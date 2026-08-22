@@ -1,0 +1,10 @@
+[workspace]
+
+[package]
+name = "tarseer"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Parallel .tar.zst archiver + custom index with optimized file walking, parallelized tar creation and compression and random-access support"
+repository = "https://github.com/borink-org/tarseer"
+readme = "README.md"
