@@ -22,6 +22,13 @@
 //! chunks — the only parallelism a single flat directory of 100,000 files
 //! offers.
 //!
+//! On Linux the directory reader is `getdents64` plus a masked `statx` (see
+//! the `rustix_scan` module); everywhere else it is `read_dir` plus
+//! `DirEntry::metadata`. Which one is used is decided by `cfg` and is not a
+//! runtime choice: the fast reader exists only to be faster, so anything a
+//! caller could gain by picking the other one would be a bug. Both fill the
+//! same buffers, and a test walks the same tree through each and compares.
+//!
 //! # Order
 //!
 //! `flatten` is serial and depth-first over name-sorted entries, so the
@@ -48,7 +55,7 @@ use crate::tree::{Skips, SourceTree};
 
 /// Entries per task when a single wide directory spreads its own `stat` calls.
 /// Big enough to amortize the fan-out that per-item parallelism fails to.
-const STAT_CHUNK: usize = 512;
+pub(crate) const STAT_CHUNK: usize = 512;
 
 /// Directories per task when a level has many. Small, because a task is cheap
 /// and directories vary wildly in size.
@@ -66,6 +73,34 @@ const SCAN_CHUNK: usize = 4;
 /// If the root's path is not UTF-8, if a directory entry's type or metadata
 /// cannot be read, or if the tree outgrows the `u32` indices used throughout.
 pub fn walk(root: &Path) -> Result<SourceTree> {
+    walk_with(root, Reader::BEST)
+}
+
+/// Which implementation reads a directory.
+///
+/// Not a choice a caller gets to make: [`Reader::BEST`] is decided by `cfg`,
+/// and this exists only so the two implementations can be run against each
+/// other in a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reader {
+    /// `read_dir` plus `DirEntry::metadata`. Everywhere.
+    // On Linux `BEST` is `Fast`, so only the differential test names this one.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Std,
+    /// `getdents64` plus a masked `statx`. Linux only — those are Linux
+    /// interfaces, not POSIX ones, so macOS and the BSDs use `Std` as well.
+    #[cfg(target_os = "linux")]
+    Fast,
+}
+
+impl Reader {
+    #[cfg(target_os = "linux")]
+    pub(crate) const BEST: Self = Self::Fast;
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) const BEST: Self = Self::Std;
+}
+
+fn walk_with(root: &Path, how: Reader) -> Result<SourceTree> {
     let root_str = root
         .to_str()
         .ctx(|| format!("non-Unicode source path {}", root.display()))?;
@@ -74,7 +109,7 @@ pub fn walk(root: &Path) -> Result<SourceTree> {
     let mut nodes: Vec<NodeAt> = Vec::new();
 
     let mut root_out = Out::default();
-    scan_one(root_str, true, &mut root_out)?;
+    scan_one(root_str, true, how, &mut root_out)?;
     root_out.release_scratch();
     levels.push(vec![root_out]);
     nodes.push(NodeAt {
@@ -113,7 +148,7 @@ pub fn walk(root: &Path) -> Result<SourceTree> {
             .map(|p| u32::try_from(p.len() - root_prefix).ctx(|| "source path exceeds u32".into()))
             .collect::<Result<_>>()?;
 
-        let mut outs = scan_frontier(&frontier)?;
+        let mut outs = scan_frontier(&frontier, how)?;
         for out in &mut outs {
             out.release_scratch();
         }
@@ -181,10 +216,10 @@ fn size_tree(levels: &[Vec<Out>], nodes: &[NodeAt]) -> SourceTree {
     SourceTree::with_capacity(files, dirs, links, text_bytes)
 }
 
-fn scan_frontier(frontier: &[&str]) -> Result<Vec<Out>> {
+fn scan_frontier(frontier: &[&str], how: Reader) -> Result<Vec<Out>> {
     if let [only] = *frontier {
         let mut out = Out::default();
-        scan_one(only, true, &mut out)?;
+        scan_one(only, true, how, &mut out)?;
         return Ok(vec![out]);
     }
 
@@ -195,7 +230,7 @@ fn scan_frontier(frontier: &[&str]) -> Result<Vec<Out>> {
             || Ok(Out::default()),
             |acc: Result<Out>, i| {
                 let mut out = acc?;
-                scan_one(frontier[i], false, &mut out)?;
+                scan_one(frontier[i], false, how, &mut out)?;
                 Ok(out)
             },
         )
@@ -203,7 +238,7 @@ fn scan_frontier(frontier: &[&str]) -> Result<Vec<Out>> {
 }
 
 /// One entry as the scan found it, before it has a path.
-enum Found {
+pub(crate) enum Found {
     File {
         name: Span,
         mtime: i64,
@@ -224,43 +259,43 @@ enum Found {
 
 /// What one `stat` yielded, before it is sorted into a `Found`.
 #[derive(Clone, Copy, Default)]
-struct Stat {
-    mtime: i64,
-    size: u64,
-    mode: u32,
+pub(crate) struct Stat {
+    pub(crate) mtime: i64,
+    pub(crate) size: u64,
+    pub(crate) mode: u32,
 }
 
 /// One directory's place in the buffers its task produced.
-struct Meta {
+pub(crate) struct Meta {
     /// Range into [`Out::entries`], sorted by name.
-    entries: (u32, u32),
+    pub(crate) entries: (u32, u32),
     /// Range into [`Out::kid_spans`], in `Found::Dir` order.
-    kids: (u32, u32),
-    skips: Skips,
+    pub(crate) kids: (u32, u32),
+    pub(crate) skips: Skips,
 }
 
 /// Everything one task produced while scanning its slice of one level.
 #[derive(Default)]
-struct Out {
+pub(crate) struct Out {
     /// Every entry name of every directory this task scanned.
-    names: Arena,
+    pub(crate) names: Arena,
     /// Every entry, contiguous per directory.
-    entries: Vec<Found>,
+    pub(crate) entries: Vec<Found>,
     /// Subdirectory paths; the next level's frontier borrows these.
-    kids: Arena,
+    pub(crate) kids: Arena,
     /// Symlink targets. Its own arena rather than a corner of `names` because
     /// it is nearly always empty and is read by exactly one match arm.
-    targets: Arena,
+    pub(crate) targets: Arena,
     /// One span per subdirectory path, in the order the directories were found.
-    kid_spans: Vec<Span>,
+    pub(crate) kid_spans: Vec<Span>,
     /// One per directory this task scanned.
-    metas: Vec<Meta>,
+    pub(crate) metas: Vec<Meta>,
     /// Symlinks found. Kept as a count because `entries` cannot be asked
     /// without walking it, and sizing the tree needs it: a link is the one row
     /// that interns two strings.
-    links: u32,
+    pub(crate) links: u32,
     /// Reusable buffer for the one path a symlink still needs built.
-    tmp: String,
+    pub(crate) tmp: String,
 }
 
 impl Out {
@@ -328,7 +363,12 @@ impl<'a> Dir<'a> {
 ///
 /// `wide` says this is the only directory being scanned right now, so it is
 /// worth spreading its own `stat`s across the pool.
-fn scan_one(dir: &str, wide: bool, out: &mut Out) -> Result<()> {
+fn scan_one(dir: &str, wide: bool, how: Reader, out: &mut Out) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if how == Reader::Fast {
+        return crate::rustix_scan::scan_one(dir, wide, out);
+    }
+    let _ = how;
     let dir_str = dir;
     let dir = Path::new(dir);
     let stat_of = |e: &std::fs::DirEntry, ft: std::fs::FileType| -> Result<Stat> {
@@ -432,7 +472,7 @@ fn scan_one(dir: &str, wide: bool, out: &mut Out) -> Result<()> {
 }
 
 /// Close off one directory's contribution to its task's buffers.
-fn finish(out: &mut Out, entries_from: u32, kids_from: u32, skips: Skips) -> Result<()> {
+pub(crate) fn finish(out: &mut Out, entries_from: u32, kids_from: u32, skips: Skips) -> Result<()> {
     let entries_to = u32::try_from(out.entries.len()).ctx(|| "entry arena overflow".into())?;
     let kids_to = u32::try_from(out.kid_spans.len()).ctx(|| "child arena overflow".into())?;
     out.metas.push(Meta {
@@ -444,7 +484,7 @@ fn finish(out: &mut Out, entries_from: u32, kids_from: u32, skips: Skips) -> Res
 }
 
 /// Append `dir/name` to `buf`, replacing whatever it held.
-fn join_into(buf: &mut String, dir: &str, name: &str) {
+pub(crate) fn join_into(buf: &mut String, dir: &str, name: &str) {
     buf.clear();
     buf.push_str(dir);
     if !dir.ends_with('/') {
@@ -463,7 +503,7 @@ fn push_kid(out: &mut Out, dir: &str, name: &str) -> Result<()> {
 
 /// Read the symlink at `abs`: its stored target and its own mtime, or `None`
 /// if the target is not UTF-8 and so cannot go in the index.
-fn scan_link(abs: &Path) -> Result<Option<(String, i64)>> {
+pub(crate) fn scan_link(abs: &Path) -> Result<Option<(String, i64)>> {
     let target = std::fs::read_link(abs).ctx(|| format!("read link {}", abs.display()))?;
     let Some(target) = target.to_str() else {
         return Ok(None);
@@ -540,5 +580,119 @@ fn mode_of(m: &std::fs::Metadata, is_dir: bool) -> u32 {
             (false, true) => 0o444,
             (false, false) => 0o644,
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{Reader, SourceTree, walk_with};
+
+    /// A fixture directory that removes itself.
+    struct Tmp(std::path::PathBuf);
+
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("tarseer-rd-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create the fixture root");
+            Self(p)
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Every row of a tree, flattened so two trees can be compared whole.
+    fn rows(t: &SourceTree) -> Vec<(String, i64, u64, u32, String)> {
+        let mut out: Vec<_> = t
+            .files
+            .iter()
+            .map(|r| {
+                (
+                    t.text(r.rel).to_owned(),
+                    r.mtime,
+                    r.size,
+                    r.mode,
+                    String::new(),
+                )
+            })
+            .collect();
+        out.extend(
+            t.dirs
+                .iter()
+                .map(|r| (t.text(r.rel).to_owned(), r.mtime, 0, r.mode, String::new())),
+        );
+        out.extend(t.links.iter().map(|r| {
+            (
+                t.text(r.rel).to_owned(),
+                r.mtime,
+                0,
+                0,
+                t.text(r.target).to_owned(),
+            )
+        }));
+        out.sort();
+        out
+    }
+
+    fn both(root: &std::path::Path) -> (SourceTree, SourceTree) {
+        (
+            walk_with(root, Reader::Std).expect("std reader"),
+            walk_with(root, Reader::Fast).expect("fast reader"),
+        )
+    }
+
+    #[test]
+    fn the_two_readers_agree_row_for_row() {
+        let t = Tmp::new("agree");
+        let r = &t.0;
+        std::fs::create_dir_all(r.join("zed/deep")).unwrap();
+        std::fs::create_dir_all(r.join("alpha")).unwrap();
+        std::fs::write(r.join("top.txt"), b"top").unwrap();
+        std::fs::write(r.join("zed/z.bin"), b"0123456789").unwrap();
+        std::fs::write(r.join("zed/deep/d.txt"), b"deep!").unwrap();
+        std::os::unix::fs::symlink("../top.txt", r.join("alpha/link")).unwrap();
+
+        let (std, fast) = both(r);
+        assert_eq!(rows(&std), rows(&fast));
+        assert_eq!(std.skips, fast.skips);
+        assert_eq!(std.text_bytes(), fast.text_bytes());
+    }
+
+    #[test]
+    fn the_two_readers_agree_on_a_wide_directory() {
+        // The wide path spreads its stats across the pool in both readers, and
+        // is the one place they take visibly different code.
+        let t = Tmp::new("wide");
+        for i in 0..2000 {
+            std::fs::write(t.0.join(format!("f{i:05}")), b"xy").unwrap();
+        }
+        let (std, fast) = both(&t.0);
+        assert_eq!(std.files.len(), 2000);
+        assert_eq!(rows(&std), rows(&fast));
+    }
+
+    #[test]
+    fn the_two_readers_agree_that_a_directory_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = Tmp::new("locked");
+        let locked = t.0.join("shut");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("hidden.txt"), b"x").unwrap();
+        std::fs::write(t.0.join("seen.txt"), b"y").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let got = std::panic::catch_unwind(|| both(&t.0));
+        // Restore before asserting, so a failure still lets the fixture clean up.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (std, fast) = got.expect("both readers returned");
+        assert_eq!(std.skips.unreadable, 1);
+        assert_eq!(std.skips, fast.skips);
+        assert_eq!(rows(&std), rows(&fast));
     }
 }
