@@ -10,6 +10,8 @@ repository = "https://github.com/borink-org/tarseer"
 readme = "README.md"
 
 [dependencies]
+# The walk fans one task out per directory; this is the pool that runs them.
+rayon = "1"
 # CLI: builder API only, and default features off drops color, suggestions,
 # wrap_help, unicode, env and derive.
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }

@@ -86,6 +86,16 @@ impl StrTape {
         self.arena.len()
     }
 
+    /// Bytes the arena can hold before it grows.
+    ///
+    /// Exposed so a caller that sized the tape up front can assert it sized it
+    /// right: "reserved exactly" and "reserved nearly, then doubled once" are
+    /// invisible in the result and are the whole point of reserving.
+    #[must_use]
+    pub const fn text_capacity(&self) -> usize {
+        self.arena.capacity()
+    }
+
     /// Every string, in index order.
     pub fn iter(&self) -> impl Iterator<Item = &str> {
         self.offs
