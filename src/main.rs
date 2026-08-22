@@ -17,10 +17,17 @@ fn main() -> ExitCode {
                 .value_parser(clap::value_parser!(PathBuf))
                 .help("Directory to walk"),
         )
+        .arg(
+            Arg::new("threads")
+                .long("threads")
+                .value_parser(clap::value_parser!(usize))
+                .help("Scan threads; defaults to the number of cores"),
+        )
         .get_matches();
 
     let dir: &PathBuf = m.get_one("dir").expect("required");
-    match run(dir) {
+    let threads = m.get_one::<usize>("threads").copied();
+    match run(dir, threads) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("tarseer: {e}");
@@ -29,7 +36,13 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(dir: &Path) -> Result<()> {
+fn run(dir: &Path, threads: Option<usize>) -> Result<()> {
+    if let Some(n) = threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .map_err(|e| -> tarseer::BoxError { format!("thread pool: {e}").into() })?;
+    }
     let tree = walk(dir)?;
     for p in tree.paths() {
         println!("{p}");

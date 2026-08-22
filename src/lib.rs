@@ -9,7 +9,8 @@
 //!
 //! [`walk()`] produces a [`SourceTree`]: three columns of fixed-size `Copy`
 //! rows over one string tape, in the order a plain recursive sorted walk would
-//! visit them.
+//! visit them. The walk itself runs on a thread pool, one task per directory,
+//! over arenas that never move what they have already written.
 //!
 //! The tree is built to be planned from rather than iterated — sizes and kinds
 //! sit in their own columns, so deciding *what work to do* never touches the
@@ -17,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod arena;
 pub mod error;
 pub mod tape;
 pub mod tree;

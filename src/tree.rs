@@ -85,6 +85,24 @@ pub struct SourceTree {
 }
 
 impl SourceTree {
+    /// A tree sized for what the walk already counted.
+    ///
+    /// This exists because the walk fills it in one *serial* pass, so a buffer
+    /// that grows there memmoves on the critical path — around 10 MiB on a
+    /// 180,000-file tree, plus the doubled peak while each old buffer is live
+    /// beside its replacement.
+    #[must_use]
+    pub fn with_capacity(files: usize, dirs: usize, links: usize, text_bytes: usize) -> Self {
+        Self {
+            // A link is the one row that interns two strings.
+            text: StrTape::with_capacity(text_bytes, files + dirs + 2 * links),
+            files: Vec::with_capacity(files),
+            dirs: Vec::with_capacity(dirs),
+            links: Vec::with_capacity(links),
+            skips: Skips::default(),
+        }
+    }
+
     /// The string at tape index `i` — a row's `rel`, or a link's `target`.
     ///
     /// # Panics
@@ -119,6 +137,13 @@ impl SourceTree {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Bytes the text tape can hold before it grows — see
+    /// [`StrTape::text_capacity`].
+    #[must_use]
+    pub const fn text_capacity(&self) -> usize {
+        self.text.text_capacity()
     }
 
     /// Bytes of text held — the capacity hint for the index's path column.

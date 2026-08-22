@@ -8,7 +8,7 @@ parallelized tar creation and compression and random-access support.
 Early. Being built up a slice at a time; what exists today is the source walk.
 
 ```
-tarseer <dir>
+tarseer [--threads N] <dir>
 ```
 
 Nothing here opens a file or reads its contents yet.

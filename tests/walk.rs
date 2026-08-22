@@ -159,3 +159,31 @@ fn an_unreadable_directory_is_counted_and_the_rest_still_walks() {
     assert!(tree.paths().contains(&"top.txt"));
     assert!(!tree.paths().contains(&"zed/z.bin"));
 }
+
+#[test]
+fn the_tree_is_sized_before_it_is_filled_and_nothing_grows() {
+    // The fill pass is the walk's only serial one, so a buffer that grows
+    // there memmoves on the critical path. The fixture has a symlink because a
+    // link is the one row that interns two strings.
+    let t = fixture("sizing");
+    let tree = walk(t.path()).unwrap();
+
+    assert_eq!(tree.text_bytes(), tree.text_capacity(), "text tape grew");
+    assert_eq!(tree.files.len(), tree.files.capacity(), "files grew");
+    assert_eq!(tree.dirs.len(), tree.dirs.capacity(), "dirs grew");
+    assert_eq!(tree.links.len(), tree.links.capacity(), "links grew");
+}
+
+#[test]
+fn a_wide_flat_directory_comes_back_whole() {
+    // One directory of many entries is the case a per-directory scan cannot
+    // spread, and so takes a different path through the walk.
+    let t = TmpDir::new("wide");
+    for i in 0..2000 {
+        fs::write(t.path().join(format!("f{i:05}")), b"x").unwrap();
+    }
+    let tree = walk(t.path()).unwrap();
+    assert_eq!(tree.files.len(), 2000);
+    assert_eq!(tree.paths().first(), Some(&"f00000"));
+    assert_eq!(tree.paths().last(), Some(&"f01999"));
+}
