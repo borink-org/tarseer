@@ -54,12 +54,20 @@ pub struct Skips {
     /// Directories that could not be read, usually for want of permission.
     /// The whole subtree below one is missing.
     pub unreadable: u32,
+    /// Entries whose path is longer than [`crate::walk::MAX_ENTRY_PATH`].
+    ///
+    /// A source tree can hold a path that only just fits the platform's limit;
+    /// writing it back out has to fit the same path under a *different* root,
+    /// so recording it would promise something extraction cannot deliver. A
+    /// directory skipped this way takes its subtree with it, which is right —
+    /// everything below is longer still.
+    pub too_long: u32,
 }
 
 impl Skips {
     #[must_use]
     pub const fn total(self) -> u64 {
-        self.special as u64 + self.non_utf8 as u64 + self.unreadable as u64
+        self.special as u64 + self.non_utf8 as u64 + self.unreadable as u64 + self.too_long as u64
     }
 
     #[must_use]
@@ -71,6 +79,7 @@ impl Skips {
         self.special += o.special;
         self.non_utf8 += o.non_utf8;
         self.unreadable += o.unreadable;
+        self.too_long += o.too_long;
     }
 }
 
@@ -81,6 +90,15 @@ pub struct SourceTree {
     pub files: Vec<FileRow>,
     pub dirs: Vec<DirRow>,
     pub links: Vec<LinkRow>,
+    /// `(index into `files`, inode)` for the files that have a second name —
+    /// nothing else.
+    ///
+    /// A side table rather than a column on [`FileRow`] because a tree with no
+    /// hard links leaves it empty, which is the overwhelmingly common case:
+    /// 200,000 files would otherwise carry 1.6 MB of zeros. Only ever compared
+    /// for equality, and only within the walk that produced it. Empty on
+    /// Windows, where a directory walk has no cheap identity to report.
+    pub linked: Vec<(u32, u64)>,
     pub skips: Skips,
 }
 
@@ -99,6 +117,9 @@ impl SourceTree {
             files: Vec::with_capacity(files),
             dirs: Vec::with_capacity(dirs),
             links: Vec::with_capacity(links),
+            // Left unsized: a tree with no hard links never pushes to it, and
+            // the walk has no count for the trees that do.
+            linked: Vec::new(),
             skips: Skips::default(),
         }
     }
@@ -170,8 +191,20 @@ impl SourceTree {
     ///
     /// # Errors
     /// If the tree's text tape or entry count overflows.
-    pub fn push_file(&mut self, rel: &str, mtime: i64, size: u64, mode: u32) -> Result<()> {
+    /// `ino` is a hard-link identity, or 0 for a file with only one name.
+    pub fn push_file(
+        &mut self,
+        rel: &str,
+        mtime: i64,
+        size: u64,
+        mode: u32,
+        ino: u64,
+    ) -> Result<()> {
         let rel = self.intern(rel)?;
+        if ino != 0 {
+            let at = u32::try_from(self.files.len()).ctx(|| "file index exceeds u32".into())?;
+            self.linked.push((at, ino));
+        }
         self.files.push(FileRow {
             rel,
             mtime,

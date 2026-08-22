@@ -263,6 +263,8 @@ pub(crate) struct Stat {
     pub(crate) mtime: i64,
     pub(crate) size: u64,
     pub(crate) mode: u32,
+    /// See [`link_ident`]: a hard-link identity, or 0.
+    pub(crate) ino: u64,
 }
 
 /// One directory's place in the buffers its task produced.
@@ -290,6 +292,13 @@ pub(crate) struct Out {
     pub(crate) kid_spans: Vec<Span>,
     /// One per directory this task scanned.
     pub(crate) metas: Vec<Meta>,
+    /// `(index into `entries`, inode)` for the files that have a second name.
+    /// Ascending, because entries are pushed in order.
+    ///
+    /// A side vector rather than a field on `Found`: `Found` is one per entry
+    /// of the whole level being scanned, and widening it to carry an inode
+    /// nobody usually has costs 8 bytes on every entry of a 200,000-path walk.
+    pub(crate) linked: Vec<(u32, u64)>,
     /// Symlinks found. Kept as a count because `entries` cannot be asked
     /// without walking it, and sizing the tree needs it: a link is the one row
     /// that interns two strings.
@@ -356,7 +365,32 @@ impl<'a> Dir<'a> {
     fn entries(&self) -> &'a [Found] {
         &self.out.entries[self.meta.entries.0 as usize..self.meta.entries.1 as usize]
     }
+
+    /// The hard-link identity of this directory's `slot`-th entry, or 0.
+    ///
+    /// The empty check is the point: a tree with no hard links — almost every
+    /// tree — never reaches the search at all.
+    fn link_ident(&self, slot: usize) -> u64 {
+        if self.out.linked.is_empty() {
+            return 0;
+        }
+        // `slot` indexes a slice of `entries`, whose length is already u32.
+        #[expect(clippy::cast_possible_truncation, reason = "entries is u32-indexed")]
+        let at = self.meta.entries.0 + slot as u32;
+        self.out
+            .linked
+            .binary_search_by_key(&at, |&(i, _)| i)
+            .map_or(0, |k| self.out.linked[k].1)
+    }
 }
+
+/// The longest path the walk will record.
+///
+/// A source tree can hold a path that only just fits the platform's limit;
+/// writing it back out has to fit the same path under a *different* root plus
+/// whatever staging suffix the writer uses, so recording a path this long
+/// would promise something extraction cannot deliver.
+pub const MAX_ENTRY_PATH: usize = 3072;
 
 /// Enumerate exactly one directory: its entries, sorted, plus the paths of its
 /// subdirectories in the same order.
@@ -371,20 +405,6 @@ fn scan_one(dir: &str, wide: bool, how: Reader, out: &mut Out) -> Result<()> {
     let _ = how;
     let dir_str = dir;
     let dir = Path::new(dir);
-    let stat_of = |e: &std::fs::DirEntry, ft: std::fs::FileType| -> Result<Stat> {
-        if !(ft.is_file() || ft.is_dir()) {
-            return Ok(Stat::default());
-        }
-        let m = e
-            .metadata()
-            .ctx(|| format!("metadata {}", e.path().display()))?;
-        Ok(Stat {
-            mtime: m.modified().ok().map_or(0, system_time_to_unix),
-            size: if ft.is_file() { m.len() } else { 0 },
-            mode: mode_of(&m, ft.is_dir()),
-        })
-    };
-
     let entries_from = u32::try_from(out.entries.len()).ctx(|| "entry arena overflow".into())?;
     let kids_from = u32::try_from(out.kid_spans.len()).ctx(|| "child arena overflow".into())?;
 
@@ -412,22 +432,7 @@ fn scan_one(dir: &str, wide: bool, how: Reader, out: &mut Out) -> Result<()> {
     }
     ents.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let stats: Vec<Stat> = if wide && ents.len() >= STAT_CHUNK * 2 {
-        ents.par_chunks(STAT_CHUNK)
-            .map(|c| {
-                c.iter()
-                    .map(|(_, ft, e)| stat_of(e, *ft))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect()
-    } else {
-        ents.iter()
-            .map(|(_, ft, e)| stat_of(e, *ft))
-            .collect::<Result<_>>()?
-    };
+    let stats = stat_all(&ents, wide)?;
 
     let mut skips = Skips::default();
     for ((name, ft, _), st) in ents.into_iter().zip(stats) {
@@ -458,6 +463,10 @@ fn scan_one(dir: &str, wide: bool, how: Reader, out: &mut Out) -> Result<()> {
                 mode: st.mode,
             });
         } else if ft.is_file() {
+            if st.ino != 0 {
+                let at = u32::try_from(out.entries.len()).ctx(|| "entry arena overflow".into())?;
+                out.linked.push((at, st.ino));
+            }
             out.entries.push(Found::File {
                 name: span,
                 mtime: st.mtime,
@@ -469,6 +478,47 @@ fn scan_one(dir: &str, wide: bool, how: Reader, out: &mut Out) -> Result<()> {
         }
     }
     finish(out, entries_from, kids_from, skips)
+}
+
+/// One `stat` per entry that has bytes or children, spread across the pool
+/// when this is the only directory being scanned.
+fn stat_all(
+    ents: &[(std::ffi::OsString, std::fs::FileType, std::fs::DirEntry)],
+    wide: bool,
+) -> Result<Vec<Stat>> {
+    let stat_of = |e: &std::fs::DirEntry, ft: std::fs::FileType| -> Result<Stat> {
+        if !(ft.is_file() || ft.is_dir()) {
+            return Ok(Stat::default());
+        }
+        let m = e
+            .metadata()
+            .ctx(|| format!("metadata {}", e.path().display()))?;
+        Ok(Stat {
+            mtime: m.modified().ok().map_or(0, system_time_to_unix),
+            size: if ft.is_file() { m.len() } else { 0 },
+            mode: mode_of(&m, ft.is_dir()),
+            ino: link_ident(&m, ft.is_file()),
+        })
+    };
+
+    let stats: Vec<Stat> = if wide && ents.len() >= STAT_CHUNK * 2 {
+        ents.par_chunks(STAT_CHUNK)
+            .map(|c| {
+                c.iter()
+                    .map(|(_, ft, e)| stat_of(e, *ft))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect()
+    } else {
+        ents.iter()
+            .map(|(_, ft, e)| stat_of(e, *ft))
+            .collect::<Result<_>>()?
+    };
+
+    Ok(stats)
 }
 
 /// Close off one directory's contribution to its task's buffers.
@@ -531,7 +581,7 @@ fn flatten(
     let dir = Dir::at(levels, nodes, id);
     tree.skips.add(dir.meta.skips);
     let mut child = 0u32;
-    for found in dir.entries() {
+    for (slot, found) in dir.entries().iter().enumerate() {
         let name = match found {
             Found::File { name, .. } | Found::Dir { name, .. } | Found::Link { name, .. } => name,
         };
@@ -541,10 +591,19 @@ fn flatten(
         }
         rel.push_str(dir.out.name(*name));
 
+        if rel.len() > MAX_ENTRY_PATH {
+            tree.skips.too_long += 1;
+            rel.truncate(mark);
+            if matches!(found, Found::Dir { .. }) {
+                child += 1;
+            }
+            continue;
+        }
+
         match found {
             Found::File {
                 mtime, size, mode, ..
-            } => tree.push_file(rel, *mtime, *size, *mode)?,
+            } => tree.push_file(rel, *mtime, *size, *mode, dir.link_ident(slot))?,
             Found::Link { target, mtime, .. } => {
                 tree.push_link(rel, dir.out.target(*target), *mtime)?;
             }
@@ -558,6 +617,30 @@ fn flatten(
         rel.truncate(mark);
     }
     Ok(())
+}
+
+/// Identity for hard-link grouping: an inode number, but only for a file that
+/// actually has a second name, and 0 otherwise.
+///
+/// The `nlink > 1` test is a filter, not the decision. What matters is whether
+/// *two recorded paths* share an inode; a file linked to something outside the
+/// tree has `nlink > 1` and no partner here. Filtering keeps the side table
+/// empty for the overwhelmingly common link-free tree.
+///
+/// Windows has no cheap equivalent from a directory walk — `file_index` is
+/// nightly-only and unavailable from `DirEntry::metadata` — so this is 0
+/// there, and nothing groups.
+#[allow(unused_variables)]
+fn link_ident(m: &std::fs::Metadata, is_file: bool) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if is_file && m.nlink() > 1 { m.ino() } else { 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 fn system_time_to_unix(t: std::time::SystemTime) -> i64 {
@@ -673,6 +756,32 @@ mod tests {
         let (std, fast) = both(&t.0);
         assert_eq!(std.files.len(), 2000);
         assert_eq!(rows(&std), rows(&fast));
+    }
+
+    #[test]
+    fn the_two_readers_find_the_same_hard_links() {
+        let t = Tmp::new("links");
+        std::fs::write(t.0.join("a.txt"), b"shared").unwrap();
+        std::fs::hard_link(t.0.join("a.txt"), t.0.join("b.txt")).unwrap();
+        std::fs::write(t.0.join("alone.txt"), b"not shared").unwrap();
+
+        let (std, fast) = both(&t.0);
+        // Identities are inode numbers, so compare the grouping rather than
+        // the numbers: which files share, not what they share.
+        let group = |t: &SourceTree| {
+            let mut g: Vec<(String, u64)> = t
+                .linked
+                .iter()
+                .map(|&(fi, ino)| (t.text(t.files[fi as usize].rel).to_owned(), ino))
+                .collect();
+            g.sort();
+            let base = g.first().map_or(0, |&(_, ino)| ino);
+            g.into_iter()
+                .map(|(p, ino)| (p, ino == base))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(group(&std), group(&fast));
+        assert_eq!(group(&std).len(), 2, "both names carry an identity");
     }
 
     #[test]

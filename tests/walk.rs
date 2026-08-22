@@ -126,3 +126,27 @@ fn a_wide_flat_directory_comes_back_whole() {
     assert_eq!(tree.paths().first(), Some(&"f00000"));
     assert_eq!(tree.paths().last(), Some(&"f01999"));
 }
+
+#[test]
+fn a_path_too_long_to_write_back_out_is_skipped() {
+    // A source tree can hold a path that only just fits the platform's limit;
+    // writing it back under a different root would not, so it is counted here
+    // rather than promised.
+    let t = TmpDir::new("too-long");
+    let mut deep = t.path().to_path_buf();
+    let seg = "d".repeat(200);
+    for _ in 0..20 {
+        deep = deep.join(&seg);
+        if fs::create_dir(&deep).is_err() {
+            break;
+        }
+    }
+    let tree = walk(t.path()).unwrap();
+    assert!(tree.skips.too_long > 0, "nothing was found too long");
+    assert!(tree.skips.any());
+    assert!(
+        tree.paths()
+            .iter()
+            .all(|p| p.len() <= tarseer::walk::MAX_ENTRY_PATH)
+    );
+}
