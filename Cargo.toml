@@ -8,3 +8,11 @@ license = "Apache-2.0"
 description = "Parallel .tar.zst archiver + custom index with optimized file walking, parallelized tar creation and compression and random-access support"
 repository = "https://github.com/borink-org/tarseer"
 readme = "README.md"
+
+[dependencies]
+# CLI: builder API only, and default features off drops color, suggestions,
+# wrap_help, unicode, env and derive.
+clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
