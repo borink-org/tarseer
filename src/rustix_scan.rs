@@ -41,10 +41,15 @@ struct Scratch {
     stats: Vec<Stat>,
 }
 
+// INO and NLINK ride along for hard-link grouping: statx fills them from the
+// inode it already had to read, so this widens the mask without adding a
+// syscall or a round trip.
 const WANT: StatxFlags = StatxFlags::TYPE
     .union(StatxFlags::MODE)
     .union(StatxFlags::MTIME)
-    .union(StatxFlags::SIZE);
+    .union(StatxFlags::SIZE)
+    .union(StatxFlags::INO)
+    .union(StatxFlags::NLINK);
 
 thread_local! {
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
@@ -113,6 +118,13 @@ fn stat_all(
                 0
             },
             mode: u32::from(st.stx_mode) & 0o7777,
+            // See `walk::link_ident`: identity only for a file with a second
+            // name.
+            ino: if ft == FileType::RegularFile && st.stx_nlink > 1 {
+                st.stx_ino
+            } else {
+                0
+            },
         })
     };
 
@@ -178,7 +190,16 @@ fn scan_into(dir: &str, wide: bool, out: &mut Out, scratch: &mut Scratch) -> Res
             .filter(|(_, ft)| *ft == FileType::Directory)
             .count(),
     );
-    for (&(span, ft), &Stat { mtime, size, mode }) in ents.iter().zip(stats.iter()) {
+    for (
+        &(span, ft),
+        &Stat {
+            mtime,
+            size,
+            mode,
+            ino,
+        },
+    ) in ents.iter().zip(stats.iter())
+    {
         let name = out.names.get(span);
         match ft {
             FileType::Symlink => {
@@ -206,12 +227,19 @@ fn scan_into(dir: &str, wide: bool, out: &mut Out, scratch: &mut Scratch) -> Res
                     mode,
                 });
             }
-            FileType::RegularFile => out.entries.push(Found::File {
-                name: span,
-                mtime,
-                size,
-                mode,
-            }),
+            FileType::RegularFile => {
+                if ino != 0 {
+                    let at =
+                        u32::try_from(out.entries.len()).ctx(|| "entry arena overflow".into())?;
+                    out.linked.push((at, ino));
+                }
+                out.entries.push(Found::File {
+                    name: span,
+                    mtime,
+                    size,
+                    mode,
+                });
+            }
             _ => skips.special += 1,
         }
     }

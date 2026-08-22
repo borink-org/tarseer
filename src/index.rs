@@ -135,6 +135,7 @@ impl Builder {
         self.m.size.push(row.size);
         self.m.mode.push(row.mode);
         self.m.mtime.push(row.mtime);
+        self.m.same_as.push(u32::MAX);
         self.m.count += 1;
         Ok(())
     }
@@ -202,6 +203,15 @@ pub struct Index {
     pub size: Vec<u64>,
     pub mode: Vec<u32>,
     pub mtime: Vec<i64>,
+    /// For a row that is a second name for a file already in the index, the
+    /// row of its first name; `u32::MAX` otherwise.
+    ///
+    /// A hard link is not a kind of entry — both names are equally the file —
+    /// so this points *back*, to whichever of them sorted first. A reader that
+    /// wants to store the bytes once and link the rest needs only this column,
+    /// and a reader that does not care can ignore it and get a correct tree
+    /// with duplicated content.
+    pub same_as: Vec<u32>,
     /// The algorithm the checksum column was produced with, or empty if the
     /// tree was indexed without hashing.
     pub checksum_algo: String,
@@ -233,6 +243,7 @@ impl Index {
                 size: Vec::with_capacity(cap.entries),
                 mode: Vec::with_capacity(cap.entries),
                 mtime: Vec::with_capacity(cap.entries),
+                same_as: Vec::with_capacity(cap.entries),
                 checksum: StrTape::with_capacity(cap.sum_bytes, cap.entries),
                 link: StrTape::with_capacity(cap.link_bytes, cap.entries),
                 ..Self::default()
@@ -261,6 +272,22 @@ impl Index {
     #[must_use]
     pub fn kind(&self, i: usize) -> Option<Kind> {
         Kind::from_u8(*self.kind.get(i)?)
+    }
+
+    /// The row this one is a second name for, or `None` if it is the only
+    /// name for its file.
+    #[must_use]
+    pub fn same_as(&self, i: usize) -> Option<usize> {
+        match self.same_as.get(i).copied() {
+            Some(u32::MAX) | None => None,
+            Some(r) => Some(r as usize),
+        }
+    }
+
+    /// How many rows are a second name for a file already in the index.
+    #[must_use]
+    pub fn num_hardlinks(&self) -> u64 {
+        self.same_as.iter().filter(|&&r| r != u32::MAX).count() as u64
     }
 
     /// The hex digest at row `i`; empty for a row that was not hashed.
@@ -417,6 +444,16 @@ pub fn index_tree_with(tree: &SourceTree, sums: &[Digest]) -> Result<Index> {
         sum_bytes: sums.len() * 64,
         link_bytes: tree.links.iter().map(|l| tree.text(l.target).len()).sum(),
     });
+    // Where each file ended up, so the hard-link side table can be turned into
+    // row numbers once the rows exist.
+    let mut row_of_file = vec![u32::MAX; tree.files.len()];
+    #[expect(clippy::cast_possible_truncation, reason = "checked as a u32 above")]
+    for (row, (_, slot)) in order.iter().enumerate() {
+        if let Slot::File(i) = *slot {
+            row_of_file[i as usize] = row as u32;
+        }
+    }
+
     for (path, slot) in order {
         // Held out here because the row below borrows it.
         let hex = match slot {
@@ -464,11 +501,41 @@ pub fn index_tree_with(tree: &SourceTree, sums: &[Digest]) -> Result<Index> {
         b.push(&row)?;
     }
     let mut m = b.finish();
+    link_groups(tree, &row_of_file, &mut m);
     m.total_bytes = tree.total_bytes();
     if !sums.is_empty() {
         m.checksum_algo = ALGO.into();
     }
     Ok(m)
+}
+
+/// Point every second name at the row of its first.
+///
+/// The tree's side table is `(file index, inode)` in walk order; two entries
+/// sharing an inode are the same file. Sorting by inode puts a group together,
+/// and the lowest row in a group is the one the others point at — so a reader
+/// meets the target before any row referring to it.
+fn link_groups(tree: &SourceTree, row_of_file: &[u32], m: &mut Index) {
+    if tree.linked.is_empty() {
+        return;
+    }
+    let mut by_ino: Vec<(u64, u32)> = tree
+        .linked
+        .iter()
+        .map(|&(fi, ino)| (ino, row_of_file[fi as usize]))
+        .collect();
+    by_ino.sort_unstable();
+
+    for group in by_ino.chunk_by(|a, b| a.0 == b.0) {
+        // A file whose only partner is outside the tree has nlink > 1 and no
+        // group here; it stays an ordinary row.
+        let Some((_, first)) = group.first().copied() else {
+            continue;
+        };
+        for &(_, row) in &group[1..] {
+            m.same_as[row as usize] = first;
+        }
+    }
 }
 
 /// Which of a tree's three columns a path-ordered entry came from.

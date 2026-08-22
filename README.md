@@ -6,7 +6,8 @@ parallelized tar creation and compression and random-access support.
 ## Status
 
 Early. Being built up a slice at a time; what exists today is the source walk,
-the index over it, its JSON form, and blake3 digests of the file contents.
+the index over it, its JSON form, blake3 digests of the file contents, and
+hard-link grouping.
 
 ```
 tarseer [--threads N] [--hash] [--json] <dir>

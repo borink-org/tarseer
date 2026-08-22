@@ -89,11 +89,12 @@ fn run(dir: &Path, json: bool, hash: bool, threads: Option<usize>) -> Result<()>
 
     if skips.any() {
         eprintln!(
-            "skipped {}: {} special, {} non-UTF-8, {} unreadable",
+            "skipped {}: {} special, {} non-UTF-8, {} unreadable, {} too long",
             skips.total(),
             skips.special,
             skips.non_utf8,
-            skips.unreadable
+            skips.unreadable,
+            skips.too_long
         );
     }
     Ok(())
