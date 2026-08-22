@@ -5,7 +5,8 @@ parallelized tar creation and compression and random-access support.
 
 ## Status
 
-Early. Being built up a slice at a time; what exists today is the source walk.
+Early. Being built up a slice at a time; what exists today is the source walk
+and the index over it.
 
 ```
 tarseer [--threads N] <dir>
