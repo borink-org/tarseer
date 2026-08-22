@@ -12,6 +12,9 @@ readme = "README.md"
 [dependencies]
 # The walk fans one task out per directory; this is the pool that runs them.
 rayon = "1"
+# Content digests. A real, audited implementation, and its own rayon feature is
+# what parallelizes a single large file across cores.
+blake3 = { version = "1", features = ["rayon"] }
 # The index is columns of plain scalars and strings, so serializing it is a
 # derive plus one adapter for the string tapes.
 serde = { version = "1", features = ["derive"] }

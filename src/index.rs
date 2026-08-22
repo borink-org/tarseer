@@ -22,6 +22,7 @@ use serde::{Serialize, Serializer};
 
 use crate::bail;
 use crate::error::{BoxError, Result};
+use crate::hash::{ALGO, Digest, HexDigest};
 use crate::tape::StrTape;
 use crate::tree::SourceTree;
 
@@ -62,6 +63,9 @@ pub struct EntryRef<'a> {
     pub mode: u32,
     /// mtime as unix seconds; 0 if unknown.
     pub mtime: i64,
+    /// Lowercase hex content digest. Empty for anything not hashed, which
+    /// includes every directory and symlink.
+    pub checksum: &'a str,
     /// A symlink's target, as stored. Empty for everything else.
     pub link: &'a str,
 }
@@ -71,6 +75,8 @@ pub struct EntryRef<'a> {
 pub struct Capacity {
     pub entries: usize,
     pub path_bytes: usize,
+    /// Total bytes of all digests: 64 per hashed file.
+    pub sum_bytes: usize,
     pub link_bytes: usize,
 }
 
@@ -120,6 +126,10 @@ impl Builder {
                 }
             }
         }
+        self.m
+            .checksum
+            .push(row.checksum)
+            .map_err(tape_err("checksum"))?;
         self.m.link.push(row.link).map_err(tape_err("link"))?;
         self.m.kind.push(row.kind.as_u8());
         self.m.size.push(row.size);
@@ -192,6 +202,11 @@ pub struct Index {
     pub size: Vec<u64>,
     pub mode: Vec<u32>,
     pub mtime: Vec<i64>,
+    /// The algorithm the checksum column was produced with, or empty if the
+    /// tree was indexed without hashing.
+    pub checksum_algo: String,
+    #[serde(serialize_with = "serialize_tape")]
+    checksum: StrTape,
     #[serde(serialize_with = "serialize_tape")]
     link: StrTape,
 }
@@ -218,6 +233,7 @@ impl Index {
                 size: Vec::with_capacity(cap.entries),
                 mode: Vec::with_capacity(cap.entries),
                 mtime: Vec::with_capacity(cap.entries),
+                checksum: StrTape::with_capacity(cap.sum_bytes, cap.entries),
                 link: StrTape::with_capacity(cap.link_bytes, cap.entries),
                 ..Self::default()
             },
@@ -245,6 +261,15 @@ impl Index {
     #[must_use]
     pub fn kind(&self, i: usize) -> Option<Kind> {
         Kind::from_u8(*self.kind.get(i)?)
+    }
+
+    /// The hex digest at row `i`; empty for a row that was not hashed.
+    ///
+    /// # Panics
+    /// If `i` is past the end.
+    #[must_use]
+    pub fn checksum(&self, i: usize) -> &str {
+        self.checksum.get(i).expect("index row in range")
     }
 
     /// A symlink's target at row `i`; empty for everything else.
@@ -349,15 +374,29 @@ pub struct PathScratch {
     up: Vec<u32>,
 }
 
-/// Build the index of a walked tree.
+/// Build the index of a walked tree, without content digests.
+///
+/// # Errors
+/// As [`index_tree_with`].
+pub fn index_tree(tree: &SourceTree) -> Result<Index> {
+    index_tree_with(tree, &[])
+}
+
+/// Build the index of a walked tree, with one digest per file.
+///
+/// `sums` is in `tree.files` order — what [`crate::hash::hash_tree`] returns —
+/// or empty for an index without them.
 ///
 /// The tree's three columns are interleaved into one path-sorted order first,
 /// because that order is the index's whole contract.
 ///
 /// # Errors
-/// If the tree holds more entries than a `u32` can index, or a string column
-/// overflows its tape.
-pub fn index_tree(tree: &SourceTree) -> Result<Index> {
+/// If `sums` is neither empty nor one digest per file, if the tree holds more
+/// entries than a `u32` can index, or if a string column overflows its tape.
+pub fn index_tree_with(tree: &SourceTree, sums: &[Digest]) -> Result<Index> {
+    if !sums.is_empty() && sums.len() != tree.files.len() {
+        bail!("{} digests for {} files", sums.len(), tree.files.len());
+    }
     let n = tree.len();
     u32::try_from(n)?;
     let mut order: Vec<(&str, Slot)> = Vec::with_capacity(n);
@@ -375,9 +414,15 @@ pub fn index_tree(tree: &SourceTree) -> Result<Index> {
     let mut b = Index::builder(Capacity {
         entries: n,
         path_bytes: tree.text_bytes(),
+        sum_bytes: sums.len() * 64,
         link_bytes: tree.links.iter().map(|l| tree.text(l.target).len()).sum(),
     });
     for (path, slot) in order {
+        // Held out here because the row below borrows it.
+        let hex = match slot {
+            Slot::File(i) if !sums.is_empty() => Some(HexDigest::of(&sums[i as usize])),
+            _ => None,
+        };
         let row = match slot {
             Slot::File(i) => {
                 let f = tree.files[i as usize];
@@ -387,6 +432,7 @@ pub fn index_tree(tree: &SourceTree) -> Result<Index> {
                     size: f.size,
                     mode: f.mode,
                     mtime: f.mtime,
+                    checksum: hex.as_ref().map_or("", HexDigest::as_str),
                     link: "",
                 }
             }
@@ -398,6 +444,7 @@ pub fn index_tree(tree: &SourceTree) -> Result<Index> {
                     size: 0,
                     mode: d.mode,
                     mtime: d.mtime,
+                    checksum: "",
                     link: "",
                 }
             }
@@ -409,6 +456,7 @@ pub fn index_tree(tree: &SourceTree) -> Result<Index> {
                     size: 0,
                     mode: 0o777,
                     mtime: l.mtime,
+                    checksum: "",
                     link: tree.text(l.target),
                 }
             }
@@ -417,6 +465,9 @@ pub fn index_tree(tree: &SourceTree) -> Result<Index> {
     }
     let mut m = b.finish();
     m.total_bytes = tree.total_bytes();
+    if !sums.is_empty() {
+        m.checksum_algo = ALGO.into();
+    }
     Ok(m)
 }
 
