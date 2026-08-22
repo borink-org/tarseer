@@ -5,11 +5,11 @@ use std::process::ExitCode;
 
 use clap::{Arg, Command};
 
-use tarseer::{Result, walk};
+use tarseer::{Kind, Result, index_tree, walk};
 
 fn main() -> ExitCode {
     let m = Command::new("tarseer")
-        .about("Walk a directory tree and list what is there")
+        .about("Walk a directory tree and index what is there")
         .version(env!("CARGO_PKG_VERSION"))
         .arg(
             Arg::new("dir")
@@ -44,24 +44,23 @@ fn run(dir: &Path, threads: Option<usize>) -> Result<()> {
             .map_err(|e| -> tarseer::BoxError { format!("thread pool: {e}").into() })?;
     }
     let tree = walk(dir)?;
-    for p in tree.paths() {
-        println!("{p}");
-    }
-    println!(
-        "{} entries: {} files, {} dirs, {} symlinks, {} bytes",
-        tree.len(),
-        tree.files.len(),
-        tree.dirs.len(),
-        tree.links.len(),
-        tree.total_bytes(),
-    );
-    if tree.skips.any() {
+    let skips = tree.skips;
+    let index = index_tree(&tree)?;
+
+    index.for_each_path(|i, p| match index.kind(i) {
+        Some(Kind::Symlink) => println!("l {:>12} {p} -> {}", "", index.link(i)),
+        Some(Kind::Dir) => println!("d {:>12} {p}", ""),
+        _ => println!("f {:>12} {p}", index.size[i]),
+    });
+    println!("{}", index.summary());
+
+    if skips.any() {
         eprintln!(
             "skipped {}: {} special, {} non-UTF-8, {} unreadable",
-            tree.skips.total(),
-            tree.skips.special,
-            tree.skips.non_utf8,
-            tree.skips.unreadable
+            skips.total(),
+            skips.special,
+            skips.non_utf8,
+            skips.unreadable
         );
     }
     Ok(())
