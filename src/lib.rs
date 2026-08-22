@@ -10,7 +10,8 @@
 //! [`walk()`] produces a [`SourceTree`]: three columns of fixed-size `Copy`
 //! rows over one string tape, in the order a plain recursive sorted walk would
 //! visit them. The walk itself runs on a thread pool, one task per directory,
-//! over arenas that never move what they have already written.
+//! over arenas that never move what they have already written, reading each
+//! directory with `getdents64` on Linux and `read_dir` elsewhere.
 //!
 //! [`index_tree`] turns that into an [`Index`]: every entry in path order,
 //! stored as columns, with ancestry interned once in a directory table so a
@@ -25,6 +26,8 @@
 pub mod arena;
 pub mod error;
 pub mod index;
+#[cfg(target_os = "linux")]
+mod rustix_scan;
 pub mod tape;
 pub mod tree;
 pub mod walk;
