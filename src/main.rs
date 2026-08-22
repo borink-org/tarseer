@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 
 use tarseer::{Kind, Result, index_tree, walk};
 
@@ -18,6 +18,12 @@ fn main() -> ExitCode {
                 .help("Directory to walk"),
         )
         .arg(
+            Arg::new("json")
+                .long("json")
+                .action(ArgAction::SetTrue)
+                .help("Print the whole index as JSON instead of a listing"),
+        )
+        .arg(
             Arg::new("threads")
                 .long("threads")
                 .value_parser(clap::value_parser!(usize))
@@ -27,7 +33,9 @@ fn main() -> ExitCode {
 
     let dir: &PathBuf = m.get_one("dir").expect("required");
     let threads = m.get_one::<usize>("threads").copied();
-    match run(dir, threads) {
+    let json = m.get_flag("json");
+
+    match run(dir, json, threads) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("tarseer: {e}");
@@ -36,23 +44,28 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(dir: &Path, threads: Option<usize>) -> Result<()> {
+fn run(dir: &Path, json: bool, threads: Option<usize>) -> Result<()> {
     if let Some(n) = threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build_global()
             .map_err(|e| -> tarseer::BoxError { format!("thread pool: {e}").into() })?;
     }
+
     let tree = walk(dir)?;
     let skips = tree.skips;
     let index = index_tree(&tree)?;
 
-    index.for_each_path(|i, p| match index.kind(i) {
-        Some(Kind::Symlink) => println!("l {:>12} {p} -> {}", "", index.link(i)),
-        Some(Kind::Dir) => println!("d {:>12} {p}", ""),
-        _ => println!("f {:>12} {p}", index.size[i]),
-    });
-    println!("{}", index.summary());
+    if json {
+        println!("{}", index.to_json()?);
+    } else {
+        index.for_each_path(|i, p| match index.kind(i) {
+            Some(Kind::Symlink) => println!("l {:>12} {p} -> {}", "", index.link(i)),
+            Some(Kind::Dir) => println!("d {:>12} {p}", ""),
+            _ => println!("f {:>12} {p}", index.size[i]),
+        });
+        println!("{}", index.summary());
+    }
 
     if skips.any() {
         eprintln!(

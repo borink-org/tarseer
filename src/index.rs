@@ -18,6 +18,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Serialize, Serializer};
+
 use crate::bail;
 use crate::error::{BoxError, Result};
 use crate::tape::StrTape;
@@ -164,7 +166,7 @@ fn split_last(path: &str) -> (&str, &str) {
 }
 
 /// Every entry a walk found, in path order.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct Index {
     /// Number of entries — the common length of every entry column.
     pub count: u64,
@@ -177,18 +179,27 @@ pub struct Index {
     /// With `dir_name` this is the tree itself — see [`Index::write_path`].
     pub dir_parent: Vec<u32>,
     /// Each directory's own component; row 0, the root, is empty.
+    #[serde(serialize_with = "serialize_tape")]
     dir_name: StrTape,
     /// The directory each entry lives in. A directory entry names *itself*, so
     /// its `name` is empty and its path is its own row in the table.
     pub dir: Vec<u32>,
     /// Each entry's final component; empty exactly for directory entries.
+    #[serde(serialize_with = "serialize_tape")]
     name: StrTape,
     /// [`Kind`] discriminants; read with [`Index::kind`].
     pub kind: Vec<u8>,
     pub size: Vec<u64>,
     pub mode: Vec<u32>,
     pub mtime: Vec<i64>,
+    #[serde(serialize_with = "serialize_tape")]
     link: StrTape,
+}
+
+/// A tape serializes as the array of its strings — the reader wants the
+/// column, not the arena it happens to be packed into.
+fn serialize_tape<S: Serializer>(t: &StrTape, s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.collect_seq(t.iter())
 }
 
 impl Index {
@@ -278,6 +289,27 @@ impl Index {
         for i in 0..self.len() {
             f(i, self.write_path(i, &mut sc));
         }
+    }
+
+    /// Serialize to the JSON form: one array per column, plus the scalars.
+    ///
+    /// Columns rather than an array of objects, for the same reason the index
+    /// is columns in the first place — a reader that wants sizes should not
+    /// have to parse every path to find them.
+    ///
+    /// # Errors
+    /// Only if a column cannot be serialized, which the types here rule out.
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string(self).map_err(|e| -> BoxError { format!("index JSON: {e}").into() })
+    }
+
+    /// As [`Index::to_json`], indented for a human.
+    ///
+    /// # Errors
+    /// As [`Index::to_json`].
+    pub fn to_json_pretty(&self) -> Result<String> {
+        serde_json::to_string_pretty(self)
+            .map_err(|e| -> BoxError { format!("index JSON: {e}").into() })
     }
 
     /// A one-line human summary.
