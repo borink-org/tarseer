@@ -13,6 +13,11 @@ use tarseer::{
     write_manifest,
 };
 
+// mimalloc for the binary. Its memory-return settings are worth knowing: see the
+// note on the dependency in Cargo.toml.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let matches = Command::new("tarseer")
         .about("Walk a directory tree into parts: JSON lines on stdout, or a compressed manifest")

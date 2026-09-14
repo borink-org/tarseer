@@ -29,6 +29,15 @@ clap = { version = "4", default-features = false, features = ["std", "help", "us
 # dependencies at all, and its own macros are declarative. Default features
 # are std + backtrace, neither of which pulls a crate in.
 error-stack = "0.8"
+# The binary's global allocator; the library does not set one. Linked for
+# library users too until the CLI's dependencies move behind a feature.
+#
+# At its defaults it holds more than glibc here. Walking /nix/store (1.7M
+# entries) peaked at 64 MB against glibc's 26 MB, and most of that is freed
+# memory it keeps: MIMALLOC_PURGE_DELAY=0 gave 36 MB, and with
+# MIMALLOC_ARENA_EAGER_COMMIT=0 as well, 25 MB. The preloaded C library at
+# 3.1.5 walked in 39 MB at defaults; this crate bundles 3.3.2.
+mimalloc = "0.1"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
