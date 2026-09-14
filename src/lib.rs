@@ -3,39 +3,43 @@
 // needs a human pass before this is published. `//` comments like this one are
 // for us and are not held to that.
 
-//! Walk a directory tree and record what is there.
+//! Walk a directory tree and record what is there, in independent parts.
 //!
 //! ```no_run
-//! let tree = tarseer::walk(std::path::Path::new(".")).unwrap();
-//! for path in tree.paths() {
+//! use tarseer::{WalkOptions, walk};
+//!
+//! let walk = walk(std::path::Path::new("."), &WalkOptions::default()).unwrap();
+//! for path in walk.paths() {
 //!     println!("{path}");
 //! }
 //! ```
 //!
-//! - [`walk()`] → [`SourceTree`]: three columns of fixed-size `Copy` rows over
-//!   one string tape
-//! - order: what a plain recursive sorted walk would visit
-//! - planned from, not iterated — sizes and kinds in their own columns, so
-//!   deciding *what work to do* never touches the strings
+//! - [`walk_parts()`] → a stream of [`Part`]s in walk order, each a contiguous
+//!   run of it with a stem, readable on its own; [`walk()`] collects them
+//! - cut by tree structure against a budget of estimated JSON bytes, so what is
+//!   held at once stays bounded however large the tree
+//! - hooks, all optional and dynamic: a [`Filter`], [`Progress`], a cancel
+//!   flag, and an [`OnError`] policy
 //! - opens no file, reads no contents
-//! - [`SourceTree::to_json`]: same shape, one array per column; the whole of
-//!   what the command prints
+//! - [`Part::to_json`]: one document per part, one array per column
 //!
 //! # Errors
 //!
-//! - [`error_stack::Report`] over one of [`WalkError`], [`TreeFull`],
-//!   [`JsonError`]
-//! - one context per unit of fallibility, not per call site
+//! - [`error_stack::Report`] over one of [`WalkError`], [`JsonError`]; causes
+//!   [`Cancelled`] and [`PartFull`] stay distinguishable inside a walk report
 //! - attached: what a caller cannot reconstruct (the entry tripped over)
 //! - not attached: what it already holds (the root it passed in)
 
 #![forbid(unsafe_code)]
 
 pub mod json;
+pub mod part;
 pub mod tape;
-pub mod tree;
 pub mod walk;
 
 pub use crate::json::JsonError;
-pub use crate::tree::{DirRow, FileRow, LinkRow, Skips, SourceTree, TreeFull};
-pub use crate::walk::{WalkError, walk};
+pub use crate::part::{DirRow, EntryKind, FileRow, LinkRow, Part, PartFull, Timestamp, walk_order};
+pub use crate::walk::{
+    Cancelled, Candidate, DEFAULT_BUDGET, Filter, Listing, OnError, Progress, SkipReason, Skips,
+    Walk, WalkError, WalkOptions, estimate, walk, walk_parts,
+};

@@ -1,11 +1,13 @@
 //! Fixtures shared by the integration tests: a self-removing directory, the
-//! tree they all walk, and the oracle they check the walk against.
+//! trees they walk, and the oracle they check the walk against.
 
 #![allow(dead_code)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+
+use tarseer::{Walk, WalkOptions, walk};
 
 /// A directory that removes itself, named uniquely per process and call.
 pub struct TempDir(PathBuf);
@@ -48,7 +50,47 @@ pub fn fixture(tag: &str) -> TempDir {
     temp_dir
 }
 
-/// The oracle: `read_dir` plus a sort, which the walk cannot influence.
+/// A tree big enough to be cut many ways: wide and deep directories, empty
+/// ones, names that sort differently as paths than as components (`a!` against
+/// `a/`), and symlinks on Unix.
+pub fn wide_fixture(tag: &str) -> TempDir {
+    let temp_dir = TempDir::new(tag);
+    let root = temp_dir.path();
+    let mut chain = root.join("chain");
+    for depth in 0..12 {
+        chain = chain.join(format!("level{depth}"));
+        fs::create_dir_all(&chain).unwrap();
+        fs::write(chain.join("leaf.txt"), vec![b'x'; depth]).unwrap();
+    }
+    fs::create_dir_all(root.join("flat")).unwrap();
+    for index in 0..60 {
+        fs::write(root.join(format!("flat/file{index:03}.dat")), b"flat").unwrap();
+    }
+    for group in ["a", "a!", "a.b", "b"] {
+        let dir = root.join(group);
+        fs::create_dir_all(dir.join("inner")).unwrap();
+        for index in 0..7 {
+            fs::write(dir.join(format!("f{index}")), b"g").unwrap();
+            fs::write(dir.join(format!("inner/g{index}")), b"h").unwrap();
+        }
+    }
+    fs::create_dir_all(root.join("empty/also_empty")).unwrap();
+    fs::write(root.join("a.txt"), b"top").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("../a.txt", root.join("b/to_top")).unwrap();
+        std::os::unix::fs::symlink("nowhere/at/all", root.join("dangling")).unwrap();
+    }
+    temp_dir
+}
+
+/// Walk with default options.
+pub fn walk_default(root: &Path) -> Walk {
+    walk(root, &WalkOptions::default()).unwrap()
+}
+
+/// The oracle: `read_dir` plus a sort per directory, which the walk cannot
+/// influence. Paths come out in walk order.
 pub fn recurse(dir: &Path, path: &str, out: &mut Vec<String>) {
     let mut kids: Vec<_> = fs::read_dir(dir)
         .unwrap()

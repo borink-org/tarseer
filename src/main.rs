@@ -3,41 +3,69 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Arg, Command};
-use error_stack::Report;
+use clap::{Arg, Command, value_parser};
+use error_stack::{Report, ResultExt as _};
 
-use tarseer::{SourceTree, walk};
+use tarseer::{DEFAULT_BUDGET, Skips, WalkError, WalkOptions, walk_parts};
 
 fn main() -> ExitCode {
     let matches = Command::new("tarseer")
-        .about("Walk a directory tree and print what is there as JSON")
+        .about("Walk a directory tree and print its parts as JSON, one per line")
         .version(env!("CARGO_PKG_VERSION"))
         .arg(
             Arg::new("dir")
                 .required(true)
-                .value_parser(clap::value_parser!(PathBuf))
+                .value_parser(value_parser!(PathBuf))
                 .help("Directory to walk"),
+        )
+        .arg(
+            Arg::new("budget")
+                .long("budget")
+                .value_parser(value_parser!(u64))
+                .help("Estimated JSON bytes per part [default: 4 MiB]"),
         )
         .get_matches();
 
     let dir: &PathBuf = matches.get_one("dir").expect("required");
+    let budget = matches
+        .get_one::<u64>("budget")
+        .copied()
+        .unwrap_or(DEFAULT_BUDGET);
+    let options = WalkOptions {
+        budget,
+        ..WalkOptions::default()
+    };
 
-    // Each step is matched where it happens rather than funnelled through one
-    // `run() -> Result<()>`. Two fallible calls with two different contexts
-    // would need a third, invented one to share a signature, and a top line
-    // reading "the command failed" tells a reader less than the walk's own
-    // context already does.
-    let tree = match walk(dir) {
-        Ok(tree) => tree,
-        Err(report) => return fail(&report),
-    };
-    let json = match tree.to_json_pretty() {
-        Ok(json) => json,
-        Err(report) => return fail(&report),
-    };
-    println!("{json}");
-    summarize(&tree);
-    ExitCode::SUCCESS
+    let mut totals = Totals::default();
+    let walked = walk_parts(dir, &options, &mut |part| {
+        let json = part
+            .to_json()
+            .attach_with(|| format!("part {}", totals.parts))
+            .change_context(WalkError)?;
+        println!("{json}");
+        totals.parts += 1;
+        totals.files += part.files.len();
+        totals.dirs += part.dirs.len();
+        totals.links += part.links.len();
+        totals.bytes += part.total_bytes();
+        Ok(())
+    });
+    match walked {
+        Ok(skips) => {
+            summarize(&totals, skips);
+            ExitCode::SUCCESS
+        }
+        Err(report) => fail(&report),
+    }
+}
+
+#[derive(Default)]
+struct Totals {
+    parts: usize,
+    files: usize,
+    dirs: usize,
+    links: usize,
+    bytes: u64,
 }
 
 /// Print a report and exit unsuccessfully.
@@ -52,23 +80,25 @@ fn fail<C: 'static>(report: &Report<C>) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// The counts, on stderr — the document on stdout is nobody else's to share.
-fn summarize(tree: &SourceTree) {
+/// The counts, on stderr — the parts on stdout are nobody else's to share.
+fn summarize(totals: &Totals, skips: Skips) {
     eprintln!(
-        "{} entries: {} files, {} dirs, {} symlinks, {} bytes",
-        tree.len(),
-        tree.files.len(),
-        tree.dirs.len(),
-        tree.links.len(),
-        tree.total_bytes(),
+        "{} parts, {} entries: {} files, {} dirs, {} symlinks, {} bytes",
+        totals.parts,
+        totals.files + totals.dirs + totals.links,
+        totals.files,
+        totals.dirs,
+        totals.links,
+        totals.bytes
     );
-    if tree.skips.any() {
+    if skips.any() {
         eprintln!(
-            "skipped {}: {} special, {} non-UTF-8, {} unreadable",
-            tree.skips.total(),
-            tree.skips.special,
-            tree.skips.non_utf8,
-            tree.skips.unreadable
+            "skipped {}: {} special, {} non-UTF-8, {} unreadable, {} failed",
+            skips.total(),
+            skips.special,
+            skips.non_utf8,
+            skips.unreadable,
+            skips.failed
         );
     }
 }
