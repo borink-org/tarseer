@@ -1,20 +1,40 @@
-//! What a walk found: three columns of fixed-size `Copy` rows over one tape.
-//!
-//! Rows are separated by kind rather than tagged, because every consumer wants
-//! one kind at a time: the frame planner reads sizes, the extractor creates
-//! directories first, and the index interleaves all three exactly once.
+// TODO(docs): scaffold. Public docs in this file are notes, not prose.
 
-use crate::error::{Context, Result};
+//! The results of a walk.
+//!
+//! - rows split by kind, not tagged: every consumer wants one kind at a time
+//! - frame planner reads sizes; extractor makes directories first; the index
+//!   interleaves all three exactly once
+
+use std::fmt;
+
+use error_stack::{Report, ResultExt as _};
+
 use crate::tape::StrTape;
 
-/// A file, minus where it lives — the path a driver opens is its own business.
+/// The tree outgrew the `u32` it addresses its text with: >4 GiB of paths, or
+/// >`u32::MAX` of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeFull;
+
+impl fmt::Display for TreeFull {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // review: is this a good error string? i feel we can do better
+        f.write_str("source tree outgrew its u32 addressing")
+    }
+}
+
+impl std::error::Error for TreeFull {}
+
+/// A file.
 ///
-/// `rel` indexes the tree's tape; `mode` is real Unix bits on Unix and derived
-/// from the read-only attribute on Windows, the mapping `tar` itself uses.
-/// `mtime` is unix seconds, 0 if the filesystem would not say.
+/// - `path`: index into the tree's tape, holding the path relative to the
+///   walk root, forward slashes.
+/// - `mode`: on Unix these are the real Unix bits, on Windows they are derived from the read-only attribute, matching `tar`
+/// - `mtime`: unix seconds (0 if unknown)
 #[derive(Clone, Copy)]
 pub struct FileRow {
-    pub rel: u32,
+    pub path: u32,
     pub mtime: i64,
     /// Size at walk time.
     pub size: u64,
@@ -24,35 +44,31 @@ pub struct FileRow {
 /// A directory. Fields as [`FileRow`].
 #[derive(Clone, Copy)]
 pub struct DirRow {
-    pub rel: u32,
+    pub path: u32,
     pub mtime: i64,
     pub mode: u32,
 }
 
-/// A symbolic link. Never followed: the link is the thing being recorded, not
-/// whatever it points at.
+/// A symbolic link. Path here is simply where the symbolic link lives.
 #[derive(Clone, Copy)]
 pub struct LinkRow {
-    pub rel: u32,
-    /// The target exactly as stored, with forward slashes — also in the tape.
+    pub path: u32,
+    /// Target as stored, forward slashes. Also in the tape.
     pub target: u32,
     pub mtime: i64,
 }
 
-/// What a walk met and could not record, by reason.
+/// Records entries the walk could not record and skipped instead.
 ///
-/// Everything counted here is found *during* the walk, which is what makes
-/// skipping it clean — the entry simply never enters the tree. A failure
-/// discovered later, once a plan has reserved bytes for an entry, is fatal
-/// instead.
+/// - found *during* the walk, so the entry never enters the tree at all
+/// - these failures are fatal when they occur in the later stage when bytes have been reserved
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Skips {
-    /// Sockets, fifos, devices — anything with no bytes and no target.
+    /// Sockets, fifos, devices: no bytes and no target.
     pub special: u32,
-    /// Names that are not UTF-8. The index is JSON, with nowhere to put them.
+    /// Not UTF-8. The index is JSON, with nowhere to put them.
     pub non_utf8: u32,
-    /// Directories that could not be read, usually for want of permission.
-    /// The whole subtree below one is missing.
+    /// Unreadable, usually permissions. The subtree below is missing too.
     pub unreadable: u32,
 }
 
@@ -67,10 +83,10 @@ impl Skips {
         self.total() > 0
     }
 
-    pub const fn add(&mut self, o: Self) {
-        self.special += o.special;
-        self.non_utf8 += o.non_utf8;
-        self.unreadable += o.unreadable;
+    pub const fn add(&mut self, other: Self) {
+        self.special += other.special;
+        self.non_utf8 += other.non_utf8;
+        self.unreadable += other.unreadable;
     }
 }
 
@@ -84,28 +100,29 @@ pub struct SourceTree {
     pub skips: Skips,
 }
 
+// review: progress until here
+
 impl SourceTree {
-    /// The string at tape index `i` — a row's `rel`, or a link's `target`.
+    /// The string at tape index `index`: a row's `path`, or a link's `target`.
     ///
     /// # Panics
-    /// If `i` did not come from a row of this tree. Every index in a row was
-    /// returned by a push below, so an invalid one is a bug here rather than
-    /// anything a caller can cause.
+    /// If `index` is not from a row of this tree. Every row index came from a push
+    /// below, so an invalid one is a bug here, not a caller's doing.
     #[must_use]
-    pub fn text(&self, i: u32) -> &str {
+    pub fn text(&self, index: u32) -> &str {
         self.text
-            .get(i as usize)
+            .get(index as usize)
             .expect("source tree tape index in range")
     }
 
-    /// Every path in the tree, sorted — the order the index will store and
-    /// every later stage will plan in.
+    /// Every path, sorted. The order the index stores and later stages plan
+    /// in.
     #[must_use]
     pub fn paths(&self) -> Vec<&str> {
         let mut all: Vec<&str> = Vec::with_capacity(self.len());
-        all.extend(self.dirs.iter().map(|r| self.text(r.rel)));
-        all.extend(self.files.iter().map(|r| self.text(r.rel)));
-        all.extend(self.links.iter().map(|r| self.text(r.rel)));
+        all.extend(self.dirs.iter().map(|row| self.text(row.path)));
+        all.extend(self.files.iter().map(|row| self.text(row.path)));
+        all.extend(self.links.iter().map(|row| self.text(row.path)));
         all.sort_unstable();
         all
     }
@@ -121,7 +138,7 @@ impl SourceTree {
         self.len() == 0
     }
 
-    /// Bytes of text held — the capacity hint for the index's path column.
+    /// Bytes of text held. Capacity hint for the index's path column.
     #[must_use]
     pub const fn text_bytes(&self) -> usize {
         self.text.bytes()
@@ -130,25 +147,29 @@ impl SourceTree {
     /// Sum of every file's size at walk time.
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
-        self.files.iter().map(|f| f.size).sum()
+        self.files.iter().map(|file| file.size).sum()
     }
 
-    fn intern(&mut self, s: &str) -> Result<u32> {
-        let i = u32::try_from(self.text.len()).ctx(|| "source tree exceeds u32 entries".into())?;
-        self.text
-            .push(s)
-            .map_err(|e| -> crate::error::BoxError { format!("source tree: {e}").into() })?;
-        Ok(i)
+    fn intern(&mut self, text: &str) -> Result<u32, Report<TreeFull>> {
+        let index = u32::try_from(self.text.len()).change_context(TreeFull)?;
+        self.text.push(text).change_context(TreeFull)?;
+        Ok(index)
     }
 
     /// Record a file.
     ///
     /// # Errors
-    /// If the tree's text tape or entry count overflows.
-    pub fn push_file(&mut self, rel: &str, mtime: i64, size: u64, mode: u32) -> Result<()> {
-        let rel = self.intern(rel)?;
+    /// [`TreeFull`]: text tape or entry count overflowed.
+    pub fn push_file(
+        &mut self,
+        path: &str,
+        mtime: i64,
+        size: u64,
+        mode: u32,
+    ) -> Result<(), Report<TreeFull>> {
+        let path = self.intern(path)?;
         self.files.push(FileRow {
-            rel,
+            path,
             mtime,
             size,
             mode,
@@ -160,9 +181,9 @@ impl SourceTree {
     ///
     /// # Errors
     /// As [`SourceTree::push_file`].
-    pub fn push_dir(&mut self, rel: &str, mtime: i64, mode: u32) -> Result<()> {
-        let rel = self.intern(rel)?;
-        self.dirs.push(DirRow { rel, mtime, mode });
+    pub fn push_dir(&mut self, path: &str, mtime: i64, mode: u32) -> Result<(), Report<TreeFull>> {
+        let path = self.intern(path)?;
+        self.dirs.push(DirRow { path, mtime, mode });
         Ok(())
     }
 
@@ -170,10 +191,19 @@ impl SourceTree {
     ///
     /// # Errors
     /// As [`SourceTree::push_file`].
-    pub fn push_link(&mut self, rel: &str, target: &str, mtime: i64) -> Result<()> {
-        let rel = self.intern(rel)?;
+    pub fn push_link(
+        &mut self,
+        path: &str,
+        target: &str,
+        mtime: i64,
+    ) -> Result<(), Report<TreeFull>> {
+        let path = self.intern(path)?;
         let target = self.intern(target)?;
-        self.links.push(LinkRow { rel, target, mtime });
+        self.links.push(LinkRow {
+            path,
+            target,
+            mtime,
+        });
         Ok(())
     }
 }

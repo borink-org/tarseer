@@ -1,10 +1,11 @@
+// TODO(docs): scaffold. Public docs in this file are notes, not prose.
+
 //! A string tape: many strings in one allocation, addressed by index.
 //!
-//! A walk of 200,000 paths held as a `String` per row is 200,000 live
-//! allocations and ~25 MB of headers and size-class rounding. One arena plus a
-//! `u32` offset per string is two allocations and no rounding, and every
-//! consumer here reads strings in index order anyway. Text is capped at 4 GiB
-//! so an offset fits a `u32`.
+//! Tape: one text arena, one `u32` offset per string, append-only. Not the
+//! `stringtape` crate — that reaches its `&str` through
+//! `from_utf8_unchecked`, and this crate is `forbid(unsafe_code)`.
+//! Attribution in the README.
 
 use std::fmt;
 
@@ -20,20 +21,25 @@ impl fmt::Display for TapeFull {
 
 impl std::error::Error for TapeFull {}
 
-/// An append-only, indexable collection of strings in one arena.
+/// Append-only, indexable strings in one arena.
+///
+/// - one `String` per row: one live allocation each, ~25 MB of headers and
+///   size-class rounding at 200k paths
+/// - arena + one `u32` offset: two allocations, no rounding
+/// - text capped at 4 GiB, so an offset fits a `u32`
 #[derive(Debug, Clone)]
 pub struct StrTape {
     arena: String,
-    /// `offs[i]..offs[i + 1]` is string `i`; always starts with a 0, so its
-    /// length is one more than the number of strings.
-    offs: Vec<u32>,
+    /// `offsets[index]..offsets[index + 1]` is string `index`. Always starts
+    /// with a 0, so it is one longer than the number of strings.
+    offsets: Vec<u32>,
 }
 
 impl Default for StrTape {
     fn default() -> Self {
         Self {
             arena: String::new(),
-            offs: vec![0],
+            offsets: vec![0],
         }
     }
 }
@@ -42,37 +48,37 @@ impl StrTape {
     /// Room for `entries` strings over `bytes` of text.
     #[must_use]
     pub fn with_capacity(bytes: usize, entries: usize) -> Self {
-        let mut offs = Vec::with_capacity(entries + 1);
-        offs.push(0);
+        let mut offsets = Vec::with_capacity(entries + 1);
+        offsets.push(0);
         Self {
             arena: String::with_capacity(bytes),
-            offs,
+            offsets,
         }
     }
 
-    /// Append `s`.
+    /// Append `text`.
     ///
     /// # Errors
-    /// [`TapeFull`] if the arena would pass 4 GiB. Nothing is appended in that
-    /// case, so the tape stays consistent.
-    pub fn push(&mut self, s: &str) -> Result<(), TapeFull> {
-        let end = u32::try_from(self.arena.len() + s.len()).map_err(|_| TapeFull)?;
-        self.arena.push_str(s);
-        self.offs.push(end);
+    /// [`TapeFull`] past 4 GiB. Nothing appended, so the tape stays
+    /// consistent.
+    pub fn push(&mut self, text: &str) -> Result<(), TapeFull> {
+        let end = u32::try_from(self.arena.len() + text.len()).map_err(|_| TapeFull)?;
+        self.arena.push_str(text);
+        self.offsets.push(end);
         Ok(())
     }
 
-    /// The string at `i`, or `None` past the end.
+    /// The string at `index`, or `None` past the end.
     #[must_use]
-    pub fn get(&self, i: usize) -> Option<&str> {
-        let end = *self.offs.get(i.checked_add(1)?)? as usize;
-        let start = self.offs[i] as usize;
+    pub fn get(&self, index: usize) -> Option<&str> {
+        let end = *self.offsets.get(index.checked_add(1)?)? as usize;
+        let start = self.offsets[index] as usize;
         Some(&self.arena[start..end])
     }
 
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.offs.len().saturating_sub(1)
+        self.offsets.len().saturating_sub(1)
     }
 
     #[must_use]
@@ -80,16 +86,16 @@ impl StrTape {
         self.len() == 0
     }
 
-    /// Bytes of text held — not the capacity.
+    /// Bytes of text held.
     #[must_use]
     pub const fn bytes(&self) -> usize {
         self.arena.len()
     }
 
-    /// Every string, in index order.
+    /// Every string, in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = &str> {
-        self.offs
+        self.offsets
             .windows(2)
-            .map(|w| &self.arena[w[0] as usize..w[1] as usize])
+            .map(|window| &self.arena[window[0] as usize..window[1] as usize])
     }
 }

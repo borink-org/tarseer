@@ -1,78 +1,17 @@
 //! End to end: build a tree on disk, walk it, and check what came back
 //! against what was written.
 
+mod common;
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
-use tarseer::walk;
-
-/// A directory that removes itself, named uniquely per process and call.
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new(tag: &str) -> Self {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("tarseer-{tag}-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(&p).expect("create the fixture root");
-        Self(p)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Files, directories and one symlink, deliberately not in sorted order on
-/// disk.
-fn fixture(tag: &str) -> TmpDir {
-    let t = TmpDir::new(tag);
-    let r = t.path();
-    fs::create_dir_all(r.join("zed/deep")).unwrap();
-    fs::create_dir_all(r.join("alpha")).unwrap();
-    fs::write(r.join("top.txt"), b"top").unwrap();
-    fs::write(r.join("zed/z.bin"), b"0123456789").unwrap();
-    fs::write(r.join("zed/deep/d.txt"), b"deep!").unwrap();
-    fs::write(r.join("alpha/a.txt"), b"a").unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink("../top.txt", r.join("alpha/link")).unwrap();
-    t
-}
-
-/// The oracle: `read_dir` plus a sort, which the walk cannot influence.
-fn recurse(dir: &Path, rel: &str, out: &mut Vec<String>) {
-    let mut kids: Vec<_> = fs::read_dir(dir)
-        .unwrap()
-        .map(|e| e.unwrap())
-        .map(|e| (e.file_name(), e.file_type().unwrap()))
-        .collect();
-    kids.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, ft) in kids {
-        let name = name.to_str().unwrap().to_owned();
-        let path = if rel.is_empty() {
-            name.clone()
-        } else {
-            format!("{rel}/{name}")
-        };
-        out.push(path.clone());
-        if ft.is_dir() {
-            recurse(&dir.join(&name), &path, out);
-        }
-    }
-}
+use common::{TempDir, fixture, recurse};
+use tarseer::{WalkError, walk};
 
 #[test]
 fn every_entry_is_found_in_path_order() {
-    let t = fixture("order");
-    let tree = walk(t.path()).unwrap();
+    let temp_dir = fixture("order");
+    let tree = walk(temp_dir.path()).unwrap();
 
     let mut want = vec![
         "alpha",
@@ -91,13 +30,13 @@ fn every_entry_is_found_in_path_order() {
 
 #[test]
 fn rows_carry_the_sizes_and_kinds_that_were_written() {
-    let t = fixture("kinds");
-    let tree = walk(t.path()).unwrap();
+    let temp_dir = fixture("kinds");
+    let tree = walk(temp_dir.path()).unwrap();
 
     let mut files: Vec<(&str, u64)> = tree
         .files
         .iter()
-        .map(|f| (tree.text(f.rel), f.size))
+        .map(|row| (tree.text(row.path), row.size))
         .collect();
     files.sort_unstable();
     assert_eq!(
@@ -116,28 +55,28 @@ fn rows_carry_the_sizes_and_kinds_that_were_written() {
 #[cfg(unix)]
 #[test]
 fn a_symlink_keeps_its_target_and_is_not_followed() {
-    let t = fixture("symlink");
-    let tree = walk(t.path()).unwrap();
+    let temp_dir = fixture("symlink");
+    let tree = walk(temp_dir.path()).unwrap();
     assert_eq!(tree.links.len(), 1);
-    let l = tree.links[0];
-    assert_eq!(tree.text(l.rel), "alpha/link");
-    assert_eq!(tree.text(l.target), "../top.txt");
+    let link = tree.links[0];
+    assert_eq!(tree.text(link.path), "alpha/link");
+    assert_eq!(tree.text(link.target), "../top.txt");
 }
 
 #[test]
 fn the_walk_order_matches_a_plain_recursive_sorted_walk() {
-    let t = fixture("oracle");
-    let tree = walk(t.path()).unwrap();
+    let temp_dir = fixture("oracle");
+    let tree = walk(temp_dir.path()).unwrap();
     let mut want = Vec::new();
-    recurse(t.path(), "", &mut want);
+    recurse(temp_dir.path(), "", &mut want);
     want.sort();
     assert_eq!(tree.paths(), want);
 }
 
 #[test]
 fn an_empty_tree_holds_nothing() {
-    let t = TmpDir::new("empty");
-    let tree = walk(t.path()).unwrap();
+    let temp_dir = TempDir::new("empty");
+    let tree = walk(temp_dir.path()).unwrap();
     assert!(tree.is_empty());
     assert_eq!(tree.paths(), Vec::<&str>::new());
 }
@@ -147,10 +86,10 @@ fn an_empty_tree_holds_nothing() {
 fn an_unreadable_directory_is_counted_and_the_rest_still_walks() {
     use std::os::unix::fs::PermissionsExt;
 
-    let t = fixture("locked");
-    let locked = t.path().join("zed");
+    let temp_dir = fixture("locked");
+    let locked = temp_dir.path().join("zed");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-    let tree = walk(t.path());
+    let tree = walk(temp_dir.path());
     // Restore before asserting, so a failure still lets the fixture clean up.
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -158,4 +97,29 @@ fn an_unreadable_directory_is_counted_and_the_rest_still_walks() {
     assert_eq!(tree.skips.unreadable, 1);
     assert!(tree.paths().contains(&"top.txt"));
     assert!(!tree.paths().contains(&"zed/z.bin"));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_entry_that_cannot_be_stated_fails_the_walk_and_says_which_one() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Readable but not searchable: the names in it list, and then every
+    // `metadata` inside it is denied. Unlike an unreadable directory there is
+    // no whole subtree to write off, so this is a failure rather than a skip.
+    let temp_dir = fixture("nostat");
+    let inner = temp_dir.path().join("zed");
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o444)).unwrap();
+    let got = walk(temp_dir.path());
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let report = got.err().expect("a denied stat fails the walk");
+    assert_eq!(report.current_context(), &WalkError);
+    // The context is asserted on above; what the text has to carry is the one
+    // thing the caller could not have worked out — which entry it was. The
+    // walk is sorted, so the first denied entry is `zed`'s first child.
+    assert!(
+        format!("{report:?}").contains("zed/deep"),
+        "the report should name the entry it tripped over: {report:?}"
+    );
 }
