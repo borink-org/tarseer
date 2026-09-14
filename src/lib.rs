@@ -22,10 +22,13 @@
 //!   flag, and an [`OnError`] policy
 //! - opens no file, reads no contents
 //! - [`Part::to_json`]: one document per part, one array per column
+//! - [`write_manifest()`]: the walk's parts as independent zstd frames with an
+//!   index and a footer, all in skippable frames; [`Manifest`] reads it back
 //!
 //! # Errors
 //!
-//! - [`error_stack::Report`] over one of [`WalkError`], [`JsonError`]; causes
+//! - [`error_stack::Report`] over one of [`WalkError`], [`JsonError`],
+//!   [`WriteError`], [`ReadError`]; causes
 //!   [`Cancelled`] and [`PartFull`] stay distinguishable inside a walk report
 //! - attached: what a caller cannot reconstruct (the entry tripped over)
 //! - not attached: what it already holds (the root it passed in)
@@ -33,11 +36,15 @@
 #![forbid(unsafe_code)]
 
 pub mod json;
+pub mod manifest;
 pub mod part;
 pub mod tape;
 pub mod walk;
 
 pub use crate::json::JsonError;
+pub use crate::manifest::{
+    Index, Manifest, PartEntry, ReadError, WriteError, WriteOptions, Written, write_manifest,
+};
 pub use crate::part::{DirRow, EntryKind, FileRow, LinkRow, Part, PartFull, Timestamp, walk_order};
 pub use crate::walk::{
     Cancelled, Candidate, DEFAULT_BUDGET, Filter, Listing, OnError, Progress, SkipReason, Skips,

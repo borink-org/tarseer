@@ -176,6 +176,24 @@ impl Part {
         }
     }
 
+    /// Path of the part's first row in walk order; `None` for an empty part.
+    #[must_use]
+    pub fn first_path(&self) -> Option<String> {
+        let dir = self.dirs.first().map(|row| self.path(row.parent, row.name));
+        let file = self
+            .files
+            .first()
+            .map(|row| self.path(row.parent, row.name));
+        let link = self
+            .links
+            .first()
+            .map(|row| self.path(row.parent, row.name));
+        [dir, file, link]
+            .into_iter()
+            .flatten()
+            .min_by(|left, right| walk_order(left, right))
+    }
+
     /// Every entry with its path, in walk order.
     #[must_use]
     pub fn entries(&self) -> Vec<(String, EntryKind)> {

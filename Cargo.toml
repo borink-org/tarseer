@@ -16,6 +16,10 @@ readme = "README.md"
 # pull syn and proc-macro2 into the build for nothing.
 serde = { version = "1", default-features = false, features = ["std"] }
 serde_json = "1"
+# Each part is one-shot compressed into its own frame, and read back the same
+# way, so the thin safe layer over libzstd is all that is needed; `std` for
+# its `Vec` output buffers.
+zstd-safe = { version = "7", features = ["std"] }
 # CLI: builder API only, and default features off drops color, suggestions,
 # wrap_help, unicode, env and derive.
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }

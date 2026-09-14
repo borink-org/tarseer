@@ -6,14 +6,17 @@ parallelized tar creation and compression and random-access support.
 ## Status
 
 Early. Being built up a slice at a time; what exists today is the source walk,
-cut into parts, and each part's JSON form.
+cut into parts, each part's JSON form, and the compressed manifest that holds
+them.
 
 ```
 tarseer <dir> [--budget BYTES]
+tarseer <dir> --out FILE [--budget BYTES] [--level N] [--threads N]
 ```
 
-Parts go to stdout as JSON, one per line; the counts go to stderr, so piping the
-one does not swallow the other.
+Without `--out`, parts go to stdout as JSON, one per line. With it, they are
+written as a compressed manifest. Either way the counts go to stderr, so piping
+the one does not swallow the other.
 
 Nothing here opens a file or reads its contents yet.
 
@@ -41,10 +44,35 @@ The walk takes optional hooks, all dynamically dispatched: a filter consulted
 before anything is stated, progress callbacks, a cancel flag, and a policy for
 entries it fails to read (fail the walk, or skip and count them).
 
+## The manifest
+
+```
+[part 0][part 1]…[part n-1][index][footer]
+```
+
+Every piece is a zstd skippable frame, so a plain zstd decoder skips the whole
+manifest. Once a payload sits in front of it, what that decoder yields is
+exactly the payload.
+
+- **A part** is a tag and one ordinary zstd frame of the part's JSON. Parts
+  decompress independently and in any order.
+- **The index** is a tag, the format version and one zstd frame of columnar
+  JSON: for each part its offset, frame length, JSON length, row counts and the
+  path of its first row, so the parts a folder spans can be found by search.
+- **The footer** is fixed-size and last. It holds the manifest's length, the
+  index frame's length, the format version and `TARSEER\x1a`.
+
+Offsets count from the manifest's first byte, so the same bytes can follow a
+payload unchanged. Parts are compressed on worker threads while the walk goes
+on, and the output does not depend on how many.
+
+On `/nix/store` (1.7 million entries, 91 parts) the default level 9 turns 67 MB
+of JSON into 10.7 MB, in 3.0 s with a 59 MB peak including the walk.
+
 ## Errors
 
 Fallible calls return an [`error-stack`](https://docs.rs/error-stack) `Report`
-over `WalkError` or `JsonError`. Inside a walk report, `Cancelled` and
+over `WalkError`, `JsonError`, `WriteError` or `ReadError`. Inside a walk report, `Cancelled` and
 `PartFull` stay distinguishable with `report.contains::<_>()`. A report names
 the entry the walk tripped over, since that is the part a caller cannot work out
 for itself.

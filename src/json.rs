@@ -36,7 +36,7 @@ impl std::error::Error for JsonError {}
 // A column, serialized from a fresh iterator over the rows it lives in. The
 // closure is there because `serialize_field` needs something it can borrow and
 // serialize, and an iterator is consumed by being one.
-struct Column<F>(F);
+pub(crate) struct Column<F>(pub(crate) F);
 
 impl<F, I> Serialize for Column<F>
 where
@@ -150,5 +150,15 @@ impl Part {
     /// rule out.
     pub fn to_json(&self) -> Result<String, Report<JsonError>> {
         serde_json::to_string(self).change_context(JsonError)
+    }
+
+    /// As [`Part::to_json`], into `out` after clearing it, so a caller that
+    /// renders many parts reuses one buffer.
+    ///
+    /// # Errors
+    /// As [`Part::to_json`].
+    pub fn write_json(&self, out: &mut Vec<u8>) -> Result<(), Report<JsonError>> {
+        out.clear();
+        serde_json::to_writer(&mut *out, self).change_context(JsonError)
     }
 }
