@@ -133,6 +133,10 @@ pub struct SymlinkRow {
     /// The modification time of the link itself, or `None` if the filesystem
     /// reported none.
     pub mtime: Option<Timestamp>,
+    /// Whether the link is a directory link. On Windows a symlink is created
+    /// as a file link or a directory link, and this records which. `None` on
+    /// a platform where a symlink has no kind, such as Linux and macOS.
+    pub directory: Option<bool>,
 }
 
 /// A contiguous run of walk order, with the stem that places it in the tree.
@@ -353,6 +357,7 @@ impl Part {
         name: &str,
         target: &str,
         mtime: Option<Timestamp>,
+        directory: Option<bool>,
     ) -> Result<(), Report<PartFull>> {
         let name = self.intern(name)?;
         let target = self.intern(target)?;
@@ -361,6 +366,7 @@ impl Part {
             name,
             target,
             mtime,
+            directory,
         });
         Ok(())
     }

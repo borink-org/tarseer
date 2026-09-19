@@ -68,6 +68,7 @@ fn a_symlink_keeps_its_target_and_is_not_followed() {
     let link = part.symlinks[0];
     assert_eq!(part.path(link.parent, link.name), "alpha/link");
     assert_eq!(part.text(link.target), "../top.txt");
+    assert_eq!(link.directory, None, "a Unix symlink has no kind");
 }
 
 #[test]

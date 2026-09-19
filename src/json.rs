@@ -7,13 +7,15 @@
 //!   "stem": ["usr", "lib"],
 //!   "directories": {"parent": [0], "name": ["x"], "mode": [493], "mtime": [1700000000], "mtime_nanos": [0]},
 //!   "files": {"parent": [3], "name": ["y"], "size": [12], "mode": [420], "mtime": [null], "mtime_nanos": [0]},
-//!   "symlinks": {"parent": [3], "name": ["z"], "target": ["y"], "mtime": [1700000000], "mtime_nanos": [500]}
+//!   "symlinks": {"parent": [3], "name": ["z"], "target": ["y"], "mtime": [1700000000], "mtime_nanos": [500], "directory": [null]}
 //! }
 //! ```
 //!
-//! Each of `directories`, `files` and `symlinks` holds one array per column, and
-//! every array in a group has one value per row. `parent` is a node id and
-//! `name` a component, as in [`Part`]. `mtime` is whole seconds since the
+//! Each of `directories`, `files` and `symlinks` holds one array per column,
+//! and every array in a group has one value per row. `parent` is a node id
+//! and `name` a component, as in [`Part`]. A symlink's `directory` is `true`
+//! or `false` for a Windows directory or file link, and `null` where a
+//! symlink has no kind. `mtime` is whole seconds since the
 //! Unix epoch, or `null` when the filesystem reported no time; `mtime_nanos`
 //! is the nanoseconds after it, and `0` when `mtime` is `null`.
 //!
@@ -121,7 +123,7 @@ impl Serialize for Symlinks<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let part = self.0;
         let rows = &part.symlinks;
-        let mut out = serializer.serialize_struct("symlinks", 5)?;
+        let mut out = serializer.serialize_struct("symlinks", 6)?;
         out.serialize_field("parent", &Column(|| rows.iter().map(|row| row.parent)))?;
         out.serialize_field(
             "name",
@@ -135,6 +137,10 @@ impl Serialize for Symlinks<'_> {
         out.serialize_field(
             "mtime_nanos",
             &Column(|| rows.iter().map(|row| nanos(row.mtime))),
+        )?;
+        out.serialize_field(
+            "directory",
+            &Column(|| rows.iter().map(|row| row.directory)),
         )?;
         out.end()
     }

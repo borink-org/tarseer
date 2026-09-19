@@ -60,8 +60,12 @@ documentation has the full procedure and the layout.
 
 A walk is depth-first over name-sorted entries, and it is cut into **parts**:
 contiguous runs of that order, each readable on its own. A part carries its
-stem (the directories above its first row), a directory table local to it, and
-one column per attribute.
+stem (the directories above its first row) and three tables of rows, one
+column per attribute: directories, files and symlinks. A symlink row records
+whether it is a Windows directory link, since extraction there must choose a
+kind before the target exists. A file with more than one name is recorded at
+each name as a plain file, so an archive built from the manifest would hold
+its content once per name.
 
 Parts are cut by the tree's structure against a budget of estimated JSON bytes:
 

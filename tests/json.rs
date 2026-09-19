@@ -29,7 +29,14 @@ fn every_group_has_one_value_per_row_in_every_column() {
         ),
         (
             "symlinks",
-            &["parent", "name", "target", "mtime", "mtime_nanos"][..],
+            &[
+                "parent",
+                "name",
+                "target",
+                "mtime",
+                "mtime_nanos",
+                "directory",
+            ][..],
             part.symlinks.len(),
         ),
     ] {
@@ -127,5 +134,9 @@ fn the_columns_carry_the_sizes_and_targets_that_were_written() {
     if cfg!(unix) {
         assert_eq!(doc["symlinks"]["name"][0].as_str(), Some("link"));
         assert_eq!(doc["symlinks"]["target"][0].as_str(), Some("../top.txt"));
+        assert!(
+            doc["symlinks"]["directory"][0].is_null(),
+            "a Unix symlink has no kind"
+        );
     }
 }

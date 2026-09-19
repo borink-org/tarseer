@@ -75,7 +75,7 @@ pub const DEFAULT_BUDGET: u64 = 4 << 20;
 // and a cut must not move with them.
 const FILE_ROW: u64 = 140;
 const DIR_ROW: u64 = 45;
-const LINK_ROW: u64 = 40;
+const LINK_ROW: u64 = 46;
 
 /// The walk could not finish.
 ///
@@ -403,6 +403,7 @@ enum Meta {
     },
     Symlink {
         mtime: Option<Timestamp>,
+        directory: Option<bool>,
     },
 }
 
@@ -566,7 +567,10 @@ impl Walker<'_, '_> {
                         depth,
                         name_len,
                         target_len,
-                        meta: Meta::Symlink { mtime },
+                        meta: Meta::Symlink {
+                            mtime,
+                            directory: symlink_is_directory(listed.file_type),
+                        },
                     },
                     bytes,
                 )?;
@@ -818,8 +822,8 @@ impl Walker<'_, '_> {
                 Meta::File { size, mtime, mode } => part
                     .push_file(parent, name, size, mtime, mode)
                     .change_context(WalkError)?,
-                Meta::Symlink { mtime } => part
-                    .push_symlink(parent, name, target, mtime)
+                Meta::Symlink { mtime, directory } => part
+                    .push_symlink(parent, name, target, mtime, directory)
                     .change_context(WalkError)?,
             }
         }
@@ -870,6 +874,20 @@ impl Walker<'_, '_> {
         if let Some(progress) = self.options.progress {
             progress.recorded(kind, size);
         }
+    }
+}
+
+// Whether a symlink is a directory link. Only Windows has the distinction.
+fn symlink_is_directory(file_type: FileType) -> Option<bool> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        Some(file_type.is_symlink_dir())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file_type;
+        None
     }
 }
 
