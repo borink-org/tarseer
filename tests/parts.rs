@@ -53,10 +53,10 @@ fn read(dir: &Path, path: &str) -> Vec<Node> {
                 }
             } else if file_type.is_dir() {
                 Node {
-                    own: estimate(EntryKind::Dir, &name, ""),
+                    own: estimate(EntryKind::Directory, &name, ""),
                     children: read(&entry.path(), &child),
                     path: child,
-                    kind: EntryKind::Dir,
+                    kind: EntryKind::Directory,
                 }
             } else {
                 Node {
@@ -77,7 +77,7 @@ fn split(children: &[Node], budget: u64, carry: &mut Vec<String>, parts: &mut Ve
     let mut group_bytes = 0;
     for child in children {
         let size = child.size();
-        if child.kind == EntryKind::Dir && size > budget {
+        if child.kind == EntryKind::Directory && size > budget {
             if !group.is_empty() {
                 emit(carry, &mut group, parts);
                 group_bytes = 0;
@@ -160,15 +160,15 @@ fn a_part_that_holds_more_than_one_unit_stays_within_budget() {
     assert!(walked.parts.len() > 3, "the fixture is cut at this budget");
     for part in &walked.parts {
         let rows: u64 = part
-            .dirs
+            .directories
             .iter()
-            .map(|row| estimate(EntryKind::Dir, part.text(row.name), ""))
+            .map(|row| estimate(EntryKind::Directory, part.text(row.name), ""))
             .chain(
                 part.files
                     .iter()
                     .map(|row| estimate(EntryKind::File, part.text(row.name), "")),
             )
-            .chain(part.links.iter().map(|row| {
+            .chain(part.symlinks.iter().map(|row| {
                 estimate(
                     EntryKind::Symlink,
                     part.text(row.name),

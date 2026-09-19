@@ -117,8 +117,8 @@ fn print_parts(dir: &Path, options: &WalkOptions<'_>) -> ExitCode {
         println!("{json}");
         totals.parts += 1;
         totals.files += part.files.len() as u64;
-        totals.dirs += part.dirs.len() as u64;
-        totals.links += part.links.len() as u64;
+        totals.directories += part.directories.len() as u64;
+        totals.symlinks += part.symlinks.len() as u64;
         Ok(())
     });
     match walked {
@@ -134,8 +134,8 @@ fn print_parts(dir: &Path, options: &WalkOptions<'_>) -> ExitCode {
 struct Totals {
     parts: usize,
     files: u64,
-    dirs: u64,
-    links: u64,
+    directories: u64,
+    symlinks: u64,
 }
 
 // Prints the report and returns the failure exit code. `{:?}`, because a
@@ -149,12 +149,12 @@ fn fail<C: 'static>(report: &Report<C>) -> ExitCode {
 // The counts go to stderr so that stdout holds only the parts.
 fn summarize(totals: &Totals, skips: Skips) {
     eprintln!(
-        "{} parts, {} entries: {} files, {} dirs, {} symlinks",
+        "{} parts, {} entries: {} files, {} directories, {} symlinks",
         totals.parts,
-        totals.files + totals.dirs + totals.links,
+        totals.files + totals.directories + totals.symlinks,
         totals.files,
-        totals.dirs,
-        totals.links,
+        totals.directories,
+        totals.symlinks,
     );
     summarize_skips(skips);
 }
@@ -165,12 +165,12 @@ fn summarize_manifest(written: &Written) {
     #[allow(clippy::cast_precision_loss)]
     let ratio = written.raw_len as f64 / written.len.max(1) as f64;
     eprintln!(
-        "{} parts, {} entries: {} files, {} dirs, {} symlinks; {} bytes of JSON in {} bytes ({ratio:.1}x)",
+        "{} parts, {} entries: {} files, {} directories, {} symlinks; {} bytes of JSON in {} bytes ({ratio:.1}x)",
         index.parts.len(),
         index.entries(),
         sum(|part| part.files),
-        sum(|part| part.dirs),
-        sum(|part| part.links),
+        sum(|part| part.directories),
+        sum(|part| part.symlinks),
         written.raw_len,
         written.len,
     );

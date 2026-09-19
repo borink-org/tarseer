@@ -322,7 +322,7 @@ impl Walk {
 pub fn estimate(kind: EntryKind, name: &str, target: &str) -> u64 {
     let fixed = match kind {
         EntryKind::File => FILE_ROW,
-        EntryKind::Dir => DIR_ROW,
+        EntryKind::Directory => DIR_ROW,
         EntryKind::Symlink => LINK_ROW,
     };
     fixed + name.len() as u64 + target.len() as u64
@@ -392,7 +392,7 @@ struct Row {
 }
 
 enum Meta {
-    Dir {
+    Directory {
         mtime: Option<Timestamp>,
         mode: u32,
     },
@@ -401,7 +401,7 @@ enum Meta {
         mtime: Option<Timestamp>,
         mode: u32,
     },
-    Link {
+    Symlink {
         mtime: Option<Timestamp>,
     },
 }
@@ -515,7 +515,7 @@ impl Walker<'_, '_> {
         let kind = if listed.file_type.is_symlink() {
             EntryKind::Symlink
         } else if listed.file_type.is_dir() {
-            EntryKind::Dir
+            EntryKind::Directory
         } else if listed.file_type.is_file() {
             EntryKind::File
         } else {
@@ -566,7 +566,7 @@ impl Walker<'_, '_> {
                         depth,
                         name_len,
                         target_len,
-                        meta: Meta::Link { mtime },
+                        meta: Meta::Symlink { mtime },
                     },
                     bytes,
                 )?;
@@ -590,7 +590,7 @@ impl Walker<'_, '_> {
                 )?;
                 self.recorded(kind, metadata.len());
             }
-            EntryKind::Dir => {
+            EntryKind::Directory => {
                 let bytes = estimate(kind, name, "");
                 self.text.push_str(name);
                 let row = self.base + self.rows.len();
@@ -598,7 +598,7 @@ impl Walker<'_, '_> {
                     depth,
                     name_len,
                     target_len: 0,
-                    meta: Meta::Dir {
+                    meta: Meta::Directory {
                         mtime,
                         mode: mode_of(&metadata, true),
                     },
@@ -808,9 +808,9 @@ impl Walker<'_, '_> {
             let depth = row.depth as usize;
             let parent = nodes[depth];
             match row.meta {
-                Meta::Dir { mtime, mode } => {
+                Meta::Directory { mtime, mode } => {
                     let node = part
-                        .push_dir(parent, name, mtime, mode)
+                        .push_directory(parent, name, mtime, mode)
                         .change_context(WalkError)?;
                     nodes.truncate(depth + 1);
                     nodes.push(node);
@@ -818,8 +818,8 @@ impl Walker<'_, '_> {
                 Meta::File { size, mtime, mode } => part
                     .push_file(parent, name, size, mtime, mode)
                     .change_context(WalkError)?,
-                Meta::Link { mtime } => part
-                    .push_link(parent, name, target, mtime)
+                Meta::Symlink { mtime } => part
+                    .push_symlink(parent, name, target, mtime)
                     .change_context(WalkError)?,
             }
         }

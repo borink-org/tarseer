@@ -50,11 +50,11 @@ fn every_part_reads_back_as_the_json_the_walk_gave() {
         assert_eq!(Some(&entry.first), part.first_path().as_ref());
         assert_eq!(entry.first, part.entries()[0].0);
         assert_eq!(
-            (entry.dirs, entry.files, entry.links),
+            (entry.directories, entry.files, entry.symlinks),
             (
-                part.dirs.len() as u64,
+                part.directories.len() as u64,
                 part.files.len() as u64,
-                part.links.len() as u64
+                part.symlinks.len() as u64
             )
         );
     }

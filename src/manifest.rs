@@ -165,11 +165,11 @@ pub struct PartEntry {
     /// The length in bytes of the part's JSON, before compression.
     pub raw_len: u64,
     /// The number of directory rows in the part.
-    pub dirs: u64,
+    pub directories: u64,
     /// The number of file rows in the part.
     pub files: u64,
     /// The number of link rows in the part.
-    pub links: u64,
+    pub symlinks: u64,
     /// The path of the part's first row in walk order. Empty if the part
     /// holds no rows.
     pub first: String,
@@ -191,7 +191,7 @@ impl Index {
     pub fn entries(&self) -> u64 {
         self.parts
             .iter()
-            .map(|part| part.dirs + part.files + part.links)
+            .map(|part| part.directories + part.files + part.symlinks)
             .sum()
     }
 
@@ -225,9 +225,9 @@ impl Index {
         let offset = column("offset")?;
         let frame_len = column("frame_len")?;
         let raw_len = column("raw_len")?;
-        let dirs = column("dirs")?;
+        let directories = column("directories")?;
         let files = column("files")?;
-        let links = column("links")?;
+        let symlinks = column("symlinks")?;
         let Some(first) = parts["first"].as_array() else {
             return corrupt(|| "index column first is missing".to_owned());
         };
@@ -235,9 +235,9 @@ impl Index {
         if [
             frame_len.len(),
             raw_len.len(),
-            dirs.len(),
+            directories.len(),
             files.len(),
-            links.len(),
+            symlinks.len(),
             first.len(),
         ]
         .iter()
@@ -254,9 +254,9 @@ impl Index {
                 offset: offset[row],
                 frame_len: frame_len[row],
                 raw_len: raw_len[row],
-                dirs: dirs[row],
+                directories: directories[row],
                 files: files[row],
-                links: links[row],
+                symlinks: symlinks[row],
                 first: first.to_owned(),
             });
         }
@@ -305,9 +305,12 @@ impl Serialize for Parts<'_> {
             &Column(|| rows.iter().map(|row| row.frame_len)),
         )?;
         out.serialize_field("raw_len", &Column(|| rows.iter().map(|row| row.raw_len)))?;
-        out.serialize_field("dirs", &Column(|| rows.iter().map(|row| row.dirs)))?;
+        out.serialize_field(
+            "directories",
+            &Column(|| rows.iter().map(|row| row.directories)),
+        )?;
         out.serialize_field("files", &Column(|| rows.iter().map(|row| row.files)))?;
-        out.serialize_field("links", &Column(|| rows.iter().map(|row| row.links)))?;
+        out.serialize_field("symlinks", &Column(|| rows.iter().map(|row| row.symlinks)))?;
         out.serialize_field("first", &Column(|| rows.iter().map(|row| &row.first)))?;
         out.end()
     }
@@ -367,9 +370,9 @@ struct Framed {
     seq: usize,
     frame: Vec<u8>,
     raw_len: u64,
-    dirs: u64,
+    directories: u64,
     files: u64,
-    links: u64,
+    symlinks: u64,
     first: String,
 }
 
@@ -512,9 +515,9 @@ impl Compressor {
             seq,
             frame: skippable(PART_FRAME_MAGIC, &[&PART_TAG, &self.compressed])?,
             raw_len: self.json.len() as u64,
-            dirs: part.dirs.len() as u64,
+            directories: part.directories.len() as u64,
             files: part.files.len() as u64,
-            links: part.links.len() as u64,
+            symlinks: part.symlinks.len() as u64,
             first: part.first_path().unwrap_or_default(),
         })
     }
@@ -540,9 +543,9 @@ fn write_in_order(
                 offset,
                 frame_len,
                 raw_len: framed.raw_len,
-                dirs: framed.dirs,
+                directories: framed.directories,
                 files: framed.files,
-                links: framed.links,
+                symlinks: framed.symlinks,
                 first: framed.first,
             });
             offset += frame_len;

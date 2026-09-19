@@ -54,7 +54,7 @@ fn rows_carry_the_sizes_and_kinds_that_were_written() {
             ("zed/z.bin".to_owned(), 10),
         ]
     );
-    assert_eq!(part.dirs.len(), 3);
+    assert_eq!(part.directories.len(), 3);
     assert_eq!(walk.total_bytes(), 19);
 }
 
@@ -64,8 +64,8 @@ fn a_symlink_keeps_its_target_and_is_not_followed() {
     let temp_dir = fixture("symlink");
     let walk = walk_default(temp_dir.path());
     let part = &walk.parts[0];
-    assert_eq!(part.links.len(), 1);
-    let link = part.links[0];
+    assert_eq!(part.symlinks.len(), 1);
+    let link = part.symlinks[0];
     assert_eq!(part.path(link.parent, link.name), "alpha/link");
     assert_eq!(part.text(link.target), "../top.txt");
 }

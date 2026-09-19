@@ -23,14 +23,14 @@ fn every_group_has_one_value_per_row_in_every_column() {
             part.files.len(),
         ),
         (
-            "dirs",
+            "directories",
             &["parent", "name", "mode", "mtime", "mtime_nanos"][..],
-            part.dirs.len(),
+            part.directories.len(),
         ),
         (
-            "links",
+            "symlinks",
             &["parent", "name", "target", "mtime", "mtime_nanos"][..],
-            part.links.len(),
+            part.symlinks.len(),
         ),
     ] {
         for col in cols {
@@ -61,8 +61,8 @@ fn the_json_rebuilds_every_path_of_its_part() {
             .iter()
             .map(|name| name.as_str().unwrap().to_owned())
             .collect();
-        let dir_parent = doc["dirs"]["parent"].as_array().unwrap();
-        let dir_name = doc["dirs"]["name"].as_array().unwrap();
+        let dir_parent = doc["directories"]["parent"].as_array().unwrap();
+        let dir_name = doc["directories"]["name"].as_array().unwrap();
 
         // Node 0 is the root, then the stem, then each directory row.
         let node_path = |node: u64| -> String {
@@ -92,7 +92,7 @@ fn the_json_rebuilds_every_path_of_its_part() {
         };
 
         let mut from_json = Vec::new();
-        for group in ["dirs", "files", "links"] {
+        for group in ["directories", "files", "symlinks"] {
             let parents = doc[group]["parent"].as_array().unwrap();
             let names = doc[group]["name"].as_array().unwrap();
             for (parent, name) in parents.iter().zip(names) {
@@ -125,7 +125,7 @@ fn the_columns_carry_the_sizes_and_targets_that_were_written() {
     assert_eq!(at("z.bin"), 10);
 
     if cfg!(unix) {
-        assert_eq!(doc["links"]["name"][0].as_str(), Some("link"));
-        assert_eq!(doc["links"]["target"][0].as_str(), Some("../top.txt"));
+        assert_eq!(doc["symlinks"]["name"][0].as_str(), Some("link"));
+        assert_eq!(doc["symlinks"]["target"][0].as_str(), Some("../top.txt"));
     }
 }

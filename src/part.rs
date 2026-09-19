@@ -2,7 +2,7 @@
 //! without any other part.
 //!
 //! A [`Part`] holds its rows in three tables, one per kind of entry:
-//! [`Part::dirs`], [`Part::files`] and [`Part::links`]. A row does not store
+//! [`Part::directories`], [`Part::files`] and [`Part::symlinks`]. A row does not store
 //! its path. It stores the node id of its parent directory and its own name,
 //! and [`Part::path`] joins them back into a path.
 //!
@@ -13,7 +13,7 @@
 //! - `0` is the walk root;
 //! - `1..=stem` are the stem, the directories above the part's first row,
 //!   outermost first ([`Part::stem`]);
-//! - `stem + 1 + index` is `dirs[index]` ([`Part::dir_node`]).
+//! - `stem + 1 + index` is `directories[index]` ([`Part::directory_node`]).
 //!
 //! Node ids and text indexes mean nothing outside the part they came from.
 
@@ -43,7 +43,7 @@ pub enum EntryKind {
     /// A regular file.
     File,
     /// A directory.
-    Dir,
+    Directory,
     /// A symbolic link. The walk records its target and does not follow it.
     Symlink,
 }
@@ -103,10 +103,10 @@ pub struct FileRow {
     pub mode: u32,
 }
 
-/// A directory. Its own node id is [`Part::dir_node`] of its index in
-/// [`Part::dirs`].
+/// A directory. Its own node id is [`Part::directory_node`] of its index in
+/// [`Part::directories`].
 #[derive(Debug, Clone, Copy)]
-pub struct DirRow {
+pub struct DirectoryRow {
     /// The node id of the directory that holds this one.
     pub parent: u32,
     /// The text index of the directory's name, for [`Part::text`].
@@ -121,7 +121,7 @@ pub struct DirRow {
 
 /// A symbolic link.
 #[derive(Debug, Clone, Copy)]
-pub struct LinkRow {
+pub struct SymlinkRow {
     /// The node id of the directory that holds the link.
     pub parent: u32,
     /// The text index of the link's name, for [`Part::text`].
@@ -137,19 +137,19 @@ pub struct LinkRow {
 
 /// A contiguous run of walk order, with the stem that places it in the tree.
 ///
-/// The walk fills a part through [`Part::push_stem`], [`Part::push_dir`],
-/// [`Part::push_file`] and [`Part::push_link`]. You read it through the row
+/// The walk fills a part through [`Part::push_stem`], [`Part::push_directory`],
+/// [`Part::push_file`] and [`Part::push_symlink`]. You read it through the row
 /// tables and [`Part::text`], or as JSON through [`Part::to_json`].
 #[derive(Debug, Clone, Default)]
 pub struct Part {
     text: StrTape,
     stem: Vec<u32>,
     /// Every directory in the part, in walk order.
-    pub dirs: Vec<DirRow>,
+    pub directories: Vec<DirectoryRow>,
     /// Every regular file in the part, in walk order.
     pub files: Vec<FileRow>,
     /// Every symbolic link in the part, in walk order.
-    pub links: Vec<LinkRow>,
+    pub symlinks: Vec<SymlinkRow>,
 }
 
 impl Part {
@@ -172,13 +172,13 @@ impl Part {
         self.stem.iter().map(|&index| self.text(index))
     }
 
-    /// Returns the node id of `dirs[index]`.
+    /// Returns the node id of `directories[index]`.
     ///
     /// # Panics
     /// If the node id does not fit a `u32`. Pushing a directory row already
     /// refuses that, so a part built by this crate cannot panic here.
     #[must_use]
-    pub fn dir_node(&self, index: usize) -> u32 {
+    pub fn directory_node(&self, index: usize) -> u32 {
         u32::try_from(1 + self.stem.len() + index).expect("node ids fit a u32")
     }
 
@@ -204,7 +204,7 @@ impl Part {
             let parent = u32::try_from(node - 1).expect("node ids fit a u32");
             (parent, self.text(self.stem[node - 1]))
         } else {
-            let row = self.dirs[node - self.stem.len() - 1];
+            let row = self.directories[node - self.stem.len() - 1];
             (row.parent, self.text(row.name))
         }
     }
@@ -213,13 +213,16 @@ impl Part {
     /// the part holds no rows.
     #[must_use]
     pub fn first_path(&self) -> Option<String> {
-        let dir = self.dirs.first().map(|row| self.path(row.parent, row.name));
+        let dir = self
+            .directories
+            .first()
+            .map(|row| self.path(row.parent, row.name));
         let file = self
             .files
             .first()
             .map(|row| self.path(row.parent, row.name));
         let link = self
-            .links
+            .symlinks
             .first()
             .map(|row| self.path(row.parent, row.name));
         [dir, file, link]
@@ -233,9 +236,9 @@ impl Part {
     pub fn entries(&self) -> Vec<(String, EntryKind)> {
         let mut all = Vec::with_capacity(self.len());
         all.extend(
-            self.dirs
+            self.directories
                 .iter()
-                .map(|row| (self.path(row.parent, row.name), EntryKind::Dir)),
+                .map(|row| (self.path(row.parent, row.name), EntryKind::Directory)),
         );
         all.extend(
             self.files
@@ -243,7 +246,7 @@ impl Part {
                 .map(|row| (self.path(row.parent, row.name), EntryKind::File)),
         );
         all.extend(
-            self.links
+            self.symlinks
                 .iter()
                 .map(|row| (self.path(row.parent, row.name), EntryKind::Symlink)),
         );
@@ -254,7 +257,7 @@ impl Part {
     /// Returns the number of rows. The stem is not counted.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.dirs.len() + self.files.len() + self.links.len()
+        self.directories.len() + self.files.len() + self.symlinks.len()
     }
 
     /// Returns `true` if the part holds no rows.
@@ -285,7 +288,7 @@ impl Part {
     /// every directory's, so the stem must be complete first.
     pub fn push_stem(&mut self, name: &str) -> Result<(), Report<PartFull>> {
         assert!(
-            self.dirs.is_empty(),
+            self.directories.is_empty(),
             "the stem precedes every directory row"
         );
         let name = self.intern(name)?;
@@ -298,16 +301,17 @@ impl Part {
     /// # Errors
     /// [`PartFull`] if the text passed 4 GiB or the node id does not fit a
     /// `u32`.
-    pub fn push_dir(
+    pub fn push_directory(
         &mut self,
         parent: u32,
         name: &str,
         mtime: Option<Timestamp>,
         mode: u32,
     ) -> Result<u32, Report<PartFull>> {
-        let node = u32::try_from(1 + self.stem.len() + self.dirs.len()).change_context(PartFull)?;
+        let node =
+            u32::try_from(1 + self.stem.len() + self.directories.len()).change_context(PartFull)?;
         let name = self.intern(name)?;
-        self.dirs.push(DirRow {
+        self.directories.push(DirectoryRow {
             parent,
             name,
             mtime,
@@ -343,7 +347,7 @@ impl Part {
     ///
     /// # Errors
     /// [`PartFull`] if the text passed 4 GiB.
-    pub fn push_link(
+    pub fn push_symlink(
         &mut self,
         parent: u32,
         name: &str,
@@ -352,7 +356,7 @@ impl Part {
     ) -> Result<(), Report<PartFull>> {
         let name = self.intern(name)?;
         let target = self.intern(target)?;
-        self.links.push(LinkRow {
+        self.symlinks.push(SymlinkRow {
             parent,
             name,
             target,

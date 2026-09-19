@@ -15,8 +15,8 @@
 //!    each [`Part`] as soon as the part is complete, in walk order, and holds
 //!    nothing of it afterwards. [`walk()`] does the same and collects the
 //!    parts into a [`Walk`].
-//! 3. Read each part's rows ([`Part::dirs`], [`Part::files`],
-//!    [`Part::links`]), or write it with [`Part::to_json`].
+//! 3. Read each part's rows ([`Part::directories`], [`Part::files`],
+//!    [`Part::symlinks`]), or write it with [`Part::to_json`].
 //!
 //! A part is a contiguous run of the walk, with the directories above its
 //! first row as a stem. You can read it without any other part. The
@@ -94,7 +94,9 @@ pub use crate::json::JsonError;
 pub use crate::manifest::{
     Index, Manifest, PartEntry, ReadError, WriteError, WriteOptions, Written, write_manifest,
 };
-pub use crate::part::{DirRow, EntryKind, FileRow, LinkRow, Part, PartFull, Timestamp, walk_order};
+pub use crate::part::{
+    DirectoryRow, EntryKind, FileRow, Part, PartFull, SymlinkRow, Timestamp, walk_order,
+};
 pub use crate::walk::{
     Cancelled, Candidate, DEFAULT_BUDGET, Filter, Listing, OnError, Progress, SkipReason, Skips,
     Walk, WalkError, WalkOptions, estimate, walk, walk_parts,

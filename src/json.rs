@@ -5,13 +5,13 @@
 //! ```json
 //! {
 //!   "stem": ["usr", "lib"],
-//!   "dirs":  {"parent": [0], "name": ["x"], "mode": [493], "mtime": [1700000000], "mtime_nanos": [0]},
+//!   "directories": {"parent": [0], "name": ["x"], "mode": [493], "mtime": [1700000000], "mtime_nanos": [0]},
 //!   "files": {"parent": [3], "name": ["y"], "size": [12], "mode": [420], "mtime": [null], "mtime_nanos": [0]},
-//!   "links": {"parent": [3], "name": ["z"], "target": ["y"], "mtime": [1700000000], "mtime_nanos": [500]}
+//!   "symlinks": {"parent": [3], "name": ["z"], "target": ["y"], "mtime": [1700000000], "mtime_nanos": [500]}
 //! }
 //! ```
 //!
-//! Each of `dirs`, `files` and `links` holds one array per column, and
+//! Each of `directories`, `files` and `symlinks` holds one array per column, and
 //! every array in a group has one value per row. `parent` is a node id and
 //! `name` a component, as in [`Part`]. `mtime` is whole seconds since the
 //! Unix epoch, or `null` when the filesystem reported no time; `mtime_nanos`
@@ -68,13 +68,13 @@ fn nanos(mtime: Option<Timestamp>) -> u32 {
 
 // The directory columns. No size: a directory's own size is the filesystem's
 // bookkeeping, not anything to write back out.
-struct Dirs<'a>(&'a Part);
+struct Directories<'a>(&'a Part);
 
-impl Serialize for Dirs<'_> {
+impl Serialize for Directories<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let part = self.0;
-        let rows = &part.dirs;
-        let mut out = serializer.serialize_struct("dirs", 5)?;
+        let rows = &part.directories;
+        let mut out = serializer.serialize_struct("directories", 5)?;
         out.serialize_field("parent", &Column(|| rows.iter().map(|row| row.parent)))?;
         out.serialize_field(
             "name",
@@ -115,13 +115,13 @@ impl Serialize for Files<'_> {
 
 // No mode: a symlink's own bits are platform folklore, and nothing restores
 // them.
-struct Links<'a>(&'a Part);
+struct Symlinks<'a>(&'a Part);
 
-impl Serialize for Links<'_> {
+impl Serialize for Symlinks<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let part = self.0;
-        let rows = &part.links;
-        let mut out = serializer.serialize_struct("links", 5)?;
+        let rows = &part.symlinks;
+        let mut out = serializer.serialize_struct("symlinks", 5)?;
         out.serialize_field("parent", &Column(|| rows.iter().map(|row| row.parent)))?;
         out.serialize_field(
             "name",
@@ -144,9 +144,9 @@ impl Serialize for Part {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut out = serializer.serialize_struct("part", 4)?;
         out.serialize_field("stem", &Column(|| self.stem()))?;
-        out.serialize_field("dirs", &Dirs(self))?;
+        out.serialize_field("directories", &Directories(self))?;
         out.serialize_field("files", &Files(self))?;
-        out.serialize_field("links", &Links(self))?;
+        out.serialize_field("symlinks", &Symlinks(self))?;
         out.end()
     }
 }
