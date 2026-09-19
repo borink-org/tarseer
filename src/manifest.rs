@@ -87,6 +87,16 @@ pub const DEFAULT_LEVEL: i32 = 9;
 /// Compression threads unless told otherwise.
 pub const DEFAULT_THREADS: usize = 2;
 
+/// How far back a part's compression may look for a match, as a power of two.
+///
+/// A compression context is sized from this, so it is what bounds the memory
+/// each thread holds: at level 9 a context is 10.5 MiB when zstd picks the
+/// window itself, 5.5 MiB at 19, 1.7 MiB at 17. Against /nix/store, 19 costs
+/// 0.19% of the manifest and 17 costs 2.8%.
+///
+/// `0` hands the choice back to zstd, which sizes the window from the part.
+pub const DEFAULT_WINDOW_LOG: u32 = 19;
+
 /// Most JSON a reader will decompress for one part or the index. The sizes
 /// come from the file, and the file may be hostile.
 pub const MAX_RAW: u64 = 1 << 30;
@@ -298,6 +308,10 @@ impl Serialize for SkipsJson {
 pub struct WriteOptions {
     /// zstd level for every part and the index.
     pub level: i32,
+    /// Match window for every part and the index, as a power of two, or `0`
+    /// for zstd's own choice. See [`DEFAULT_WINDOW_LOG`]: this is the knob
+    /// that bounds what a compression thread holds.
+    pub window_log: u32,
     /// Compression threads. The bytes written do not depend on it.
     pub threads: usize,
 }
@@ -306,6 +320,7 @@ impl Default for WriteOptions {
     fn default() -> Self {
         Self {
             level: DEFAULT_LEVEL,
+            window_log: DEFAULT_WINDOW_LOG,
             threads: DEFAULT_THREADS,
         }
     }
@@ -352,6 +367,7 @@ pub fn write_manifest(
 ) -> Result<Written, Report<WriteError>> {
     let threads = options.threads.max(1);
     let level = options.level;
+    let window_log = options.window_log;
     let writer_out = &mut *out;
 
     let (in_order, walked) = thread::scope(|scope| {
@@ -364,7 +380,7 @@ pub fn write_manifest(
             let job_rx = Arc::clone(&job_rx);
             let done_tx = done_tx.clone();
             scope.spawn(move || {
-                let mut compressor = match Compressor::new(level) {
+                let mut compressor = match Compressor::new(level, window_log) {
                     Ok(compressor) => compressor,
                     Err(report) => {
                         let _ = done_tx.send(Err(report));
@@ -407,7 +423,7 @@ pub fn write_manifest(
 
     let index = Index { parts, skips };
     let json = index.to_json()?;
-    let blob = zstd(json.as_bytes(), level)?;
+    let blob = zstd(json.as_bytes(), level, window_log)?;
     let index_frame = skippable(
         INDEX_FRAME_MAGIC,
         &[&INDEX_TAG, &FORMAT_VERSION.to_le_bytes(), &blob],
@@ -442,12 +458,9 @@ struct Compressor {
 }
 
 impl Compressor {
-    fn new(level: i32) -> Result<Self, Report<WriteError>> {
+    fn new(level: i32, window_log: u32) -> Result<Self, Report<WriteError>> {
         let mut context = zstd_safe::CCtx::create();
-        context
-            .set_parameter(zstd_safe::CParameter::CompressionLevel(level))
-            .map_err(|code| ZstdFailure(zstd_safe::get_error_name(code)))
-            .change_context(WriteError)?;
+        set_parameters(&mut context, level, window_log)?;
         Ok(Self {
             context,
             json: Vec::new(),
@@ -527,9 +540,38 @@ fn skippable(magic: u32, pieces: &[&[u8]]) -> Result<Vec<u8>, Report<WriteError>
     Ok(frame)
 }
 
-fn zstd(input: &[u8], level: i32) -> Result<Vec<u8>, Report<WriteError>> {
+// The level and the window, on a context about to compress one thing. A
+// window of 0 is zstd's own choice, which is what it makes when nobody sets
+// the parameter at all.
+fn set_parameters(
+    context: &mut zstd_safe::CCtx<'_>,
+    level: i32,
+    window_log: u32,
+) -> Result<(), Report<WriteError>> {
+    let mut set = |parameter| {
+        context
+            .set_parameter(parameter)
+            .map_err(|code| ZstdFailure(zstd_safe::get_error_name(code)))
+            .change_context(WriteError)
+            .map(|_| ())
+    };
+    set(zstd_safe::CParameter::CompressionLevel(level))?;
+    if window_log != 0 {
+        set(zstd_safe::CParameter::WindowLog(window_log))?;
+    }
+    // Four bytes a frame for a checksum over what it decodes to. Without it a
+    // flipped byte inside a frame can still decode, to JSON that parses and
+    // says something else; with it, the decoder refuses the frame.
+    set(zstd_safe::CParameter::ChecksumFlag(true))?;
+    Ok(())
+}
+
+fn zstd(input: &[u8], level: i32, window_log: u32) -> Result<Vec<u8>, Report<WriteError>> {
     let mut out = Vec::with_capacity(zstd_safe::compress_bound(input.len()));
-    zstd_safe::compress(&mut out, input, level)
+    let mut context = zstd_safe::CCtx::create();
+    set_parameters(&mut context, level, window_log)?;
+    context
+        .compress2(&mut out, input)
         .map_err(|code| ZstdFailure(zstd_safe::get_error_name(code)))
         .change_context(WriteError)?;
     Ok(out)

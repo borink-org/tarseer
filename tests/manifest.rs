@@ -72,6 +72,36 @@ fn the_bytes_do_not_depend_on_the_thread_count() {
 }
 
 #[test]
+fn the_match_window_changes_the_bytes_but_not_what_they_say() {
+    let temp_dir = wide_fixture("manifest-window");
+    let options = WalkOptions {
+        budget: 300,
+        ..WalkOptions::default()
+    };
+    let walked = walk(temp_dir.path(), &options).unwrap();
+
+    // 0 is zstd's own choice, 10 the smallest window it accepts.
+    for window_log in [0, 10, 17, 19, 27] {
+        let mut bytes = Vec::new();
+        let write_options = WriteOptions {
+            window_log,
+            ..WriteOptions::default()
+        };
+        write_manifest(temp_dir.path(), &options, &write_options, &mut bytes).unwrap();
+
+        let manifest = Manifest::parse(&bytes).unwrap();
+        assert_eq!(manifest.index.parts.len(), walked.parts.len());
+        for (number, part) in walked.parts.iter().enumerate() {
+            assert_eq!(
+                manifest.part_json(number).unwrap(),
+                part.to_json().unwrap().into_bytes(),
+                "window {window_log}, part {number}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_manifest_after_other_bytes_still_opens() {
     let temp_dir = fixture("manifest-prefix");
     let (bytes, _) = write(temp_dir.path(), 4 << 20, 2);
@@ -163,4 +193,28 @@ fn a_damaged_part_is_refused_when_it_is_read() {
     manifest.part_json(0).unwrap();
     let report = manifest.part_json(1).expect_err("a bad tag is refused");
     assert!(format!("{report:?}").contains("TSPT"));
+}
+
+#[test]
+fn a_flipped_byte_inside_a_part_is_refused_rather_than_decoded() {
+    let temp_dir = wide_fixture("manifest-flip");
+    let (bytes, _) = write(temp_dir.path(), 300, 2);
+    let part = Manifest::parse(&bytes).unwrap().index.parts[1].clone();
+
+    // Inside the compressed payload, past the frame's own header. Nothing but
+    // the frame checksum notices this: the damage decodes, to JSON that may
+    // well parse.
+    let start = usize::try_from(part.offset).unwrap();
+    for at in [
+        start + 20,
+        start + usize::try_from(part.frame_len).unwrap() / 2,
+    ] {
+        let mut damaged = bytes.clone();
+        damaged[at] ^= 0x55;
+        let manifest = Manifest::parse(&damaged).unwrap();
+        let report = manifest
+            .part_json(1)
+            .expect_err("a damaged part is refused");
+        assert_eq!(report.current_context(), &ReadError);
+    }
 }

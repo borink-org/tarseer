@@ -32,12 +32,28 @@ error-stack = "0.8"
 # The binary's global allocator; the library does not set one. Linked for
 # library users too until the CLI's dependencies move behind a feature.
 #
-# At its defaults it holds more than glibc here. Walking /nix/store (1.7M
-# entries) peaked at 64 MB against glibc's 26 MB, and most of that is freed
-# memory it keeps: MIMALLOC_PURGE_DELAY=0 gave 36 MB, and with
-# MIMALLOC_ARENA_EAGER_COMMIT=0 as well, 25 MB. The preloaded C library at
-# 3.1.5 walked in 39 MB at defaults; this crate bundles 3.3.2.
-mimalloc = "0.1"
+# mimalloc V3 (3.5.3 at the pinned commit), Linux only, and with no Cargo features at all: it is
+# configured through the environment of the build that produces the binary,
+# so nothing in the dependency graph can turn a mode on for the whole program.
+#
+# At its defaults it holds more than glibc here, and most of the difference is
+# freed memory it keeps. Peak RSS walking /nix/store (1.86M entries, 4 MiB
+# budget), and writing the same walk as a manifest (2 threads, level 9, the
+# default window):
+#
+#                                 walk    manifest
+#   glibc                        25 MB       42 MB
+#   defaults                     63 MB      116 MB
+#   MIMALLOC_PURGE_DELAY=0       34 MB       73 MB
+#   + MIMALLOC_ARENA_EAGER_COMMIT=0
+#                                23 MB       43 MB
+#
+# 3.5.3 measures within noise of the `mimalloc` crate's 3.3.2. Most of the
+# manifest column is zstd's compression
+# contexts, which come from the C allocator, not this one.
+#
+# Git until it is published.
+cyo-mimalloc = { git = "https://github.com/cyo-alloc/mimalloc" }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

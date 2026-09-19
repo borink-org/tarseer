@@ -16,7 +16,7 @@ use tarseer::{
 // mimalloc for the binary. Its memory-return settings are worth knowing: see the
 // note on the dependency in Cargo.toml.
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: cyo_mimalloc::MiMalloc = cyo_mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
     let matches = Command::new("tarseer")
@@ -48,6 +48,12 @@ fn main() -> ExitCode {
                 .help("zstd level for every part [default: 9]"),
         )
         .arg(
+            Arg::new("window-log")
+                .long("window-log")
+                .value_parser(value_parser!(u32))
+                .help("Match window per part, as a power of two; 0 for zstd's own [default: 19]"),
+        )
+        .arg(
             Arg::new("threads")
                 .long("threads")
                 .value_parser(value_parser!(usize))
@@ -76,6 +82,10 @@ fn write(dir: &Path, options: &WalkOptions<'_>, out: &Path, matches: &ArgMatches
             .get_one::<i32>("level")
             .copied()
             .unwrap_or(defaults.level),
+        window_log: matches
+            .get_one::<u32>("window-log")
+            .copied()
+            .unwrap_or(defaults.window_log),
         threads: matches
             .get_one::<usize>("threads")
             .copied()

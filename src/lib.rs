@@ -24,6 +24,9 @@
 //! - [`Part::to_json`]: one document per part, one array per column
 //! - [`write_manifest()`]: the walk's parts as independent zstd frames with an
 //!   index and a footer, all in skippable frames; [`Manifest`] reads it back
+//! - every frame carries a checksum, and its match window is capped, which is
+//!   what bounds a compression thread:
+//!   [`DEFAULT_WINDOW_LOG`](manifest::DEFAULT_WINDOW_LOG)
 //!
 //! # Errors
 //!
