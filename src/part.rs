@@ -1,13 +1,21 @@
-// TODO(docs): scaffold. Public docs in this file are notes, not prose.
-
-//! One part of a walk: a contiguous run of walk order, readable on its own.
+//! One part of a walk: a contiguous run of walk order that you can read
+//! without any other part.
 //!
-//! - rows split by kind, not tagged: every consumer wants one kind at a time
-//! - a row names its parent directory by node id plus its own last component;
-//!   no row stores a whole path, so text is linear in depth, not quadratic
-//! - nodes: `0` is the walk root, `1..=stem` the stem (the directories above
-//!   the part's first row), `stem + 1 + i` is `dirs[i]`
-//! - every id is local to the part: a part needs nothing outside itself
+//! A [`Part`] holds its rows in three tables, one per kind of entry:
+//! [`Part::dirs`], [`Part::files`] and [`Part::links`]. A row does not store
+//! its path. It stores the node id of its parent directory and its own name,
+//! and [`Part::path`] joins them back into a path.
+//!
+//! # Node ids
+//!
+//! A node id names a directory within one part:
+//!
+//! - `0` is the walk root;
+//! - `1..=stem` are the stem, the directories above the part's first row,
+//!   outermost first ([`Part::stem`]);
+//! - `stem + 1 + index` is `dirs[index]` ([`Part::dir_node`]).
+//!
+//! Node ids and text indexes mean nothing outside the part they came from.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -17,7 +25,7 @@ use error_stack::{Report, ResultExt as _};
 
 use crate::tape::StrTape;
 
-/// The part outgrew the `u32` it addresses its text and nodes with.
+/// The part's text or node ids passed what a `u32` can address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartFull;
 
@@ -29,25 +37,29 @@ impl fmt::Display for PartFull {
 
 impl std::error::Error for PartFull {}
 
-/// What an entry is.
+/// The kind of an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EntryKind {
+    /// A regular file.
     File,
+    /// A directory.
     Dir,
+    /// A symbolic link. The walk records its target and does not follow it.
     Symlink,
 }
 
-/// A point in time at the precision the filesystem gave.
-///
-/// - `secs` from the Unix epoch, negative before it
-/// - `nanos` always `0..1_000_000_000`, counting forward from `secs`
+/// A point in time, at the precision the filesystem reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp {
+    /// Whole seconds since the Unix epoch. Negative before it.
     pub secs: i64,
+    /// Nanoseconds after `secs`, in `0..1_000_000_000`.
     pub nanos: u32,
 }
 
 impl Timestamp {
+    /// Converts a [`SystemTime`] to seconds and nanoseconds since the Unix
+    /// epoch. A time more than `i64::MAX` seconds from the epoch saturates.
     #[must_use]
     pub fn from_system_time(time: SystemTime) -> Self {
         match time.duration_since(UNIX_EPOCH) {
@@ -74,59 +86,78 @@ impl Timestamp {
     }
 }
 
-/// A file.
-///
-/// - `parent`: node id of the directory holding it
-/// - `name`: tape index of its last component
-/// - `mode`: real Unix bits on Unix; on Windows derived from the read-only
-///   attribute, matching `tar`
-/// - `mtime`: `None` if the filesystem would not say
+/// A regular file.
 #[derive(Debug, Clone, Copy)]
 pub struct FileRow {
+    /// The node id of the directory that holds the file.
     pub parent: u32,
+    /// The text index of the file's name, for [`Part::text`].
     pub name: u32,
-    /// Size at walk time.
+    /// The file's size in bytes when the walk read its metadata.
     pub size: u64,
+    /// The modification time, or `None` if the filesystem reported none.
     pub mtime: Option<Timestamp>,
+    /// The permission bits. On Unix these are the low twelve bits of the
+    /// mode. On other platforms they are `0o644`, or `0o444` for a read-only
+    /// file.
     pub mode: u32,
 }
 
-/// A directory. Fields as [`FileRow`]; its own node id is
-/// [`Part::dir_node`].
+/// A directory. Its own node id is [`Part::dir_node`] of its index in
+/// [`Part::dirs`].
 #[derive(Debug, Clone, Copy)]
 pub struct DirRow {
+    /// The node id of the directory that holds this one.
     pub parent: u32,
+    /// The text index of the directory's name, for [`Part::text`].
     pub name: u32,
+    /// The modification time, or `None` if the filesystem reported none.
     pub mtime: Option<Timestamp>,
+    /// The permission bits. On Unix these are the low twelve bits of the
+    /// mode. On other platforms they are `0o755`, or `0o555` for a read-only
+    /// directory.
     pub mode: u32,
 }
 
-/// A symbolic link, never followed. Fields as [`FileRow`].
+/// A symbolic link.
 #[derive(Debug, Clone, Copy)]
 pub struct LinkRow {
+    /// The node id of the directory that holds the link.
     pub parent: u32,
+    /// The text index of the link's name, for [`Part::text`].
     pub name: u32,
-    /// Target as stored, forward slashes. Also in the tape.
+    /// The text index of the link's target, for [`Part::text`]. The target is
+    /// stored as the filesystem gave it, with any backslash replaced by a
+    /// forward slash.
     pub target: u32,
+    /// The modification time of the link itself, or `None` if the filesystem
+    /// reported none.
     pub mtime: Option<Timestamp>,
 }
 
-/// A contiguous run of walk order with its stem.
+/// A contiguous run of walk order, with the stem that places it in the tree.
+///
+/// The walk fills a part through [`Part::push_stem`], [`Part::push_dir`],
+/// [`Part::push_file`] and [`Part::push_link`]. You read it through the row
+/// tables and [`Part::text`], or as JSON through [`Part::to_json`].
 #[derive(Debug, Clone, Default)]
 pub struct Part {
     text: StrTape,
     stem: Vec<u32>,
+    /// Every directory in the part, in walk order.
     pub dirs: Vec<DirRow>,
+    /// Every regular file in the part, in walk order.
     pub files: Vec<FileRow>,
+    /// Every symbolic link in the part, in walk order.
     pub links: Vec<LinkRow>,
 }
 
 impl Part {
-    /// The string at tape index `index`: a row's `name`, or a link's `target`.
+    /// Returns the string at text index `index`: a row's name, or a link's
+    /// target.
     ///
     /// # Panics
-    /// If `index` is not from a row of this part. Every row index came from a
-    /// push below, so an invalid one is a bug here, not a caller's doing.
+    /// If `index` did not come from a row or the stem of this part.
     #[must_use]
     pub fn text(&self, index: u32) -> &str {
         self.text
@@ -134,23 +165,25 @@ impl Part {
             .expect("part tape index in range")
     }
 
-    /// The stem's components, outermost first.
+    /// Returns the stem's components, outermost first. The stem is empty when
+    /// the part starts at the walk root.
     #[must_use]
     pub fn stem(&self) -> impl ExactSizeIterator<Item = &str> {
         self.stem.iter().map(|&index| self.text(index))
     }
 
-    /// Node id of `dirs[index]`.
+    /// Returns the node id of `dirs[index]`.
     ///
     /// # Panics
-    /// Past `u32`, which pushing a row already refuses.
+    /// If the node id does not fit a `u32`. Pushing a directory row already
+    /// refuses that, so a part built by this crate cannot panic here.
     #[must_use]
     pub fn dir_node(&self, index: usize) -> u32 {
         u32::try_from(1 + self.stem.len() + index).expect("node ids fit a u32")
     }
 
-    /// The path of the entry `name` inside node `parent`, relative to the walk
-    /// root, forward slashes.
+    /// Returns the path of the entry named by text index `name` inside node
+    /// `parent`, relative to the walk root and joined with forward slashes.
     #[must_use]
     pub fn path(&self, parent: u32, name: u32) -> String {
         let mut components = vec![self.text(name)];
@@ -176,7 +209,8 @@ impl Part {
         }
     }
 
-    /// Path of the part's first row in walk order; `None` for an empty part.
+    /// Returns the path of the part's first row in walk order, or `None` if
+    /// the part holds no rows.
     #[must_use]
     pub fn first_path(&self) -> Option<String> {
         let dir = self.dirs.first().map(|row| self.path(row.parent, row.name));
@@ -194,7 +228,7 @@ impl Part {
             .min_by(|left, right| walk_order(left, right))
     }
 
-    /// Every entry with its path, in walk order.
+    /// Returns every entry with its path, in walk order.
     #[must_use]
     pub fn entries(&self) -> Vec<(String, EntryKind)> {
         let mut all = Vec::with_capacity(self.len());
@@ -217,18 +251,19 @@ impl Part {
         all
     }
 
-    /// Rows in the part; the stem is not counted.
+    /// Returns the number of rows. The stem is not counted.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.dirs.len() + self.files.len() + self.links.len()
     }
 
+    /// Returns `true` if the part holds no rows.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Sum of every file's size at walk time.
+    /// Returns the sum of every file's size.
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
         self.files.iter().map(|file| file.size).sum()
@@ -240,13 +275,14 @@ impl Part {
         Ok(index)
     }
 
-    /// Append a stem component, below the previous one.
+    /// Appends a stem component below the previous one.
     ///
     /// # Errors
-    /// [`PartFull`]: text tape overflowed.
+    /// [`PartFull`] if the text passed 4 GiB.
     ///
     /// # Panics
-    /// If a directory row was already pushed: the stem's node ids come first.
+    /// If a directory row was already pushed. The stem's node ids come before
+    /// every directory's, so the stem must be complete first.
     pub fn push_stem(&mut self, name: &str) -> Result<(), Report<PartFull>> {
         assert!(
             self.dirs.is_empty(),
@@ -257,10 +293,11 @@ impl Part {
         Ok(())
     }
 
-    /// Record a directory, returning its node id.
+    /// Appends a directory row and returns its node id.
     ///
     /// # Errors
-    /// [`PartFull`]: text tape or node ids overflowed.
+    /// [`PartFull`] if the text passed 4 GiB or the node id does not fit a
+    /// `u32`.
     pub fn push_dir(
         &mut self,
         parent: u32,
@@ -279,10 +316,10 @@ impl Part {
         Ok(node)
     }
 
-    /// Record a file.
+    /// Appends a file row.
     ///
     /// # Errors
-    /// [`PartFull`]: text tape overflowed.
+    /// [`PartFull`] if the text passed 4 GiB.
     pub fn push_file(
         &mut self,
         parent: u32,
@@ -302,10 +339,10 @@ impl Part {
         Ok(())
     }
 
-    /// Record a symlink.
+    /// Appends a symbolic link row.
     ///
     /// # Errors
-    /// As [`Part::push_file`].
+    /// [`PartFull`] if the text passed 4 GiB.
     pub fn push_link(
         &mut self,
         parent: u32,
@@ -325,14 +362,15 @@ impl Part {
     }
 }
 
-/// Walk order over two relative paths: component by component, each compared
-/// bytewise.
+/// Compares two relative paths in walk order.
 ///
-/// - a directory sorts before its contents, and its contents before its next
-///   sibling — unlike a plain string sort, where `a!` falls between `a` and
-///   `a/sub`
-/// - the same as mapping `/` to the lowest byte, since a name holds neither
-///   `/` nor NUL
+/// Walk order compares paths component by component, and each component
+/// bytewise. A directory sorts before its contents, and its contents sort
+/// before the directory's next sibling. A plain string comparison differs:
+/// there, `a!` falls between `a` and `a/sub`, because `!` is below `/`.
+///
+/// This is the same as comparing the paths bytewise with `/` mapped to the
+/// lowest byte, since a name holds neither `/` nor NUL.
 #[must_use]
 pub fn walk_order(left: &str, right: &str) -> Ordering {
     let key = |byte: u8| if byte == b'/' { 0 } else { byte };

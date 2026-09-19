@@ -1,48 +1,60 @@
-// TODO(docs): scaffold. Public docs in this file are notes, not prose.
-
-//! The manifest on disk: every part as its own zstd frame, an index of the
-//! parts, and a footer that locates both.
+//! The manifest: a walk written to a file as compressed parts, an index of
+//! the parts, and a footer.
+//!
+//! # How a write works
+//!
+//! 1. Fill a [`WalkOptions`] and a [`WriteOptions`]. [`WriteOptions::default()`]
+//!    compresses at [`DEFAULT_LEVEL`] with a [`DEFAULT_WINDOW_LOG`] window on
+//!    [`DEFAULT_THREADS`] threads.
+//! 2. Call [`write_manifest`] with the root, both option sets and a writer.
+//!    It walks the root, compresses each part as the walk seals it, and writes
+//!    the parts in walk order, then the index, then the footer.
+//! 3. Keep the returned [`Written`] if you want the [`Index`] without
+//!    reading the file back.
+//!
+//! # How a read works
+//!
+//! 1. Load the file, or the tail of it that holds the manifest, into memory.
+//! 2. Call [`Manifest::parse`] on the bytes. It reads the footer and the
+//!    index and checks that the parts fill the space before the index. It
+//!    decompresses no part.
+//! 3. Call [`Manifest::part_json`] with a part number to decompress that one
+//!    part. Search [`PartEntry::first`] across [`Index::parts`] to find the
+//!    parts a directory spans: a directory is one contiguous run of parts.
+//!
+//! # Layout
 //!
 //! ```text
 //! [part 0][part 1]…[part n-1][index][footer]
 //! ```
 //!
-//! - every piece is a zstd skippable frame, so a plain zstd decoder skips the
-//!   whole manifest; once a payload sits in front, what it yields is exactly
-//!   the payload
-//! - a part frame: a tag, then one ordinary zstd frame of the part's JSON;
-//!   parts decompress independently and in any order
-//! - the index frame: a tag, the format version, then one zstd frame of
-//!   columnar JSON with one row per part, in walk order
-//! - the footer: fixed size and last, so a reader starts from the tail
-//! - offsets count from the manifest's first byte, so the same bytes can follow
-//!   a payload unchanged
-//! - parts are compressed on worker threads while the walk goes on, and put
-//!   back in order by the writer; a full job queue holds the walk back
-//! - a worker keeps one zstd context, one JSON buffer and one output buffer for
-//!   every part it compresses: allocating and freeing them per part left each
-//!   thread's glibc arena holding its own copy, ~13 MB a thread
-//! - one level for every part, not recorded anywhere a reader looks, so not a
-//!   format property
+//! Every piece is a zstd skippable frame, so a plain zstd decoder skips the
+//! whole manifest. A manifest appended to an ordinary zstd stream leaves that
+//! stream decoding to the same bytes.
 //!
-//! # Defaults, measured
+//! - A part frame holds the tag `TSPT` and one ordinary zstd frame of the
+//!   part's JSON. Each part decompresses on its own.
+//! - The index frame holds the tag `TSIX`, [`FORMAT_VERSION`], and one zstd
+//!   frame of JSON. That JSON holds one column per field of [`PartEntry`],
+//!   with one value per part in walk order, and the [`Skips`].
+//! - The footer is [`FOOTER_LEN`] bytes and comes last. It holds the
+//!   manifest's length, the index frame's length, [`FORMAT_VERSION`] and
+//!   [`MAGIC`].
 //!
-//! `/nix/store`: 1.7 million entries, 91 parts, 67 MB of JSON, a 2.7 s walk.
+//! Every offset counts from the manifest's first byte, so bytes placed
+//! before the manifest do not change it. Every zstd frame carries a checksum
+//! of its content, and a frame whose checksum does not match is refused.
 //!
-//! | level | manifest | compress CPU | peak RSS (2 threads) |
-//! |---|---|---|---|
-//! | 6  | 10.95 MB | 1.2 s  | 41 MB  |
-//! | 9  | 10.73 MB | 1.6 s  | 59 MB  |
-//! | 15 | 10.59 MB | 3.0 s  | 137 MB |
-//! | 19 | 9.88 MB  | 12.1 s | 149 MB |
+//! The compression level and the window are not recorded in the manifest.
+//! Two writes with different settings differ in bytes and read back the same.
 //!
-//! - level 9: past it, size barely moves while CPU and workspace memory climb
-//! - not by size, as a single whole-tree manifest would be: a third of the
-//!   parts crossed a 1 MiB threshold, and a 19-below/3-above rule came out
-//!   larger than a flat 9 for twice the CPU
-//! - 2 threads: the serial walk seals a part every ~30 ms, one thread
-//!   compresses it in ~15 ms, and each extra thread keeps a zstd workspace;
-//!   on 22 threads peak RSS was 314 MB for the same wall time
+//! # Memory
+//!
+//! Each compression thread keeps one zstd context, one JSON buffer and one
+//! output buffer, and reuses them for every part. The context is the largest
+//! of the three, and its size follows the level and the window, not the
+//! part: see [`DEFAULT_WINDOW_LOG`]. The walk waits when every thread is
+//! busy and the queue of sealed parts, one slot per thread, is full.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -59,11 +71,12 @@ use crate::json::Column;
 use crate::part::Part;
 use crate::walk::{Skips, WalkError, WalkOptions, walk_parts};
 
-/// The last eight bytes of every manifest: the name, then `0x1a`, the
-/// end-of-file byte a text viewer stops at.
+/// The last eight bytes of every manifest: `TARSEER` and `0x1a`, the byte
+/// at which a DOS text viewer stops.
 pub const MAGIC: [u8; 8] = *b"TARSEER\x1a";
 
-/// Bumped by any change to the bytes; a mismatch is refused, not guessed at.
+/// The version of the layout this build writes and reads. [`Manifest::parse`]
+/// refuses any other.
 pub const FORMAT_VERSION: u16 = 1;
 
 const PART_FRAME_MAGIC: u32 = 0x184D_2A55;
@@ -78,32 +91,34 @@ const INDEX_PREFIX_LEN: usize = SKIPPABLE_HEAD_LEN + 4 + 2;
 // Manifest length, index frame length, format version, magic.
 const FOOTER_PAYLOAD_LEN: u32 = 8 + 8 + 2 + 8;
 
-/// Bytes of the footer frame, the last thing in every manifest.
+/// The length in bytes of the footer frame, the last thing in every manifest.
 pub const FOOTER_LEN: usize = SKIPPABLE_HEAD_LEN + FOOTER_PAYLOAD_LEN as usize;
 
-/// zstd level for every part and the index.
+/// The zstd level of [`WriteOptions::default()`].
 pub const DEFAULT_LEVEL: i32 = 9;
 
-/// Compression threads unless told otherwise.
+/// The number of compression threads of [`WriteOptions::default()`].
 pub const DEFAULT_THREADS: usize = 2;
 
-/// How far back a part's compression may look for a match, as a power of two.
+/// The match window of [`WriteOptions::default()`], as a power of two: 512 KiB.
 ///
-/// A compression context is sized from this, so it is what bounds the memory
-/// each thread holds: at level 9 a context is 10.5 MiB when zstd picks the
-/// window itself, 5.5 MiB at 19, 1.7 MiB at 17. Against /nix/store, 19 costs
-/// 0.19% of the manifest and 17 costs 2.8%.
-///
-/// `0` hands the choice back to zstd, which sizes the window from the part.
+/// zstd sizes a compression context from the window, so the window sets how
+/// much memory each compression thread holds. At level 9 a context takes
+/// 10.5 MiB when zstd chooses the window from the input, 5.5 MiB at a window
+/// of 19, and 1.7 MiB at 17. Measured on a walk of `/nix/store` on
+/// 2026-09-19, a window of 19 made the manifest 0.19% larger and 17 made it
+/// 2.8% larger than zstd's own choice.
 pub const DEFAULT_WINDOW_LOG: u32 = 19;
 
-/// Most JSON a reader will decompress for one part or the index. The sizes
-/// come from the file, and the file may be hostile.
+/// The most bytes [`Manifest`] will decompress for one part or for the index:
+/// 1 GiB. A frame that declares more is refused, since the declared size comes
+/// from the file and the file may be damaged or hostile.
 pub const MAX_RAW: u64 = 1 << 30;
 
 /// The manifest could not be written.
 ///
-/// - a failed walk is inside it: `report.contains::<WalkError>()`
+/// If the walk failed, its [`WalkError`] is inside the report:
+/// `report.contains::<WalkError>()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteError;
 
@@ -115,8 +130,8 @@ impl fmt::Display for WriteError {
 
 impl std::error::Error for WriteError {}
 
-/// The bytes are not a manifest this build can read; what is wrong is
-/// attached.
+/// The bytes are not a manifest this build can read. The report says what
+/// does not hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadError;
 
@@ -139,32 +154,39 @@ impl fmt::Display for ZstdFailure {
 
 impl std::error::Error for ZstdFailure {}
 
-/// One row of the index: where a part is and what it holds.
+/// One row of the index: where a part is in the manifest and what it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartEntry {
-    /// Start of the part's skippable frame, from the manifest's first byte.
+    /// The offset of the part's skippable frame from the manifest's first
+    /// byte.
     pub offset: u64,
-    /// Bytes of the whole skippable frame.
+    /// The length in bytes of the part's skippable frame.
     pub frame_len: u64,
-    /// Bytes of its JSON.
+    /// The length in bytes of the part's JSON, before compression.
     pub raw_len: u64,
+    /// The number of directory rows in the part.
     pub dirs: u64,
+    /// The number of file rows in the part.
     pub files: u64,
+    /// The number of link rows in the part.
     pub links: u64,
-    /// Path of its first row in walk order. Searching this column finds the
-    /// parts a folder spans, since a folder is one contiguous run.
+    /// The path of the part's first row in walk order. Empty if the part
+    /// holds no rows.
     pub first: String,
 }
 
-/// Every part, in walk order, and what the walk skipped.
+/// The index of a manifest: every part, in walk order, and what the walk
+/// skipped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Index {
+    /// One entry per part, in walk order.
     pub parts: Vec<PartEntry>,
+    /// What the walk skipped.
     pub skips: Skips,
 }
 
 impl Index {
-    /// Rows across every part.
+    /// Returns the number of rows over every part.
     #[must_use]
     pub fn entries(&self) -> u64 {
         self.parts
@@ -173,10 +195,11 @@ impl Index {
             .sum()
     }
 
-    /// The index's JSON.
+    /// Writes the index as the JSON document that the index frame holds.
     ///
     /// # Errors
-    /// [`WriteError`] if it cannot be serialized, which its types rule out.
+    /// [`WriteError`] if a column cannot be serialized. The types of the
+    /// columns rule that out.
     pub fn to_json(&self) -> Result<String, Report<WriteError>> {
         serde_json::to_string(&IndexJson(self)).change_context(WriteError)
     }
@@ -303,16 +326,17 @@ impl Serialize for SkipsJson {
     }
 }
 
-/// How to write.
+/// The settings of one write.
 #[derive(Debug, Clone, Copy)]
 pub struct WriteOptions {
-    /// zstd level for every part and the index.
+    /// The zstd level for every part and for the index.
     pub level: i32,
-    /// Match window for every part and the index, as a power of two, or `0`
-    /// for zstd's own choice. See [`DEFAULT_WINDOW_LOG`]: this is the knob
-    /// that bounds what a compression thread holds.
+    /// The match window for every part and for the index, as a power of two.
+    /// `0` lets zstd choose the window from each input. The window sets the
+    /// memory each compression thread holds: see [`DEFAULT_WINDOW_LOG`].
     pub window_log: u32,
-    /// Compression threads. The bytes written do not depend on it.
+    /// The number of compression threads. `0` is treated as 1. The bytes
+    /// written do not depend on this.
     pub threads: usize,
 }
 
@@ -326,13 +350,15 @@ impl Default for WriteOptions {
     }
 }
 
-/// What a write produced.
+/// What [`write_manifest`] wrote.
 #[derive(Debug, Clone)]
 pub struct Written {
+    /// The index, as the index frame holds it.
     pub index: Index,
-    /// Bytes of JSON across every part, before compression.
+    /// The length in bytes of every part's JSON added together, before
+    /// compression.
     pub raw_len: u64,
-    /// Bytes of the whole manifest, footer included.
+    /// The length in bytes of the whole manifest, footer included.
     pub len: u64,
 }
 
@@ -347,18 +373,20 @@ struct Framed {
     first: String,
 }
 
-/// Walk `root` and write its manifest to `out`.
+/// Walks `root` and writes its manifest to `out`.
 ///
-/// - parts are compressed on `options.threads` threads as the walk seals them
-/// - `out` sees the parts in walk order, then the index, then the footer
-/// - on failure `out` holds a prefix; nothing is taken back
+/// The walk runs on the calling thread. Each part is compressed on one of
+/// `options.threads` threads as soon as the walk seals it. `out` receives
+/// the parts in walk order, then the index, then the footer. After an error,
+/// `out` holds whatever was written before it; nothing is taken back.
 ///
 /// # Errors
-/// [`WriteError`]: the walk failed (inside it), a part or the index could not
-/// be compressed or framed, or `out` refused a write.
+/// [`WriteError`] if the walk failed (its [`WalkError`] is inside the
+/// report), if a part or the index could not be compressed or framed, or if
+/// `out` returned an error.
 ///
 /// # Panics
-/// If a compression thread panics, which nothing in it is expected to do.
+/// If a compression thread panics. Nothing in one is expected to.
 pub fn write_manifest(
     root: &Path,
     walk_options: &WalkOptions<'_>,
@@ -450,7 +478,9 @@ pub fn write_manifest(
 }
 
 // One worker's reusable state. Only the framed result, a fraction of the
-// JSON's size, is allocated per part.
+// JSON's size, is allocated per part. Allocating and freeing the context and
+// the buffers per part left each thread's glibc arena holding its own copy of
+// them, about 13 MB a thread (measured 2026-09-14 on a walk of /nix/store).
 struct Compressor {
     context: zstd_safe::CCtx<'static>,
     json: Vec<u8>,
@@ -577,24 +607,29 @@ fn zstd(input: &[u8], level: i32, window_log: u32) -> Result<Vec<u8>, Report<Wri
     Ok(out)
 }
 
-/// A manifest over bytes held in memory.
+/// A manifest over bytes held in memory, with its index decoded.
 #[derive(Debug, Clone)]
 pub struct Manifest<'a> {
     bytes: &'a [u8],
     // Where the manifest starts within `bytes`.
     start: usize,
+    /// The index, decoded by [`Manifest::parse`].
     pub index: Index,
 }
 
 impl<'a> Manifest<'a> {
-    /// Open the manifest that ends `bytes`. Anything may come before it.
+    /// Opens the manifest at the end of `bytes`. Any bytes may come before
+    /// it.
     ///
-    /// - checks the footer, the index frame, and that the parts tile the
-    ///   space before the index exactly
-    /// - does not decompress any part
+    /// This checks the footer and the index frame, decodes the index, and
+    /// checks that the parts fill the space before the index exactly. It
+    /// decompresses no part.
     ///
     /// # Errors
-    /// [`ReadError`], saying what does not hold.
+    /// [`ReadError`] if `bytes` does not end in a manifest of
+    /// [`FORMAT_VERSION`], if the index frame is damaged or its checksum does
+    /// not match, or if the parts and the footer disagree about the layout.
+    /// The report says which.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Report<ReadError>> {
         let Some(footer_at) = bytes.len().checked_sub(FOOTER_LEN) else {
             return corrupt(|| format!("{} bytes is shorter than a footer", bytes.len()));
@@ -657,10 +692,13 @@ impl<'a> Manifest<'a> {
         })
     }
 
-    /// The JSON of part `number`, decompressed.
+    /// Decompresses part `number` and returns its JSON.
     ///
     /// # Errors
-    /// [`ReadError`]: no such part, or its frame is not what the index says.
+    /// [`ReadError`] if there is no part `number`, if the part's frame is
+    /// not tagged as a part, if the frame is damaged or its checksum does
+    /// not match, or if the frame does not decompress to the length the
+    /// index gives for it.
     pub fn part_json(&self, number: usize) -> Result<Vec<u8>, Report<ReadError>> {
         let Some(entry) = self.index.parts.get(number) else {
             return corrupt(|| format!("there is no part {number}"));

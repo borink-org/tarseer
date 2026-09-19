@@ -13,8 +13,8 @@ use tarseer::{
     write_manifest,
 };
 
-// mimalloc for the binary. Its memory-return settings are worth knowing: see the
-// note on the dependency in Cargo.toml.
+// mimalloc for the binary only. The comment on the dependency in Cargo.toml
+// records what it costs and which of its settings return memory sooner.
 #[global_allocator]
 static GLOBAL: cyo_mimalloc::MiMalloc = cyo_mimalloc::MiMalloc;
 
@@ -45,13 +45,13 @@ fn main() -> ExitCode {
             Arg::new("level")
                 .long("level")
                 .value_parser(value_parser!(i32))
-                .help("zstd level for every part [default: 9]"),
+                .help("zstd level for every part and the index [default: 9]"),
         )
         .arg(
             Arg::new("window-log")
                 .long("window-log")
                 .value_parser(value_parser!(u32))
-                .help("Match window per part, as a power of two; 0 for zstd's own [default: 19]"),
+                .help("Match window for compression, as a power of two; 0 lets zstd choose [default: 19]"),
         )
         .arg(
             Arg::new("threads")
@@ -138,19 +138,15 @@ struct Totals {
     links: u64,
 }
 
-/// Print a report and exit unsuccessfully.
-///
-/// `{:?}` rather than `{}` on purpose: a `Report`'s `Display` is its top
-/// context alone, and its `Debug` is the whole thing — every context it passed
-/// through, what was attached at each, and a backtrace when `RUST_BACKTRACE`
-/// asks for one. On a command that has just failed, the whole thing is the
-/// point.
+// Prints the report and returns the failure exit code. `{:?}`, because a
+// `Report`'s `Display` is its top context alone and its `Debug` is every
+// context, every attachment, and a backtrace when `RUST_BACKTRACE` is set.
 fn fail<C: 'static>(report: &Report<C>) -> ExitCode {
     eprintln!("tarseer: {report:?}");
     ExitCode::FAILURE
 }
 
-/// The counts, on stderr — the parts on stdout are nobody else's to share.
+// The counts go to stderr so that stdout holds only the parts.
 fn summarize(totals: &Totals, skips: Skips) {
     eprintln!(
         "{} parts, {} entries: {} files, {} dirs, {} symlinks",

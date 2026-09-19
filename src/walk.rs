@@ -1,32 +1,59 @@
-// TODO(docs): scaffold. Public docs in this file are notes, not prose.
-
-//! The source walk: every entry under a root, in walk order, cut into parts.
+//! The source walk: every entry under a root, in walk order, handed out in
+//! parts.
 //!
-//! - walk order: depth-first, each directory's entries sorted by name
-//! - serial for now; the parallel walk lands later and must cut identically
+//! # How a walk works
+//!
+//! 1. Fill a [`WalkOptions`]. [`WalkOptions::default()`] records everything
+//!    under the root, fails on the first entry it cannot read, and cuts parts
+//!    at [`DEFAULT_BUDGET`].
+//! 2. Call [`walk_parts`] with the root and a sink. The walk hands the sink
+//!    each [`Part`] as soon as the part is complete, in walk order, and holds
+//!    nothing of it afterwards. [`walk`] does the same and collects the parts
+//!    into a [`Walk`].
+//! 3. Read each part's rows, or write it with [`Part::to_json`].
+//!
+//! The walk opens no file and reads no contents. Paths are relative to the
+//! root, and the root itself has no row.
+//!
+//! # Walk order
+//!
+//! The walk is depth-first. It lists each directory, sorts the entries by
+//! name, bytewise, and visits them in that order. A directory's row comes
+//! directly before the rows of its contents.
+//! [`walk_order`](crate::walk_order) compares two paths in this order.
 //!
 //! # Where parts are cut
 //!
-//! Sizes are *estimated* JSON bytes ([`estimate`]), from names and fixed
-//! per-row widths only, so a cut never depends on anything decided later.
+//! Each row has an estimated size in JSON bytes ([`estimate`]), computed from
+//! its kind and the lengths of its name and target. The walk sums these
+//! estimates and cuts parts against [`WalkOptions::budget`]:
 //!
-//! - a subtree within the budget is never split
-//! - an over-budget directory groups its children in order, each group as
-//!   large as fits
-//! - an over-budget child closes the group before it and is split the same way
-//! - a directory's own row goes with the first part of its contents
+//! - a directory whose whole subtree fits the budget is never split;
+//! - a directory whose subtree does not fit groups its children in order, and
+//!   each group takes as many children as fit;
+//! - a child whose own subtree does not fit closes the group before it and is
+//!   cut by these same rules;
+//! - a directory's own row goes into the first part of its contents.
 //!
-//! Where a cut falls depends only on the subtree and its siblings, never on
-//! what came before, which is what lets a task that walks a subtree produce
-//! that subtree's parts by itself.
+//! Where a cut falls depends only on the tree, the filter and the budget,
+//! never on how the walk was scheduled.
 //!
-//! # Holding only what is undecided
+//! # Memory
 //!
-//! Rows wait in one queue until their part is sealed. A directory is
-//! *measuring* until its subtree passes the budget, and *split* after. The
-//! outermost measuring directory is always the one to cross first, and when it
-//! does, every group before it is sealed, outermost first, so parts leave in
-//! walk order. Waiting rows stay around two budgets.
+//! The walk holds the rows that are not yet in a sealed part, and their
+//! estimates add up to less than about two budgets. It also holds the listing
+//! of every directory between the root and the entry being visited, so a
+//! directory with millions of children costs its whole listing while the walk
+//! is inside it.
+//!
+//! # Skips
+//!
+//! Under either [`OnError`] policy, the walk skips and counts in [`Skips`]
+//! sockets, fifos and devices, and entries whose name or link target is not
+//! UTF-8. Under [`OnError::Skip`] it also skips entries whose type, metadata
+//! or link target cannot be read, and directories that cannot be opened,
+//! together with everything under them. Under [`OnError::Fail`] those fail
+//! the walk. A root that cannot be opened fails the walk under either policy.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -38,22 +65,23 @@ use error_stack::{Report, ResultExt as _};
 
 use crate::part::{EntryKind, Part, Timestamp};
 
-/// Default part budget, in estimated JSON bytes.
+/// The budget of [`WalkOptions::default()`]: 4 MiB of estimated JSON per
+/// part.
 pub const DEFAULT_BUDGET: u64 = 4 << 20;
 
 // Fixed per-row estimates: every column a row adds to its part's JSON except
-// its strings, including the ones filled in after the walk (checksum, frame,
-// offset). Fixed on purpose: the real digit widths are either not known yet or
-// changed by `--reproducible`, and a cut must not move with them.
+// its strings, with room for columns a later stage may add (checksum, frame,
+// offset). Fixed, because the real digit widths are not known at walk time
+// and a cut must not move with them.
 const FILE_ROW: u64 = 140;
 const DIR_ROW: u64 = 45;
 const LINK_ROW: u64 = 40;
 
 /// The walk could not finish.
 ///
-/// - one context for the whole walk; what went wrong is attached
-/// - distinguishable causes: `report.contains::<Cancelled>()`,
-///   `report.contains::<PartFull>()`
+/// The report names the entry the walk failed on. Two causes have their own
+/// types inside the report: [`Cancelled`] and [`PartFull`](crate::PartFull). Test for them
+/// with `report.contains::<Cancelled>()` and `report.contains::<PartFull>()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalkError;
 
@@ -65,7 +93,8 @@ impl fmt::Display for WalkError {
 
 impl std::error::Error for WalkError {}
 
-/// The cancel flag was raised. Parts already handed to the sink stay handed.
+/// The walk stopped because [`WalkOptions::cancel`] was set. Parts the sink
+/// already received are complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cancelled;
 
@@ -79,33 +108,37 @@ impl std::error::Error for Cancelled {}
 
 /// Decides which entries the walk records.
 ///
-/// - asked before anything is stated or descended into
-/// - a refused directory costs its whole subtree, uncounted
-/// - parts depend on the filter: it is part of the input, like the tree
+/// The walk asks the filter about every entry before it reads the entry's
+/// metadata or lists it. A refused directory is not listed, so nothing under
+/// it is offered or counted. The filter changes where parts are cut, in the
+/// same way that the tree does.
 pub trait Filter: Send + Sync {
+    /// Returns `true` to record `candidate`, or `false` to leave it out.
     fn keep(&self, candidate: &Candidate<'_>) -> bool;
 }
 
 /// An entry offered to a [`Filter`].
 pub struct Candidate<'a> {
-    /// Path of the directory holding it, relative to the root; empty at the
-    /// root.
+    /// The path of the directory that holds the entry, relative to the root.
+    /// Empty for an entry in the root.
     pub parent: &'a str,
+    /// The entry's name.
     pub name: &'a str,
+    /// The entry's kind.
     pub kind: EntryKind,
-    /// Everything else in the same directory, for rules that depend on
-    /// siblings.
+    /// Every entry of the same directory, the candidate included.
     pub listing: Listing<'a>,
 }
 
-/// One directory's entries, sorted by name.
+/// The entries of one directory, sorted by name.
 #[derive(Clone, Copy)]
 pub struct Listing<'a> {
     entries: &'a [Listed],
 }
 
 impl<'a> Listing<'a> {
-    /// Whether an entry named `name` is in the directory. A binary search.
+    /// Returns `true` if the directory holds an entry named `name`. This is a
+    /// binary search over the sorted names.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
         self.entries
@@ -113,67 +146,82 @@ impl<'a> Listing<'a> {
             .is_ok()
     }
 
-    /// Every UTF-8 name, sorted.
+    /// Returns every name that is UTF-8, in sorted order.
     pub fn names(&self) -> impl Iterator<Item = &'a str> + use<'a> {
         self.entries.iter().filter_map(|entry| entry.name.to_str())
     }
 
-    /// Entries, including ones whose names are not UTF-8.
+    /// Returns the number of entries, including those whose names are not
+    /// UTF-8.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Returns `true` if the directory holds no entries.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }
 
-/// Told what the walk is doing. Every method defaults to nothing.
+/// Receives a call for each step the walk takes. Every method does nothing
+/// unless you override it.
 pub trait Progress: Send + Sync {
-    /// About to list a directory; empty for the root.
+    /// Called before the walk lists the directory at `dir`. `dir` is empty for
+    /// the root.
     fn entered(&self, _dir: &str) {}
-    /// An entry was recorded. `size` is 0 for anything but a file.
+    /// Called when the walk records an entry. `size` is the file's size, or 0
+    /// for a directory or a link.
     fn recorded(&self, _kind: EntryKind, _size: u64) {}
-    /// An entry was counted in [`Skips`] instead. `path` is lossy for a
-    /// non-UTF-8 name.
+    /// Called when the walk skips an entry and counts it in [`Skips`]. A name
+    /// that is not UTF-8 appears in `path` with its invalid bytes replaced by
+    /// U+FFFD.
     fn skipped(&self, _path: &str, _reason: SkipReason) {}
 }
 
-/// Why an entry was skipped.
+/// Why the walk skipped an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
-    /// Socket, fifo, device: no bytes and no target.
+    /// The entry is a socket, a fifo or a device.
     Special,
-    /// Name or symlink target is not UTF-8.
+    /// The entry's name or link target is not UTF-8.
     NonUtf8,
-    /// A directory that could not be listed; its subtree is missing too.
+    /// The entry is a directory that could not be opened, and the policy is
+    /// [`OnError::Skip`]. Nothing under it was visited.
     Unreadable,
-    /// Type, metadata or target unreadable, under [`OnError::Skip`].
+    /// The entry's type, metadata or link target could not be read, and the
+    /// policy is [`OnError::Skip`].
     Failed,
 }
 
-/// What an entry the walk fails to read costs.
+/// What the walk does with an entry it cannot read: one whose type, metadata
+/// or link target cannot be read, or a directory that cannot be opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OnError {
-    /// The walk fails, naming the entry. What an archive wants: a hole there
-    /// would be silent.
+    /// The walk fails with a [`WalkError`] that names the entry.
     #[default]
     Fail,
-    /// Counted in [`Skips::failed`] and reported to [`Progress::skipped`].
+    /// The walk counts the entry in [`Skips::failed`], or a directory it
+    /// cannot open in [`Skips::unreadable`], reports it to
+    /// [`Progress::skipped`], and goes on.
     Skip,
 }
 
-/// How to walk.
+/// The settings of one walk.
 #[derive(Clone, Copy)]
 pub struct WalkOptions<'a> {
-    /// Estimated JSON bytes per part.
+    /// The estimated JSON bytes a part may hold before the walk cuts it. See
+    /// [the module doc](self#where-parts-are-cut) for how a cut is placed.
     pub budget: u64,
+    /// The filter the walk consults before recording an entry, if any.
     pub filter: Option<&'a dyn Filter>,
+    /// The receiver of progress calls, if any.
     pub progress: Option<&'a dyn Progress>,
-    /// Checked before every entry.
+    /// A flag the walk reads before every entry. Set it to `true` to stop the
+    /// walk with [`Cancelled`].
     pub cancel: Option<&'a AtomicBool>,
+    /// What the walk does with an entry it cannot read.
     pub on_error: OnError,
 }
 
@@ -189,43 +237,53 @@ impl Default for WalkOptions<'_> {
     }
 }
 
-/// Entries the walk met and did not record, by reason. A filter's refusals
-/// are not counted.
+/// The entries the walk met and did not record, counted by [`SkipReason`].
+/// Entries a [`Filter`] refused are not counted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Skips {
+    /// Sockets, fifos and devices.
     pub special: u32,
+    /// Entries whose name or link target is not UTF-8.
     pub non_utf8: u32,
+    /// Directories that could not be opened under [`OnError::Skip`]. Each
+    /// counts once, whatever it held.
     pub unreadable: u32,
+    /// Entries whose type, metadata or link target could not be read under
+    /// [`OnError::Skip`].
     pub failed: u32,
 }
 
 impl Skips {
+    /// Returns the number of skipped entries over every reason.
     #[must_use]
     pub const fn total(&self) -> u32 {
         self.special + self.non_utf8 + self.unreadable + self.failed
     }
 
+    /// Returns `true` if the walk skipped anything.
     #[must_use]
     pub const fn any(&self) -> bool {
         self.total() > 0
     }
 }
 
-/// A whole walk, collected: see [`walk`].
+/// A whole walk, as [`walk`] returns it.
 #[derive(Debug, Clone, Default)]
 pub struct Walk {
+    /// Every part, in walk order.
     pub parts: Vec<Part>,
+    /// What the walk skipped.
     pub skips: Skips,
 }
 
 impl Walk {
-    /// Every entry with its path, in walk order.
+    /// Returns every entry with its path, in walk order.
     #[must_use]
     pub fn entries(&self) -> Vec<(String, EntryKind)> {
         self.parts.iter().flat_map(Part::entries).collect()
     }
 
-    /// Every path, in walk order.
+    /// Returns every path, in walk order.
     #[must_use]
     pub fn paths(&self) -> Vec<String> {
         self.parts
@@ -235,23 +293,31 @@ impl Walk {
             .collect()
     }
 
+    /// Returns the number of rows over every part.
     #[must_use]
     pub fn len(&self) -> usize {
         self.parts.iter().map(Part::len).sum()
     }
 
+    /// Returns `true` if the walk recorded nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Returns the sum of every file's size.
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
         self.parts.iter().map(Part::total_bytes).sum()
     }
 }
 
-/// Estimated JSON bytes of one row. `target` is empty for all but a symlink.
+/// Returns the estimated JSON bytes of one row: a fixed width for its kind,
+/// plus the lengths of `name` and `target`. Pass an empty `target` for
+/// anything but a link.
+///
+/// The estimate is what the walk cuts parts against. It is not the number of
+/// bytes [`Part::to_json`] writes for the row.
 #[must_use]
 pub fn estimate(kind: EntryKind, name: &str, target: &str) -> u64 {
     let fixed = match kind {
@@ -262,7 +328,10 @@ pub fn estimate(kind: EntryKind, name: &str, target: &str) -> u64 {
     fixed + name.len() as u64 + target.len() as u64
 }
 
-/// Walk `root`, collecting every part.
+/// Walks `root` and collects every part.
+///
+/// The whole walk is in memory when this returns. Use [`walk_parts`] to
+/// handle each part as it is sealed instead.
 ///
 /// # Errors
 /// As [`walk_parts`].
@@ -275,15 +344,18 @@ pub fn walk(root: &Path, options: &WalkOptions<'_>) -> Result<Walk, Report<WalkE
     Ok(Walk { parts, skips })
 }
 
-/// Walk `root`, handing each part to `sink` as it is sealed, in walk order.
+/// Walks `root` and hands each part to `sink` as soon as it is sealed, in
+/// walk order.
 ///
-/// - `root` itself is not recorded; paths are relative to it
-/// - an unreadable directory costs its subtree; the rest still walks
-/// - a sink error stops the walk and is returned as is
+/// Returns what the walk skipped. `root` itself gets no row, and every path
+/// is relative to it. An error from `sink` stops the walk and is returned
+/// unchanged.
 ///
 /// # Errors
-/// [`WalkError`]: an entry unreadable under [`OnError::Fail`], cancelled, a
-/// part outgrew its `u32` addressing, or the sink failed.
+/// [`WalkError`] if `root` cannot be opened, if an entry cannot be read or
+/// a directory cannot be opened under [`OnError::Fail`], if [`WalkOptions::cancel`] was set
+/// ([`Cancelled`]), if a part passed the `u32` it addresses its text and
+/// nodes with ([`PartFull`](crate::PartFull)), or if `sink` returned an error.
 pub fn walk_parts(
     root: &Path,
     options: &WalkOptions<'_>,
@@ -379,7 +451,7 @@ impl Walker<'_, '_> {
         let listing = match fs::read_dir(root) {
             Ok(read) => self.collect(read)?,
             // No root, no tree: a skip here would report an empty walk as a
-            // success.
+            // success. Every other unreadable directory is a skip.
             Err(error) => {
                 return Err(error)
                     .attach_with(|| format!("listing {}", root.display()))

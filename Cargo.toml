@@ -5,7 +5,7 @@ name = "tarseer"
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
-description = "Parallel .tar.zst archiver + custom index with optimized file walking, parallelized tar creation and compression and random-access support"
+description = "Walks a directory tree into memory-bounded parts and writes them as a compressed, indexed manifest: the source half of a parallel .tar.zst archiver"
 repository = "https://github.com/borink-org/tarseer"
 readme = "README.md"
 
@@ -39,7 +39,7 @@ error-stack = "0.8"
 # At its defaults it holds more than glibc here, and most of the difference is
 # freed memory it keeps. Peak RSS walking /nix/store (1.86M entries, 4 MiB
 # budget), and writing the same walk as a manifest (2 threads, level 9, the
-# default window):
+# default window), measured 2026-09-19:
 #
 #                                 walk    manifest
 #   glibc                        25 MB       42 MB

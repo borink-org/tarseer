@@ -1,15 +1,15 @@
-// TODO(docs): scaffold. Public docs in this file are notes, not prose.
-
-//! A string tape: many strings in one allocation, addressed by index.
+//! Many strings in one allocation, each addressed by its index.
 //!
-//! Tape: one text arena, one `u32` offset per string, append-only. Not the
-//! `stringtape` crate — that reaches its `&str` through
-//! `from_utf8_unchecked`, and this crate is `forbid(unsafe_code)`.
-//! Attribution in the README.
+//! [`StrTape`] holds every string in one text buffer and one `u32` offset per
+//! string. This crate uses it for the names in a [`Part`](crate::Part).
+//!
+//! The layout is the one the `stringtape` crate uses (see the README). That
+//! crate reads its strings back through `from_utf8_unchecked`, and this crate
+//! forbids `unsafe` code, so the layout is written out here instead.
 
 use std::fmt;
 
-/// The tape's 4 GiB text limit was reached.
+/// The tape holds 4 GiB of text and cannot take more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TapeFull;
 
@@ -21,12 +21,11 @@ impl fmt::Display for TapeFull {
 
 impl std::error::Error for TapeFull {}
 
-/// Append-only, indexable strings in one arena.
+/// An append-only sequence of strings, addressed by index.
 ///
-/// - one `String` per row: one live allocation each, ~25 MB of headers and
-///   size-class rounding at 200k paths
-/// - arena + one `u32` offset: two allocations, no rounding
-/// - text capped at 4 GiB, so an offset fits a `u32`
+/// The text lives in one buffer, and each string is a `u32` offset into it.
+/// A tape is two allocations however many strings it holds. The text is
+/// limited to 4 GiB so that an offset fits a `u32`.
 #[derive(Debug, Clone)]
 pub struct StrTape {
     arena: String,
@@ -45,7 +44,8 @@ impl Default for StrTape {
 }
 
 impl StrTape {
-    /// Room for `entries` strings over `bytes` of text.
+    /// Creates an empty tape with room for `entries` strings holding `bytes`
+    /// of text in total.
     #[must_use]
     pub fn with_capacity(bytes: usize, entries: usize) -> Self {
         let mut offsets = Vec::with_capacity(entries + 1);
@@ -56,11 +56,11 @@ impl StrTape {
         }
     }
 
-    /// Append `text`.
+    /// Appends `text` as the next string.
     ///
     /// # Errors
-    /// [`TapeFull`] past 4 GiB. Nothing appended, so the tape stays
-    /// consistent.
+    /// [`TapeFull`] if appending `text` would take the tape past 4 GiB. The
+    /// tape is unchanged after that error.
     pub fn push(&mut self, text: &str) -> Result<(), TapeFull> {
         let end = u32::try_from(self.arena.len() + text.len()).map_err(|_| TapeFull)?;
         self.arena.push_str(text);
@@ -68,7 +68,8 @@ impl StrTape {
         Ok(())
     }
 
-    /// The string at `index`, or `None` past the end.
+    /// Returns the string at `index`, or `None` if the tape holds fewer than
+    /// `index + 1` strings.
     #[must_use]
     pub fn get(&self, index: usize) -> Option<&str> {
         let end = *self.offsets.get(index.checked_add(1)?)? as usize;
@@ -76,23 +77,25 @@ impl StrTape {
         Some(&self.arena[start..end])
     }
 
+    /// Returns the number of strings.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }
 
+    /// Returns `true` if the tape holds no strings.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Bytes of text held.
+    /// Returns the bytes of text held, summed over every string.
     #[must_use]
     pub const fn bytes(&self) -> usize {
         self.arena.len()
     }
 
-    /// Every string, in insertion order.
+    /// Returns every string, in the order it was pushed.
     pub fn iter(&self) -> impl Iterator<Item = &str> {
         self.offsets
             .windows(2)

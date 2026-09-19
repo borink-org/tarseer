@@ -34,8 +34,8 @@ impl Drop for TempDir {
     }
 }
 
-/// Files, directories and one symlink, deliberately not in sorted order on
-/// disk.
+/// Files, directories and one symlink, created in an order that is not
+/// sorted, so that a walk which does not sort fails the order tests.
 pub fn fixture(tag: &str) -> TempDir {
     let temp_dir = TempDir::new(tag);
     let root = temp_dir.path();

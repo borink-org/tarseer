@@ -1,15 +1,24 @@
-// TODO(docs): scaffold. Public docs in this file are notes, not prose.
-// TODO(docs): the shape itself is unreviewed too — group names and which
-// columns each group carries are all still open.
-
-//! The JSON form of a part: its stem, then one array per column, all the same
-//! length within a group.
+//! The JSON form of a part.
 //!
-//! - columns, not an array of objects, for the reason a part is columns: a
-//!   reader after sizes should not parse every name to reach them
-//! - arrays also compress far better than values interleaved with field names
-//! - no second copy of the document: columns written straight from the rows
-//! - `mtime` is seconds or `null` when unknown; `mtime_nanos` carries the rest
+//! [`Part::to_json`] writes one document per part:
+//!
+//! ```json
+//! {
+//!   "stem": ["usr", "lib"],
+//!   "dirs":  {"parent": [0], "name": ["x"], "mode": [493], "mtime": [1700000000], "mtime_nanos": [0]},
+//!   "files": {"parent": [3], "name": ["y"], "size": [12], "mode": [420], "mtime": [null], "mtime_nanos": [0]},
+//!   "links": {"parent": [3], "name": ["z"], "target": ["y"], "mtime": [1700000000], "mtime_nanos": [500]}
+//! }
+//! ```
+//!
+//! Each of `dirs`, `files` and `links` holds one array per column, and
+//! every array in a group has one value per row. `parent` is a node id and
+//! `name` a component, as in [`Part`]. `mtime` is whole seconds since the
+//! Unix epoch, or `null` when the filesystem reported no time; `mtime_nanos`
+//! is the nanoseconds after it, and `0` when `mtime` is `null`.
+//!
+//! The document is written straight from the rows, without a second copy of
+//! the part in memory.
 
 use std::fmt;
 
@@ -18,10 +27,10 @@ use serde::{Serialize, Serializer, ser::SerializeStruct};
 
 use crate::part::{Part, Timestamp};
 
-/// A part could not be rendered as JSON.
+/// The part could not be written as JSON.
 ///
-/// - in practice ruled out — every value is a string, an integer or `null` —
-///   so read the source if it ever does fire
+/// Every value in the document is a string, an integer or `null`, so this
+/// error is not expected to occur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JsonError;
 
@@ -143,17 +152,17 @@ impl Serialize for Part {
 }
 
 impl Part {
-    /// Serialize to the JSON form.
+    /// Writes the part as a JSON document.
     ///
     /// # Errors
-    /// [`JsonError`] if a column cannot be serialized — which the types here
-    /// rule out.
+    /// [`JsonError`] if a column cannot be serialized. The types of the
+    /// columns rule that out.
     pub fn to_json(&self) -> Result<String, Report<JsonError>> {
         serde_json::to_string(self).change_context(JsonError)
     }
 
-    /// As [`Part::to_json`], into `out` after clearing it, so a caller that
-    /// renders many parts reuses one buffer.
+    /// Clears `out` and writes the part as a JSON document into it. Use this
+    /// to write many parts through one buffer.
     ///
     /// # Errors
     /// As [`Part::to_json`].
