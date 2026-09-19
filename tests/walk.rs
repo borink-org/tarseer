@@ -80,6 +80,18 @@ fn the_walk_order_matches_a_plain_recursive_sorted_walk() {
 }
 
 #[test]
+fn a_root_that_cannot_be_listed_fails_the_walk() {
+    let temp_dir = TempDir::new("noroot");
+    let missing = temp_dir.path().join("missing");
+    let report = walk(&missing, &WalkOptions::default()).expect_err("no root, no walk");
+    assert_eq!(report.current_context(), &WalkError);
+    assert!(
+        format!("{report:?}").contains("missing"),
+        "the report should name the root: {report:?}"
+    );
+}
+
+#[test]
 fn an_empty_tree_holds_nothing() {
     let temp_dir = TempDir::new("empty");
     let walk = walk_default(temp_dir.path());
@@ -185,14 +197,37 @@ fn a_raised_cancel_flag_stops_the_walk() {
 
 #[cfg(unix)]
 #[test]
-fn an_unreadable_directory_is_counted_and_the_rest_still_walks() {
+fn an_unreadable_directory_fails_the_walk_and_says_which_one() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = fixture("locked-fail");
+    let locked = temp_dir.path().join("zed");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let walked = walk(temp_dir.path(), &WalkOptions::default());
+    // Restore before asserting, so a failure still lets the fixture clean up.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let report = walked.expect_err("an unopenable directory fails the walk");
+    assert_eq!(report.current_context(), &WalkError);
+    assert!(
+        format!("{report:?}").contains("listing zed"),
+        "the report should name the directory: {report:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn under_skip_an_unreadable_directory_is_counted_and_the_rest_still_walks() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp_dir = fixture("locked");
     let locked = temp_dir.path().join("zed");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-    let walked = walk(temp_dir.path(), &WalkOptions::default());
-    // Restore before asserting, so a failure still lets the fixture clean up.
+    let options = WalkOptions {
+        on_error: OnError::Skip,
+        ..WalkOptions::default()
+    };
+    let walked = walk(temp_dir.path(), &options);
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 
     let walked = walked.unwrap();

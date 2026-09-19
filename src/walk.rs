@@ -376,7 +376,16 @@ impl Walker<'_, '_> {
         if let Some(progress) = self.options.progress {
             progress.entered("");
         }
-        let listing = self.list(root)?;
+        let listing = match fs::read_dir(root) {
+            Ok(read) => self.collect(read)?,
+            // No root, no tree: a skip here would report an empty walk as a
+            // success.
+            Err(error) => {
+                return Err(error)
+                    .attach_with(|| format!("listing {}", root.display()))
+                    .change_context(WalkError);
+            }
+        };
         self.stack.push(Level {
             listing,
             next: 0,
@@ -545,12 +554,24 @@ impl Walker<'_, '_> {
         Ok(())
     }
 
-    // Read and sort a directory. An unreadable one is a skip, not an error.
+    // Read and sort a directory below the root. One that cannot be opened
+    // costs its whole subtree, so under `Skip` it has its own count.
     fn list(&mut self, dir: &Path) -> Result<Vec<Listed>, Report<WalkError>> {
-        let Ok(read) = fs::read_dir(dir) else {
-            self.skip(SkipReason::Unreadable);
-            return Ok(Vec::new());
-        };
+        match fs::read_dir(dir) {
+            Ok(read) => self.collect(read),
+            Err(error) => match self.options.on_error {
+                OnError::Fail => Err(error)
+                    .attach_with(|| format!("listing {}", self.path))
+                    .change_context(WalkError),
+                OnError::Skip => {
+                    self.skip(SkipReason::Unreadable);
+                    Ok(Vec::new())
+                }
+            },
+        }
+    }
+
+    fn collect(&mut self, read: fs::ReadDir) -> Result<Vec<Listed>, Report<WalkError>> {
         let mut listing = Vec::new();
         for entry in read {
             let entry = match entry {
