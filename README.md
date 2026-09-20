@@ -1,9 +1,7 @@
 # tarseer
 
 Walks a directory tree into memory-bounded parts and writes them as a
-compressed, indexed manifest. This is the source half of a parallel `.tar.zst`
-archiver. The archive itself does not exist yet, and nothing here opens a file
-or reads its contents.
+compressed, indexed manifest. It opens no file and reads no contents.
 
 ## Walking a tree
 
@@ -64,8 +62,7 @@ stem (the directories above its first row) and three tables of rows, one
 column per attribute: directories, files and symlinks. A symlink row records
 whether it is a Windows directory link, since extraction there must choose a
 kind before the target exists. A file with more than one name is recorded at
-each name as a plain file, so an archive built from the manifest would hold
-its content once per name.
+each name as a plain file.
 
 Parts are cut by the tree's structure against a budget of estimated JSON bytes:
 

@@ -1,10 +1,9 @@
 //! Walks a directory tree and records every entry in it, in parts that each
 //! fit a memory budget.
 //!
-//! This crate is the source half of a `.tar.zst` archiver. It walks a tree,
-//! cuts the walk into [`Part`]s, writes a part as JSON, and writes every part
-//! of a walk into one compressed, indexed manifest. It opens no file and
-//! reads no contents.
+//! This crate walks a tree, cuts the walk into [`Part`]s, writes a part as
+//! JSON, and writes every part of a walk into one compressed, indexed
+//! manifest. It opens no file and reads no contents.
 //!
 //! # How a walk works
 //!

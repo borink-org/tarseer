@@ -5,7 +5,7 @@ name = "tarseer"
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
-description = "Walks a directory tree into memory-bounded parts and writes them as a compressed, indexed manifest: the source half of a parallel .tar.zst archiver"
+description = "Walks a directory tree into memory-bounded parts and writes them as a compressed, indexed manifest"
 repository = "https://github.com/borink-org/tarseer"
 readme = "README.md"
 
