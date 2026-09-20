@@ -159,8 +159,8 @@ struct Counting {
 }
 
 impl Progress for Counting {
-    fn entered(&self, dir: &str) {
-        self.entered.lock().unwrap().push(dir.to_owned());
+    fn entered(&self, directory: &str) {
+        self.entered.lock().unwrap().push(directory.to_owned());
     }
 
     fn recorded(&self, _kind: EntryKind, size: u64) {

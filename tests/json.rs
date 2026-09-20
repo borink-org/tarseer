@@ -14,9 +14,9 @@ fn every_group_has_one_value_per_row_in_every_column() {
     let temp_dir = fixture("json");
     let walked = walk(temp_dir.path(), &WalkOptions::default()).unwrap();
     let part = &walked.parts[0];
-    let doc = parse(part);
+    let document = parse(part);
 
-    for (group, cols, want) in [
+    for (group, columns, want) in [
         (
             "files",
             &["parent", "name", "size", "mode", "mtime", "mtime_nanos"][..],
@@ -40,12 +40,12 @@ fn every_group_has_one_value_per_row_in_every_column() {
             part.symlinks.len(),
         ),
     ] {
-        for col in cols {
-            let got = doc[group][col]
+        for column in columns {
+            let got = document[group][column]
                 .as_array()
                 .expect("a column is an array")
                 .len();
-            assert_eq!(got, want, "{group}.{col}");
+            assert_eq!(got, want, "{group}.{column}");
         }
     }
 }
@@ -61,15 +61,15 @@ fn the_json_rebuilds_every_path_of_its_part() {
     assert!(walked.parts.len() > 1);
 
     for part in &walked.parts {
-        let doc = parse(part);
-        let stem: Vec<String> = doc["stem"]
+        let document = parse(part);
+        let stem: Vec<String> = document["stem"]
             .as_array()
             .unwrap()
             .iter()
             .map(|name| name.as_str().unwrap().to_owned())
             .collect();
-        let dir_parent = doc["directories"]["parent"].as_array().unwrap();
-        let dir_name = doc["directories"]["name"].as_array().unwrap();
+        let directory_parent = document["directories"]["parent"].as_array().unwrap();
+        let directory_name = document["directories"]["name"].as_array().unwrap();
 
         // Node 0 is the root, then the stem, then each directory row.
         let node_path = |node: u64| -> String {
@@ -81,27 +81,27 @@ fn the_json_rebuilds_every_path_of_its_part() {
                     node -= 1;
                 } else {
                     let row = node - stem.len() - 1;
-                    components.push(dir_name[row].as_str().unwrap().to_owned());
-                    node = usize::try_from(dir_parent[row].as_u64().unwrap()).unwrap();
+                    components.push(directory_name[row].as_str().unwrap().to_owned());
+                    node = usize::try_from(directory_parent[row].as_u64().unwrap()).unwrap();
                 }
             }
             components.reverse();
             components.join("/")
         };
         let join = |parent: &serde_json::Value, name: &serde_json::Value| {
-            let dir = node_path(parent.as_u64().unwrap());
+            let directory = node_path(parent.as_u64().unwrap());
             let name = name.as_str().unwrap();
-            if dir.is_empty() {
+            if directory.is_empty() {
                 name.to_owned()
             } else {
-                format!("{dir}/{name}")
+                format!("{directory}/{name}")
             }
         };
 
         let mut from_json = Vec::new();
         for group in ["directories", "files", "symlinks"] {
-            let parents = doc[group]["parent"].as_array().unwrap();
-            let names = doc[group]["name"].as_array().unwrap();
+            let parents = document[group]["parent"].as_array().unwrap();
+            let names = document[group]["name"].as_array().unwrap();
             for (parent, name) in parents.iter().zip(names) {
                 from_json.push(join(parent, name));
             }
@@ -117,10 +117,10 @@ fn the_json_rebuilds_every_path_of_its_part() {
 fn the_columns_carry_the_sizes_and_targets_that_were_written() {
     let temp_dir = fixture("json-values");
     let walked = walk(temp_dir.path(), &WalkOptions::default()).unwrap();
-    let doc = parse(&walked.parts[0]);
+    let document = parse(&walked.parts[0]);
 
-    let names = doc["files"]["name"].as_array().unwrap();
-    let sizes = doc["files"]["size"].as_array().unwrap();
+    let names = document["files"]["name"].as_array().unwrap();
+    let sizes = document["files"]["size"].as_array().unwrap();
     let at = |name: &str| -> u64 {
         let index = names
             .iter()
@@ -132,10 +132,13 @@ fn the_columns_carry_the_sizes_and_targets_that_were_written() {
     assert_eq!(at("z.bin"), 10);
 
     if cfg!(unix) {
-        assert_eq!(doc["symlinks"]["name"][0].as_str(), Some("link"));
-        assert_eq!(doc["symlinks"]["target"][0].as_str(), Some("../top.txt"));
+        assert_eq!(document["symlinks"]["name"][0].as_str(), Some("link"));
+        assert_eq!(
+            document["symlinks"]["target"][0].as_str(),
+            Some("../top.txt")
+        );
         assert!(
-            doc["symlinks"]["directory"][0].is_null(),
+            document["symlinks"]["directory"][0].is_null(),
             "a Unix symlink has no kind"
         );
     }

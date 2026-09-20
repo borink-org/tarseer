@@ -73,8 +73,8 @@ pub const DEFAULT_BUDGET: u64 = 4 << 20;
 // strings, rounded up. Fixed, because the digit widths of the real values are
 // not known when a cut is decided, and a cut must not move with them.
 const FILE_ROW: u64 = 140;
-const DIR_ROW: u64 = 45;
-const LINK_ROW: u64 = 46;
+const DIRECTORY_ROW: u64 = 45;
+const SYMLINK_ROW: u64 = 46;
 
 /// The walk could not finish.
 ///
@@ -167,9 +167,9 @@ impl<'a> Listing<'a> {
 /// Receives a call for each step the walk takes. Every method does nothing
 /// unless you override it.
 pub trait Progress: Send + Sync {
-    /// Called before the walk lists the directory at `dir`. `dir` is empty for
-    /// the root.
-    fn entered(&self, _dir: &str) {}
+    /// Called before the walk lists the directory at `directory`, which is
+    /// empty for the root.
+    fn entered(&self, _directory: &str) {}
     /// Called when the walk records an entry. `size` is the file's size, or 0
     /// for a directory or a link.
     fn recorded(&self, _kind: EntryKind, _size: u64) {}
@@ -321,8 +321,8 @@ impl Walk {
 pub fn estimate(kind: EntryKind, name: &str, target: &str) -> u64 {
     let fixed = match kind {
         EntryKind::File => FILE_ROW,
-        EntryKind::Directory => DIR_ROW,
-        EntryKind::Symlink => LINK_ROW,
+        EntryKind::Directory => DIRECTORY_ROW,
+        EntryKind::Symlink => SYMLINK_ROW,
     };
     fixed + name.len() as u64 + target.len() as u64
 }
@@ -631,8 +631,8 @@ impl Walker<'_, '_> {
 
     // Read and sort a directory below the root. One that cannot be opened
     // costs its whole subtree, so under `Skip` it has its own count.
-    fn list(&mut self, dir: &Path) -> Result<Vec<Listed>, Report<WalkError>> {
-        match fs::read_dir(dir) {
+    fn list(&mut self, directory: &Path) -> Result<Vec<Listed>, Report<WalkError>> {
+        match fs::read_dir(directory) {
             Ok(read) => self.collect(read),
             Err(error) => match self.options.on_error {
                 OnError::Fail => Err(error)
@@ -890,16 +890,16 @@ fn symlink_is_directory(file_type: FileType) -> Option<bool> {
     }
 }
 
-fn mode_of(metadata: &fs::Metadata, is_dir: bool) -> u32 {
+fn mode_of(metadata: &fs::Metadata, is_directory: bool) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let _ = is_dir;
+        let _ = is_directory;
         metadata.mode() & 0o7777
     }
     #[cfg(not(unix))]
     {
-        match (is_dir, metadata.permissions().readonly()) {
+        match (is_directory, metadata.permissions().readonly()) {
             (true, true) => 0o555,
             (true, false) => 0o755,
             (false, true) => 0o444,

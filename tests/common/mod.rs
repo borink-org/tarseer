@@ -67,11 +67,11 @@ pub fn wide_fixture(tag: &str) -> TempDir {
         fs::write(root.join(format!("flat/file{index:03}.dat")), b"flat").unwrap();
     }
     for group in ["a", "a!", "a.b", "b"] {
-        let dir = root.join(group);
-        fs::create_dir_all(dir.join("inner")).unwrap();
+        let directory = root.join(group);
+        fs::create_dir_all(directory.join("inner")).unwrap();
         for index in 0..7 {
-            fs::write(dir.join(format!("f{index}")), b"g").unwrap();
-            fs::write(dir.join(format!("inner/g{index}")), b"h").unwrap();
+            fs::write(directory.join(format!("f{index}")), b"g").unwrap();
+            fs::write(directory.join(format!("inner/g{index}")), b"h").unwrap();
         }
     }
     fs::create_dir_all(root.join("empty/also_empty")).unwrap();
@@ -91,14 +91,14 @@ pub fn walk_default(root: &Path) -> Walk {
 
 /// The oracle: `read_dir` plus a sort per directory, which the walk cannot
 /// influence. Paths come out in walk order.
-pub fn recurse(dir: &Path, path: &str, out: &mut Vec<String>) {
-    let mut kids: Vec<_> = fs::read_dir(dir)
+pub fn recurse(directory: &Path, path: &str, out: &mut Vec<String>) {
+    let mut children: Vec<_> = fs::read_dir(directory)
         .unwrap()
         .map(|entry| entry.unwrap())
         .map(|entry| (entry.file_name(), entry.file_type().unwrap()))
         .collect();
-    kids.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, ft) in kids {
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, file_type) in children {
         let name = name.to_str().unwrap().to_owned();
         let path = if path.is_empty() {
             name.clone()
@@ -106,8 +106,8 @@ pub fn recurse(dir: &Path, path: &str, out: &mut Vec<String>) {
             format!("{path}/{name}")
         };
         out.push(path.clone());
-        if ft.is_dir() {
-            recurse(&dir.join(&name), &path, out);
+        if file_type.is_dir() {
+            recurse(&directory.join(&name), &path, out);
         }
     }
 }

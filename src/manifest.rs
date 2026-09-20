@@ -205,11 +205,11 @@ impl Index {
     }
 
     fn from_json(raw: &[u8]) -> Result<Self, Report<ReadError>> {
-        let doc: serde_json::Value = serde_json::from_slice(raw).change_context(ReadError)?;
-        if doc["format_version"].as_u64() != Some(u64::from(FORMAT_VERSION)) {
+        let document: serde_json::Value = serde_json::from_slice(raw).change_context(ReadError)?;
+        if document["format_version"].as_u64() != Some(u64::from(FORMAT_VERSION)) {
             return corrupt(|| "the index names another format version".to_owned());
         }
-        let parts = &doc["parts"];
+        let parts = &document["parts"];
         let column = |name: &str| -> Result<Vec<u64>, Report<ReadError>> {
             let Some(values) = parts[name].as_array() else {
                 return corrupt(|| format!("index column {name} is missing"));
@@ -262,7 +262,7 @@ impl Index {
         }
 
         let skip = |name: &str| -> Result<u32, Report<ReadError>> {
-            match doc["skips"][name].as_u64().map(u32::try_from) {
+            match document["skips"][name].as_u64().map(u32::try_from) {
                 Some(Ok(count)) => Ok(count),
                 _ => corrupt(|| format!("index skip count {name} is missing")),
             }
@@ -367,7 +367,7 @@ pub struct Written {
 
 // A part, compressed and framed, waiting for its turn.
 struct Framed {
-    seq: usize,
+    sequence: usize,
     frame: Vec<u8>,
     raw_len: u64,
     directories: u64,
@@ -404,27 +404,27 @@ pub fn write_manifest(
     let (in_order, walked) = thread::scope(|scope| {
         // Bounded, so a walk that outruns compression waits instead of
         // queueing parts without limit.
-        let (job_tx, job_rx) = mpsc::sync_channel::<(usize, Part)>(threads);
-        let job_rx = Arc::new(Mutex::new(job_rx));
-        let (done_tx, done_rx) = mpsc::channel();
+        let (job_sender, job_receiver) = mpsc::sync_channel::<(usize, Part)>(threads);
+        let job_receiver = Arc::new(Mutex::new(job_receiver));
+        let (done_sender, done_receiver) = mpsc::channel();
         for _ in 0..threads {
-            let job_rx = Arc::clone(&job_rx);
-            let done_tx = done_tx.clone();
+            let job_receiver = Arc::clone(&job_receiver);
+            let done_sender = done_sender.clone();
             scope.spawn(move || {
                 let mut compressor = match Compressor::new(level, window_log) {
                     Ok(compressor) => compressor,
                     Err(report) => {
-                        let _ = done_tx.send(Err(report));
+                        let _ = done_sender.send(Err(report));
                         return;
                     }
                 };
                 loop {
-                    let job = job_rx
+                    let job = job_receiver
                         .lock()
                         .expect("no worker panics holding the job queue")
                         .recv();
-                    let Ok((seq, part)) = job else { break };
-                    if done_tx.send(compressor.frame(seq, &part)).is_err() {
+                    let Ok((sequence, part)) = job else { break };
+                    if done_sender.send(compressor.frame(sequence, &part)).is_err() {
                         break;
                     }
                 }
@@ -432,20 +432,20 @@ pub fn write_manifest(
         }
         // Only the workers hold these now: when they have all stopped, the
         // walk's next send fails instead of waiting forever.
-        drop(job_rx);
-        drop(done_tx);
-        let writer = scope.spawn(move || write_in_order(done_rx, writer_out));
+        drop(job_receiver);
+        drop(done_sender);
+        let writer = scope.spawn(move || write_in_order(done_receiver, writer_out));
 
-        let mut seq = 0;
+        let mut sequence = 0;
         let walked = walk_parts(root, walk_options, &mut |part| {
-            if job_tx.send((seq, part)).is_err() {
+            if job_sender.send((sequence, part)).is_err() {
                 // The writer stopped; its own error is the one returned.
                 return Err(Report::new(WalkError));
             }
-            seq += 1;
+            sequence += 1;
             Ok(())
         });
-        drop(job_tx);
+        drop(job_sender);
         let in_order = writer.join().expect("the manifest writer does not panic");
         (in_order, walked)
     });
@@ -501,7 +501,7 @@ impl Compressor {
         })
     }
 
-    fn frame(&mut self, seq: usize, part: &Part) -> Result<Framed, Report<WriteError>> {
+    fn frame(&mut self, sequence: usize, part: &Part) -> Result<Framed, Report<WriteError>> {
         part.write_json(&mut self.json).change_context(WriteError)?;
         self.compressed.clear();
         self.compressed
@@ -512,7 +512,7 @@ impl Compressor {
             .map_err(|code| ZstdFailure(zstd_safe::get_error_name(code)))
             .change_context(WriteError)?;
         Ok(Framed {
-            seq,
+            sequence,
             frame: skippable(PART_FRAME_MAGIC, &[&PART_TAG, &self.compressed])?,
             raw_len: self.json.len() as u64,
             directories: part.directories.len() as u64,
@@ -535,7 +535,7 @@ fn write_in_order(
     let mut raw_len = 0;
     for framed in done {
         let framed = framed?;
-        early.insert(framed.seq, framed);
+        early.insert(framed.sequence, framed);
         while let Some(framed) = early.remove(&entries.len()) {
             out.write_all(&framed.frame).change_context(WriteError)?;
             let frame_len = framed.frame.len() as u64;
@@ -552,21 +552,25 @@ fn write_in_order(
             raw_len += framed.raw_len;
         }
     }
-    if let Some(&seq) = early.keys().next() {
-        return Err(WriteError)
-            .attach_with(|| format!("part {} never arrived, but part {seq} did", entries.len()));
+    if let Some(&sequence) = early.keys().next() {
+        return Err(WriteError).attach_with(|| {
+            format!(
+                "part {} never arrived, but part {sequence} did",
+                entries.len()
+            )
+        });
     }
     Ok((entries, offset, raw_len))
 }
 
 fn skippable(magic: u32, pieces: &[&[u8]]) -> Result<Vec<u8>, Report<WriteError>> {
     let len: usize = pieces.iter().map(|piece| piece.len()).sum();
-    let len_u32 = u32::try_from(len)
+    let payload_len = u32::try_from(len)
         .change_context(WriteError)
         .attach_with(|| format!("{len} bytes is past a skippable frame's 4 GiB"))?;
     let mut frame = Vec::with_capacity(SKIPPABLE_HEAD_LEN + len);
     frame.extend_from_slice(&magic.to_le_bytes());
-    frame.extend_from_slice(&len_u32.to_le_bytes());
+    frame.extend_from_slice(&payload_len.to_le_bytes());
     for piece in pieces {
         frame.extend_from_slice(piece);
     }

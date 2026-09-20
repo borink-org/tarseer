@@ -31,10 +31,14 @@ impl Node {
     }
 }
 
-fn read(dir: &Path, path: &str) -> Vec<Node> {
-    let mut kids: Vec<_> = fs::read_dir(dir).unwrap().map(Result::unwrap).collect();
-    kids.sort_by_key(fs::DirEntry::file_name);
-    kids.into_iter()
+fn read(directory: &Path, path: &str) -> Vec<Node> {
+    let mut children: Vec<_> = fs::read_dir(directory)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    children.sort_by_key(fs::DirEntry::file_name);
+    children
+        .into_iter()
         .map(|entry| {
             let name = entry.file_name().into_string().unwrap();
             let child = if path.is_empty() {

@@ -61,9 +61,9 @@ fn main() -> ExitCode {
         )
         .get_matches();
 
-    let dir: &PathBuf = matches
+    let directory: &PathBuf = matches
         .get_one("dir")
-        .expect("clap requires the dir argument");
+        .expect("clap requires the directory argument");
     let options = WalkOptions {
         budget: matches
             .get_one::<u64>("budget")
@@ -72,12 +72,17 @@ fn main() -> ExitCode {
         ..WalkOptions::default()
     };
     match matches.get_one::<PathBuf>("out") {
-        Some(out) => write(dir, &options, out, &matches),
-        None => print_parts(dir, &options),
+        Some(out) => write(directory, &options, out, &matches),
+        None => print_parts(directory, &options),
     }
 }
 
-fn write(dir: &Path, options: &WalkOptions<'_>, out: &Path, matches: &ArgMatches) -> ExitCode {
+fn write(
+    directory: &Path,
+    options: &WalkOptions<'_>,
+    out: &Path,
+    matches: &ArgMatches,
+) -> ExitCode {
     let defaults = WriteOptions::default();
     let write_options = WriteOptions {
         level: matches
@@ -100,7 +105,12 @@ fn write(dir: &Path, options: &WalkOptions<'_>, out: &Path, matches: &ArgMatches
         Ok(file) => file,
         Err(report) => return fail(&report),
     };
-    match write_manifest(dir, options, &write_options, &mut BufWriter::new(file)) {
+    match write_manifest(
+        directory,
+        options,
+        &write_options,
+        &mut BufWriter::new(file),
+    ) {
         Ok(written) => {
             summarize_manifest(&written);
             ExitCode::SUCCESS
@@ -109,9 +119,9 @@ fn write(dir: &Path, options: &WalkOptions<'_>, out: &Path, matches: &ArgMatches
     }
 }
 
-fn print_parts(dir: &Path, options: &WalkOptions<'_>) -> ExitCode {
+fn print_parts(directory: &Path, options: &WalkOptions<'_>) -> ExitCode {
     let mut totals = Totals::default();
-    let walked = walk_parts(dir, options, &mut |part| {
+    let walked = walk_parts(directory, options, &mut |part| {
         let json = part
             .to_json()
             .attach_with(|| format!("part {}", totals.parts))

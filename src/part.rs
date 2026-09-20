@@ -220,7 +220,7 @@ impl Part {
     /// the part holds no rows.
     #[must_use]
     pub fn first_path(&self) -> Option<String> {
-        let dir = self
+        let directory = self
             .directories
             .first()
             .map(|row| self.path(row.parent, row.name));
@@ -232,7 +232,7 @@ impl Part {
             .symlinks
             .first()
             .map(|row| self.path(row.parent, row.name));
-        [dir, file, link]
+        [directory, file, link]
             .into_iter()
             .flatten()
             .min_by(|left, right| walk_order(left, right))
