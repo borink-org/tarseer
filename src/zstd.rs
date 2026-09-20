@@ -1,35 +1,9 @@
-//! The zstd codec, and a manifest as one zstd file.
+//! The zstd format: a manifest as one seekable zstd file.
 //!
-//! # How a write works
-//!
-//! 1. Fill a [`Zstd`]. [`Zstd::default()`] compresses at [`DEFAULT_LEVEL`]
-//!    with a [`DEFAULT_WINDOW_LOG`] window.
-//! 2. Call [`write_file`] with the root, a [`WalkOptions`], the codec, a
-//!    thread count and a writer.
-//!
-//! # How a read works
-//!
-//! 1. Load the file into memory and call [`SeekableFile::parse`]. It reads
-//!    the seek table and the index, and decompresses no part.
-//! 2. Call [`SeekableFile::part_json`] with a part number to decompress that
-//!    one part.
-//!
-//! # Examples
-//!
-//! ```
-//! use std::path::Path;
-//! use tarseer::WalkOptions;
-//! use tarseer::zstd::{SeekableFile, Zstd, write_file};
-//!
-//! let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-//! let mut bytes = Vec::new();
-//! let written = write_file(&root, &WalkOptions::default(), &Zstd::default(), 2, &mut bytes).unwrap();
-//!
-//! let file = SeekableFile::parse(&bytes).unwrap();
-//! assert_eq!(file.index, written.index);
-//! let json = file.part_json(0).unwrap();
-//! assert!(json.starts_with(b"{\"stem\":[]"));
-//! ```
+//! [`Zstd`] is a [`Codec`] and a [`Format`]. Pass it to
+//! [`write_file`](crate::file::write_file) and
+//! [`ManifestFile::parse`](crate::file::ManifestFile::parse); the
+//! [`file`](mod@crate::file) module has the procedure and an example.
 //!
 //! # Layout
 //!
@@ -37,11 +11,11 @@
 //! [part 0][part 1]…[part n-1][index][seek table]
 //! ```
 //!
-//! Each part and the index is one ordinary zstd frame, as [`write_frames`]
-//! hands it out. `zstd -dc` over the file therefore prints a JSON Lines
-//! document: one line per part, then the index. Every frame carries a
-//! checksum of its content, and a frame whose checksum does not match is
-//! refused.
+//! Each part and the index is one ordinary zstd frame, as
+//! [`write_frames`](crate::frames::write_frames) hands it out. `zstd -dc` over
+//! the file therefore prints a JSON Lines document: one line per part, then
+//! the index. Every frame carries a checksum of its content, and a frame whose
+//! checksum does not match is refused. The file has no header.
 //!
 //! The seek table is the one from zstd's seekable format. It is a skippable
 //! frame, which a zstd decoder passes over without output. It lists the
@@ -58,15 +32,11 @@
 
 use std::fmt;
 use std::io::Write;
-use std::path::Path;
 
 use error_stack::{Report, ResultExt as _};
 
-use crate::frames::{
-    Codec, Encoder, Frame, ReadError, WriteError, decode_index, decode_line, write_frames,
-};
-use crate::manifest::Index;
-use crate::walk::WalkOptions;
+use crate::file::{Format, FrameSize, FrameSpan};
+use crate::frames::{Codec, Encoder, ReadError, WriteError};
 
 /// The zstd level of [`Zstd::default()`].
 pub const DEFAULT_LEVEL: i32 = 9;
@@ -105,7 +75,8 @@ impl fmt::Display for ZstdFailure {
 
 impl std::error::Error for ZstdFailure {}
 
-/// The zstd codec: every frame is one zstd frame with a content checksum.
+/// The zstd codec and file format: every frame is one zstd frame with a
+/// content checksum, and the file ends in a seek table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Zstd {
     /// The compression level.
@@ -188,114 +159,47 @@ impl Encoder for ZstdEncoder {
     }
 }
 
-/// What [`write_file`] wrote.
-#[derive(Debug, Clone)]
-pub struct Written {
-    /// The index, as the last frame holds it.
-    pub index: Index,
-    /// The length in bytes of the JSON Lines document the file decompresses
-    /// to.
-    pub raw_len: u64,
-    /// The length in bytes of the whole file, seek table included.
-    pub len: u64,
-}
-
-/// Walks `root` and writes its manifest to `out` as one seekable zstd file.
-///
-/// `out` receives the frames of [`write_frames`] in order, then the seek
-/// table. After an error, `out` holds whatever was written before it.
-///
-/// # Errors
-/// [`WriteError`] as [`write_frames`], if a frame passes the 4 GiB that a
-/// seek table entry can record, or if `out` returned an error.
-///
-/// # Panics
-/// As [`write_frames`].
-pub fn write_file(
-    root: &Path,
-    walk_options: &WalkOptions<'_>,
-    codec: &Zstd,
-    threads: usize,
-    out: &mut (dyn Write + Send),
-) -> Result<Written, Report<WriteError>> {
-    let mut sizes: Vec<(u32, u32)> = Vec::new();
-    let index = {
-        let frame_out = &mut *out;
-        write_frames(root, walk_options, codec, threads, &mut |frame: Frame| {
-            let size = |len: u64| {
-                u32::try_from(len)
-                    .change_context(WriteError)
-                    .attach_with(|| format!("a frame of {len} bytes is past a seek table entry"))
-            };
-            sizes.push((size(frame.bytes.len() as u64)?, size(frame.raw_len)?));
-            frame_out.write_all(&frame.bytes).change_context(WriteError)
-        })?
-    };
-    let table = seek_table(&sizes)?;
-    out.write_all(&table).change_context(WriteError)?;
-    out.flush().change_context(WriteError)?;
-
-    let sum = |pick: fn(&(u32, u32)) -> u32| sizes.iter().map(|size| u64::from(pick(size))).sum();
-    let compressed: u64 = sum(|size| size.0);
-    Ok(Written {
-        index,
-        raw_len: sum(|size| size.1),
-        len: compressed + table.len() as u64,
-    })
-}
-
 // The seek table of zstd's seekable format, without per-frame checksums.
-fn seek_table(sizes: &[(u32, u32)]) -> Result<Vec<u8>, Report<WriteError>> {
-    let payload_len = sizes.len() * SEEK_TABLE_ENTRY_LEN + SEEK_TABLE_FOOTER_LEN;
-    let (Ok(payload_len_u32), Ok(frames)) =
-        (u32::try_from(payload_len), u32::try_from(sizes.len()))
+fn seek_table(frames: &[FrameSize]) -> Result<Vec<u8>, Report<WriteError>> {
+    let payload_len = frames.len() * SEEK_TABLE_ENTRY_LEN + SEEK_TABLE_FOOTER_LEN;
+    let (Ok(payload_len_u32), Ok(count)) =
+        (u32::try_from(payload_len), u32::try_from(frames.len()))
     else {
         return Err(WriteError)
-            .attach_with(|| format!("{} frames are past a seek table", sizes.len()));
+            .attach_with(|| format!("{} frames are past a seek table", frames.len()));
     };
     let mut table = Vec::with_capacity(SKIPPABLE_HEAD_LEN + payload_len);
     table.extend_from_slice(&SEEK_TABLE_MAGIC.to_le_bytes());
     table.extend_from_slice(&payload_len_u32.to_le_bytes());
-    for (compressed, raw) in sizes {
-        table.extend_from_slice(&compressed.to_le_bytes());
-        table.extend_from_slice(&raw.to_le_bytes());
+    for frame in frames {
+        for size in [frame.len, frame.raw_len] {
+            let size = u32::try_from(size)
+                .change_context(WriteError)
+                .attach_with(|| format!("a frame of {size} bytes is past a seek table entry"))?;
+            table.extend_from_slice(&size.to_le_bytes());
+        }
     }
-    table.extend_from_slice(&frames.to_le_bytes());
+    table.extend_from_slice(&count.to_le_bytes());
     table.push(0);
     table.extend_from_slice(&SEEKABLE_MAGIC.to_le_bytes());
     Ok(table)
 }
 
-// Where one frame lies in the file, and what it decompresses to.
-#[derive(Debug, Clone, Copy)]
-struct FrameAt {
-    start: usize,
-    len: usize,
-    raw_len: u32,
-}
+impl Format for Zstd {
+    fn codec(&self) -> &dyn Codec {
+        self
+    }
 
-/// A manifest file held in memory, with its index decoded.
-#[derive(Debug, Clone)]
-pub struct SeekableFile<'a> {
-    bytes: &'a [u8],
-    // Every frame before the seek table. The last one is the index.
-    frames: Vec<FrameAt>,
-    /// The index, decoded by [`SeekableFile::parse`].
-    pub index: Index,
-}
+    fn write_trailer(
+        &self,
+        frames: &[FrameSize],
+        out: &mut dyn Write,
+    ) -> Result<(), Report<WriteError>> {
+        let table = seek_table(frames)?;
+        out.write_all(&table).change_context(WriteError)
+    }
 
-impl<'a> SeekableFile<'a> {
-    /// Opens the manifest that `bytes` holds.
-    ///
-    /// This reads the seek table, checks that its frames fill the file
-    /// exactly, and decodes the index. It decompresses no part.
-    ///
-    /// # Errors
-    /// [`ReadError`] if `bytes` does not end in a seek table, if the table
-    /// and the file disagree about the layout, if the index frame is damaged
-    /// or its checksum does not match, or if the index lists a different
-    /// number of parts than the file holds. The report says which.
-    pub fn parse(bytes: &'a [u8]) -> Result<Self, Report<ReadError>> {
+    fn locate(&self, bytes: &[u8]) -> Result<Vec<FrameSpan>, Report<ReadError>> {
         let Some(footer_at) = bytes.len().checked_sub(SEEK_TABLE_FOOTER_LEN) else {
             return corrupt(|| format!("{} bytes is shorter than a seek table", bytes.len()));
         };
@@ -327,10 +231,10 @@ impl<'a> SeekableFile<'a> {
         let mut start = 0usize;
         for entry in table[SKIPPABLE_HEAD_LEN..footer_at - table_at].chunks_exact(entry_len) {
             let len = le_u32(&entry[0..4]) as usize;
-            frames.push(FrameAt {
+            frames.push(FrameSpan {
                 start,
                 len,
-                raw_len: le_u32(&entry[4..8]),
+                raw_len: Some(u64::from(le_u32(&entry[4..8]))),
             });
             start = match start.checked_add(len) {
                 Some(end) if end <= table_at => end,
@@ -340,59 +244,7 @@ impl<'a> SeekableFile<'a> {
         if start != table_at {
             return corrupt(|| "the frames do not end where the seek table begins".to_owned());
         }
-        let Some((index_at, parts)) = frames.split_last() else {
-            return corrupt(|| "the file holds no index frame".to_owned());
-        };
-
-        let index = decode_index(&Zstd::default(), &bytes[index_at.start..table_at])
-            .attach_with(|| "in the index".to_owned())?;
-        if index.parts.len() != parts.len() {
-            return corrupt(|| {
-                format!(
-                    "the index lists {} parts and the file holds {}",
-                    index.parts.len(),
-                    parts.len()
-                )
-            });
-        }
-        Ok(Self {
-            bytes,
-            frames,
-            index,
-        })
-    }
-
-    /// Returns the bytes of frame `number`: a part, or the index when
-    /// `number` is the number of parts. `None` past that.
-    #[must_use]
-    pub fn frame(&self, number: usize) -> Option<&'a [u8]> {
-        let at = self.frames.get(number)?;
-        Some(&self.bytes[at.start..at.start + at.len])
-    }
-
-    /// Decompresses part `number` and returns its JSON.
-    ///
-    /// # Errors
-    /// [`ReadError`] if there is no part `number`, if the frame is damaged or
-    /// its checksum does not match, or if it does not decompress to the
-    /// length the seek table gives for it.
-    pub fn part_json(&self, number: usize) -> Result<Vec<u8>, Report<ReadError>> {
-        if number >= self.index.parts.len() {
-            return corrupt(|| format!("there is no part {number}"));
-        }
-        let at = self.frames[number];
-        let frame = &self.bytes[at.start..at.start + at.len];
-        let line = decode_line(&Zstd::default(), frame).attach_with(|| format!("part {number}"))?;
-        if line.len() as u64 + 1 != u64::from(at.raw_len) {
-            return corrupt(|| {
-                format!(
-                    "part {number} holds {} bytes and the seek table says {}",
-                    line.len() + 1,
-                    at.raw_len
-                )
-            });
-        }
-        Ok(line)
+        Ok(frames)
     }
 }
 

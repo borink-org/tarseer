@@ -16,7 +16,7 @@
 //! of a part or of the index, followed by a newline. The frames of a manifest
 //! decoded in order are therefore a JSON Lines document.
 //!
-//! [`zstd::write_file`](crate::zstd::write_file) is a sink that writes the
+//! [`file::write_file`](crate::file::write_file) is a sink that writes the
 //! frames one after another into a single file.
 //!
 //! # Memory

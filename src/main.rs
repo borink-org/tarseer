@@ -8,8 +8,9 @@ use std::process::ExitCode;
 use clap::{Arg, ArgMatches, Command, value_parser};
 use error_stack::{Report, ResultExt as _};
 
+use tarseer::file::{Written, write_file};
 use tarseer::frames::DEFAULT_THREADS;
-use tarseer::zstd::{Written, Zstd, write_file};
+use tarseer::zstd::Zstd;
 use tarseer::{DEFAULT_BUDGET, Skips, WalkError, WalkOptions, WriteError, walk_parts};
 
 // mimalloc for the binary only. The comment on the dependency in Cargo.toml

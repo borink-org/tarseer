@@ -8,8 +8,9 @@
 //!
 //! The [`manifest`] module holds what a walk produces: the parts and an
 //! index of them. [`write_frames`] encodes each part and the index into a
-//! frame of bytes with a [`Codec`] of your choice. The [`mod@zstd`] module has
-//! the zstd codec and writes the frames as one file.
+//! frame of bytes with a [`Codec`] of your choice. The [`mod@file`] module writes
+//! the frames as one file and reads it back, in a [`Format`](file::Format)
+//! of your choice, and [`mod@zstd`] is the format this crate has.
 //!
 //! # Examples
 //!
@@ -39,6 +40,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod file;
 pub mod frames;
 pub mod json;
 pub mod manifest;
