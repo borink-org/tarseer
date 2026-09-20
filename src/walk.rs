@@ -45,15 +45,6 @@
 //! of every directory between the root and the entry being visited, so a
 //! directory with millions of children costs its whole listing while the walk
 //! is inside it.
-//!
-//! # Skips
-//!
-//! Under either [`OnError`] policy, the walk skips and counts in [`Skips`]
-//! sockets, fifos and devices, and entries whose name or link target is not
-//! UTF-8. Under [`OnError::Skip`] it also skips entries whose type, metadata
-//! or link target cannot be read, and directories that cannot be opened,
-//! together with everything under them. Under [`OnError::Fail`] those fail
-//! the walk. A root that cannot be opened fails the walk under either policy.
 
 use std::ffi::OsString;
 use std::fmt;

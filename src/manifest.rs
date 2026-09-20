@@ -22,15 +22,41 @@
 //!    part. Search [`PartEntry::first`] across [`Index::parts`] to find the
 //!    parts a directory spans: a directory is one contiguous run of parts.
 //!
+//! # Examples
+//!
+//! ```
+//! use std::path::Path;
+//! use tarseer::{Manifest, WalkOptions, WriteOptions, write_manifest};
+//!
+//! let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+//! let mut bytes = Vec::new();
+//! let written = write_manifest(
+//!     &root,
+//!     &WalkOptions::default(),
+//!     &WriteOptions::default(),
+//!     &mut bytes,
+//! )
+//! .unwrap();
+//!
+//! let manifest = Manifest::parse(&bytes).unwrap();
+//! assert_eq!(manifest.index, written.index);
+//! let json = manifest.part_json(0).unwrap();
+//! assert!(json.starts_with(b"{\"stem\":[]"));
+//! ```
+//!
+//!
 //! # Layout
 //!
 //! ```text
 //! [part 0][part 1]…[part n-1][index][footer]
 //! ```
 //!
-//! Every piece is a zstd skippable frame, so a plain zstd decoder skips the
-//! whole manifest. A manifest appended to an ordinary zstd stream leaves that
-//! stream decoding to the same bytes.
+//! Each of these is a zstd *skippable frame*: a frame that a zstd decoder
+//! passes over without output. A part frame and the index frame each hold an
+//! ordinary compressed zstd frame inside, which only a reader of this layout
+//! reaches. A plain `zstd -d` over a manifest therefore outputs nothing, and
+//! a manifest appended to an ordinary zstd stream leaves that stream decoding
+//! to the same bytes.
 //!
 //! - A part frame holds the tag `TSPT` and one ordinary zstd frame of the
 //!   part's JSON. Each part decompresses on its own.
