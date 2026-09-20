@@ -42,8 +42,8 @@ pub struct Directory {
 }
 
 impl Directory {
-    /// Whether [`Directory::stat_self`] is cheaper than [`Directory::stat`]
-    /// on the parent.
+    /// Whether the walk reads a directory's metadata from the directory itself
+    /// and not from its parent's listing. Here that saves the kernel a lookup.
     pub const STATS_ITSELF: bool = true;
 
     /// Whether a value of this type keeps a file descriptor open.

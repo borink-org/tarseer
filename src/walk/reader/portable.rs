@@ -29,9 +29,11 @@ pub struct Directory {
 // open directory.
 #[allow(clippy::unused_self)]
 impl Directory {
-    /// Whether [`Directory::stat_self`] is cheaper than [`Directory::stat`]
-    /// on the parent.
-    pub const STATS_ITSELF: bool = false;
+    /// Whether the walk reads a directory's metadata from the directory itself
+    /// and not from its parent's listing. On Windows the listing holds a copy
+    /// that the filesystem updates late, so a directory that was just written
+    /// into shows an old mtime there.
+    pub const STATS_ITSELF: bool = cfg!(windows);
 
     /// Whether a value of this type keeps a file descriptor open.
     pub const HOLDS_A_HANDLE: bool = false;
