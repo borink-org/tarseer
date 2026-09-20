@@ -22,11 +22,19 @@ use lz4_flex::frame::{FrameDecoder, FrameEncoder, FrameInfo};
 use tarseer::file::{Format, FrameSize, FrameSpan};
 use tarseer::{Codec, Encoder, ReadError, WriteError};
 
+// The LZ4 frame format reserves `0x184D2A50` to `0x184D2A5F` for skippable
+// frames, as zstd does. An LZ4 decoder passes over a frame that starts with
+// one. This format uses the first for its table of frames.
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
+// A skippable frame starts with the magic number and the length of what
+// follows, each a little-endian `u32`.
 const SKIPPABLE_HEAD_LEN: usize = 8;
+// An entry: the compressed size and the decompressed size, each a `u32`.
 const ENTRY_LEN: usize = 8;
+// This format's own mark, the last four bytes of a file. No standard defines
+// it. A reader finds the table by looking for it at the end.
 const TAG: [u8; 4] = *b"TLZ4";
-// The number of frames, then the tag.
+// The footer: the number of frames as a `u32`, then the tag.
 const FOOTER_LEN: usize = 8;
 
 /// The LZ4 codec and file format.

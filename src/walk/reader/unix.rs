@@ -27,6 +27,7 @@ pub struct Scratch {
 impl Default for Scratch {
     fn default() -> Self {
         Self {
+            // 32 KiB, the size glibc reads directories with.
             buffer: vec![MaybeUninit::uninit(); 32 << 10],
         }
     }

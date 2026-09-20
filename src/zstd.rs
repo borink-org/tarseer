@@ -52,13 +52,32 @@ pub const DEFAULT_WINDOW_LOG: u32 = 19;
 /// declared size comes from the file and the file may be damaged or hostile.
 pub const MAX_RAW: u64 = 1 << 30;
 
+// Every number below is fixed by zstd, not chosen here, so that zstd's own
+// tools read the file. The frame format is RFC 8878. The seek table is
+// zstd's seekable format, in `contrib/seekable_format` of the zstd sources.
+
+// A skippable frame starts with a magic number and the length of what
+// follows, each a little-endian `u32`. A zstd decoder reads the length and
+// passes over the frame.
 const SKIPPABLE_HEAD_LEN: usize = 8;
+// RFC 8878 reserves `0x184D2A50` to `0x184D2A5F` for skippable frames. The
+// seekable format takes the one ending in `E` for its seek table.
 const SEEK_TABLE_MAGIC: u32 = 0x184D_2A5E;
+// The last four bytes of a seekable file, `ZSTD_SEEKABLE_MAGICNUMBER`. A
+// reader finds the seek table by looking for it at the end.
 const SEEKABLE_MAGIC: u32 = 0x8F92_EAB1;
+// The footer: the number of frames as a `u32`, one descriptor byte, and
+// `SEEKABLE_MAGIC`.
 const SEEK_TABLE_FOOTER_LEN: usize = 9;
-// Compressed size and decompressed size. A third field, a checksum, is
-// present when the descriptor's top bit is set; this crate does not write it.
+// An entry: the compressed size and the decompressed size, each a `u32`.
 const SEEK_TABLE_ENTRY_LEN: usize = 8;
+// The descriptor's top bit says that every entry also ends in a `u32`
+// checksum. This crate does not write checksums there, and reads past them.
+const DESCRIPTOR_CHECKSUMS: u8 = 0x80;
+const SEEK_TABLE_CHECKSUM_LEN: usize = 4;
+// The descriptor's bits 2 to 6 are reserved, and a reader must refuse a file
+// that sets one.
+const DESCRIPTOR_RESERVED: u8 = 0x7c;
 
 #[derive(Debug)]
 struct ZstdFailure(&'static str);
@@ -204,10 +223,14 @@ impl Format for Zstd {
             return corrupt(|| "no seek table at the end".to_owned());
         }
         let descriptor = footer[4];
-        if descriptor & 0x7c != 0 {
+        if descriptor & DESCRIPTOR_RESERVED != 0 {
             return corrupt(|| "the seek table sets reserved bits".to_owned());
         }
-        let entry_len = SEEK_TABLE_ENTRY_LEN + if descriptor & 0x80 == 0 { 0 } else { 4 };
+        let entry_len = if descriptor & DESCRIPTOR_CHECKSUMS == 0 {
+            SEEK_TABLE_ENTRY_LEN
+        } else {
+            SEEK_TABLE_ENTRY_LEN + SEEK_TABLE_CHECKSUM_LEN
+        };
         let count = le_u32(&footer[0..4]) as usize;
         let Some(table_at) = count
             .checked_mul(entry_len)
