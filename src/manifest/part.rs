@@ -281,9 +281,15 @@ impl TreePart {
     }
 
     fn intern(&mut self, text: &str) -> Result<u32, Report<TreePartFull>> {
-        let index = u32::try_from(self.text.len()).change_context(TreePartFull)?;
-        self.text.push(text).change_context(TreePartFull)?;
-        Ok(index)
+        // Matched by hand: `change_context` costs a call even when there is no
+        // error, and this runs for every row.
+        let Ok(index) = u32::try_from(self.text.len()) else {
+            return Err(Report::new(TreePartFull));
+        };
+        match self.text.push(text) {
+            Ok(()) => Ok(index),
+            Err(full) => Err(Report::new(full).change_context(TreePartFull)),
+        }
     }
 
     /// Appends a stem component below the previous one.
