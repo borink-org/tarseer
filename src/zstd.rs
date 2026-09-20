@@ -52,31 +52,21 @@ pub const DEFAULT_WINDOW_LOG: u32 = 19;
 /// declared size comes from the file and the file may be damaged or hostile.
 pub const MAX_RAW: u64 = 1 << 30;
 
-// Every number below is fixed by zstd, not chosen here, so that zstd's own
-// tools read the file. The frame format is RFC 8878. The seek table is
-// zstd's seekable format, in `contrib/seekable_format` of the zstd sources.
-
-// A skippable frame starts with a magic number and the length of what
-// follows, each a little-endian `u32`. A zstd decoder reads the length and
-// passes over the frame.
+// From zstd's seekable format, so that zstd's own tools read the file.
+// A skippable frame's magic number and length.
 const SKIPPABLE_HEAD_LEN: usize = 8;
-// RFC 8878 reserves `0x184D2A50` to `0x184D2A5F` for skippable frames. The
-// seekable format takes the one ending in `E` for its seek table.
+// One of the skippable magics of RFC 8878, the one the seek table uses.
 const SEEK_TABLE_MAGIC: u32 = 0x184D_2A5E;
-// The last four bytes of a seekable file, `ZSTD_SEEKABLE_MAGICNUMBER`. A
-// reader finds the seek table by looking for it at the end.
+// The last four bytes of a seekable file.
 const SEEKABLE_MAGIC: u32 = 0x8F92_EAB1;
-// The footer: the number of frames as a `u32`, one descriptor byte, and
-// `SEEKABLE_MAGIC`.
+// The number of frames, a descriptor byte, and `SEEKABLE_MAGIC`.
 const SEEK_TABLE_FOOTER_LEN: usize = 9;
-// An entry: the compressed size and the decompressed size, each a `u32`.
+// The compressed size and the decompressed size.
 const SEEK_TABLE_ENTRY_LEN: usize = 8;
-// The descriptor's top bit says that every entry also ends in a `u32`
-// checksum. This crate does not write checksums there, and reads past them.
+// Descriptor bit: each entry also holds a checksum. This crate writes none.
 const DESCRIPTOR_CHECKSUMS: u8 = 0x80;
 const SEEK_TABLE_CHECKSUM_LEN: usize = 4;
-// The descriptor's bits 2 to 6 are reserved, and a reader must refuse a file
-// that sets one.
+// Descriptor bits that must be zero.
 const DESCRIPTOR_RESERVED: u8 = 0x7c;
 
 #[derive(Debug)]
