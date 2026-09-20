@@ -22,6 +22,14 @@ jobs:
       - run: cargo test --locked --workspace
       - run: RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 
+      # The `std::fs` directory reader, which other platforms use.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: --cfg tarseer_portable_reader
+      - run: cargo test --locked --workspace
+        env:
+          RUSTFLAGS: --cfg tarseer_portable_reader
+
       # The library without the zstd feature.
       - run: cargo clippy --locked -p tarseer --no-default-features --all-targets -- -D warnings
       - run: cargo test --locked -p tarseer --no-default-features

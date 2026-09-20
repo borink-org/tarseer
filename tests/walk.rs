@@ -299,3 +299,77 @@ fn under_skip_an_unstatable_entry_is_counted_and_named_and_the_walk_goes_on() {
     );
     assert!(walked.paths().iter().any(|path| path == "top.txt"));
 }
+
+#[cfg(unix)]
+#[test]
+fn a_name_that_is_not_utf8_is_counted_and_the_rest_still_walks() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = TempDir::new("non-utf8");
+    fs::write(temp_dir.path().join("kept.txt"), b"kept").expect("write");
+    fs::write(temp_dir.path().join(OsStr::from_bytes(b"bad-\xff")), b"").expect("write");
+
+    let walked = walk_default(temp_dir.path());
+    assert_eq!(walked.skips.non_utf8, 1);
+    assert_eq!(walked.paths(), ["kept.txt"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_socket_is_counted_as_special_and_not_recorded() {
+    let temp_dir = TempDir::new("special");
+    fs::write(temp_dir.path().join("kept.txt"), b"kept").expect("write");
+    let _socket = std::os::unix::net::UnixListener::bind(temp_dir.path().join("socket"))
+        .expect("bind a socket");
+
+    let walked = walk_default(temp_dir.path());
+    assert_eq!(walked.skips.special, 1);
+    assert_eq!(walked.paths(), ["kept.txt"]);
+}
+
+#[test]
+fn a_filter_finds_names_in_a_listing_whatever_their_length() {
+    struct Siblings(Mutex<Vec<(String, bool, bool)>>);
+    impl Filter for Siblings {
+        fn keep(&self, candidate: &Candidate<'_>) -> bool {
+            let listing = candidate.listing;
+            self.0.lock().expect("lock").push((
+                candidate.name.to_owned(),
+                listing.contains("a-long-name-that-shares-its-first-bytes.b"),
+                listing.contains("a-long-name-that-shares-its-first-bytes.c"),
+            ));
+            assert_eq!(listing.names().count(), listing.len());
+            true
+        }
+    }
+
+    let temp_dir = TempDir::new("listing");
+    for name in [
+        "a",
+        "a-long-name-that-shares-its-first-bytes.a",
+        "a-long-name-that-shares-its-first-bytes.b",
+        "ab",
+    ] {
+        fs::write(temp_dir.path().join(name), b"").expect("write");
+    }
+    let siblings = Siblings(Mutex::new(Vec::new()));
+    let options = WalkOptions {
+        filter: Some(&siblings),
+        ..WalkOptions::default()
+    };
+    let walked = walk(temp_dir.path(), &options).expect("walk");
+
+    assert_eq!(
+        walked.paths(),
+        [
+            "a",
+            "a-long-name-that-shares-its-first-bytes.a",
+            "a-long-name-that-shares-its-first-bytes.b",
+            "ab",
+        ]
+    );
+    let seen = siblings.0.into_inner().expect("lock");
+    assert_eq!(seen.len(), 4);
+    assert!(seen.iter().all(|(_, has_b, has_c)| *has_b && !*has_c));
+}

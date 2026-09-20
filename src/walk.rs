@@ -45,16 +45,23 @@
 //! of every directory between the root and the entry being visited, so a
 //! directory with millions of children costs its whole listing while the walk
 //! is inside it.
+//!
+//! On Unix the walk also keeps each of those directories open, one file
+//! descriptor per level of depth. When the process runs out of descriptors, the
+//! walk closes the shallowest one. It opens that directory again, by its path,
+//! when it returns to it.
 
-use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, DirEntry, FileType};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use error_stack::{Report, ResultExt as _};
 
 use crate::manifest::{EntryKind, Timestamp, TreePart};
+
+mod reader;
+
+use self::reader::{Directory, Kind, Listed, Scratch};
 
 /// The budget of [`WalkOptions::default()`]: 4 MiB of estimated JSON per
 /// part.
@@ -100,7 +107,8 @@ impl std::error::Error for Cancelled {}
 /// Decides which entries the walk records.
 ///
 /// The walk asks the filter about every entry before it reads the entry's
-/// metadata or lists it. A refused directory is not listed, so nothing under
+/// metadata or lists it. The one exception is a filesystem whose listings give
+/// no kinds: there the walk reads the metadata first, to learn the kind. A refused directory is not listed, so nothing under
 /// it is offered or counted. The filter changes where parts are cut, in the
 /// same way that the tree does.
 pub trait Filter: Send + Sync {
@@ -125,6 +133,7 @@ pub struct Candidate<'a> {
 #[derive(Clone, Copy)]
 pub struct Listing<'a> {
     entries: &'a [Listed],
+    names: &'a [u8],
 }
 
 impl<'a> Listing<'a> {
@@ -132,14 +141,17 @@ impl<'a> Listing<'a> {
     /// binary search over the sorted names.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
-        self.entries
-            .binary_search_by(|entry| entry.name.as_os_str().cmp(name.as_ref()))
-            .is_ok()
+        reader::Listing::find(self.entries, self.names, name.as_bytes())
+            .is_some_and(|found| self.entries[found].kind != Kind::NonUtf8)
     }
 
     /// Returns every name that is UTF-8, in sorted order.
     pub fn names(&self) -> impl Iterator<Item = &'a str> + use<'a> {
-        self.entries.iter().filter_map(|entry| entry.name.to_str())
+        let names = self.names;
+        self.entries
+            .iter()
+            .filter(|entry| entry.kind != Kind::NonUtf8)
+            .filter_map(move |entry| std::str::from_utf8(entry.name(names)).ok())
     }
 
     /// Returns the number of entries, including those whose names are not
@@ -364,15 +376,11 @@ pub fn walk_parts(
         stack: Vec::new(),
         measuring: 1,
         skips: Skips::default(),
+        root: root.to_path_buf(),
+        scratch: Scratch::default(),
     };
     walker.run(root)?;
     Ok(walker.skips)
-}
-
-struct Listed {
-    name: OsString,
-    file_type: FileType,
-    entry: DirEntry,
 }
 
 // A row waiting for its part. Its strings sit in `Walker::text`, in row order.
@@ -402,7 +410,10 @@ enum Meta {
 // An open directory. Row positions are absolute: `Walker::base` plus an index
 // into `Walker::rows`.
 struct Level {
-    listing: Vec<Listed>,
+    listing: reader::Listing,
+    // `None` for a directory that could not be opened, and for one whose
+    // handle was given up when the process ran out of them.
+    directory: Option<Directory>,
     next: usize,
     // Length of this directory's relative path in `Walker::path`.
     path_len: usize,
@@ -434,6 +445,8 @@ struct Walker<'o, 's> {
     // Index of the outermost measuring level; `stack.len()` if none.
     measuring: usize,
     skips: Skips,
+    root: PathBuf,
+    scratch: Scratch,
 }
 
 impl Walker<'_, '_> {
@@ -441,18 +454,19 @@ impl Walker<'_, '_> {
         if let Some(progress) = self.options.progress {
             progress.entered("");
         }
-        let listing = match fs::read_dir(root) {
-            Ok(read) => self.collect(read)?,
-            // An error under either policy: counting the root as a skip would
-            // report an empty walk as a success.
-            Err(error) => {
-                return Err(error)
-                    .attach_with(|| format!("listing {}", root.display()))
-                    .change_context(WalkError);
-            }
-        };
+        // An error under either policy: counting the root as a skip would
+        // report an empty walk as a success.
+        let directory = Directory::open_root(root)
+            .attach_with(|| format!("listing {}", root.display()))
+            .change_context(WalkError)?;
+        let mut listing = directory
+            .list(&mut self.scratch)
+            .attach_with(|| format!("listing {}", root.display()))
+            .change_context(WalkError)?;
+        self.report(&mut listing)?;
         self.stack.push(Level {
             listing,
+            directory: Some(directory),
             next: 0,
             path_len: 0,
             row: 0,
@@ -464,7 +478,7 @@ impl Walker<'_, '_> {
         });
 
         while let Some(top) = self.stack.last_mut() {
-            if top.next == top.listing.len() {
+            if top.next == top.listing.entries.len() {
                 self.finish_level()?;
                 continue;
             }
@@ -494,33 +508,58 @@ impl Walker<'_, '_> {
     fn visit(
         &mut self,
         level: usize,
-        listing: &[Listed],
+        listing: &reader::Listing,
         index: usize,
     ) -> Result<(), Report<WalkError>> {
-        let listed = &listing[index];
+        let listed = &listing.entries[index];
         let parent_len = self.stack[level].path_len;
         self.path.truncate(parent_len);
 
-        let Some(name) = listed.name.to_str() else {
-            self.skip_lossy(&listed.name, SkipReason::NonUtf8);
-            return Ok(());
+        let name = listed.name(&listing.names);
+        let name = match std::str::from_utf8(name) {
+            Ok(name) if listed.kind != Kind::NonUtf8 => name,
+            Ok(lossy) => {
+                self.skip_named(lossy, SkipReason::NonUtf8);
+                return Ok(());
+            }
+            Err(_) => {
+                self.skip_named(&String::from_utf8_lossy(name), SkipReason::NonUtf8);
+                return Ok(());
+            }
         };
-        let kind = if listed.file_type.is_symlink() {
-            EntryKind::Symlink
-        } else if listed.file_type.is_dir() {
-            EntryKind::Directory
-        } else if listed.file_type.is_file() {
-            EntryKind::File
-        } else {
-            self.skip_lossy(&listed.name, SkipReason::Special);
-            return Ok(());
+        self.ensure_open(level)?;
+
+        // A listing without kinds costs a read of the metadata before the
+        // filter is asked.
+        let mut stat = None;
+        let mut listed_kind = listed.kind;
+        if listed_kind == Kind::Unknown {
+            match self.open(level).stat(listed, listing) {
+                Ok(found) => {
+                    listed_kind = found.kind;
+                    stat = Some(found);
+                }
+                Err(error) => return self.failed_at(error, name, "kind"),
+            }
+        }
+        let kind = match listed_kind {
+            Kind::Symlink { .. } => EntryKind::Symlink,
+            Kind::Directory => EntryKind::Directory,
+            Kind::File => EntryKind::File,
+            Kind::Special | Kind::Unknown | Kind::NonUtf8 => {
+                self.skip_named(name, SkipReason::Special);
+                return Ok(());
+            }
         };
         if let Some(filter) = self.options.filter {
             let candidate = Candidate {
                 parent: &self.path,
                 name,
                 kind,
-                listing: Listing { entries: listing },
+                listing: Listing {
+                    entries: &listing.entries,
+                    names: &listing.names,
+                },
             };
             if !filter.keep(&candidate) {
                 return Ok(());
@@ -531,26 +570,38 @@ impl Walker<'_, '_> {
         }
         self.path.push_str(name);
 
-        let metadata = match listed.entry.metadata() {
-            Ok(metadata) => metadata,
+        // A directory is opened before its metadata is read, because an open
+        // directory can report its own.
+        let opened =
+            (kind == EntryKind::Directory).then(|| self.open_child(level, listed, listing));
+        let stat = match (stat, &opened) {
+            (Some(stat), _) => Ok(stat),
+            (None, Some(Ok(directory))) if Directory::STATS_ITSELF => directory.stat_self(),
+            _ => self.open(level).stat(listed, listing),
+        };
+        let stat = match stat {
+            Ok(stat) => stat,
             Err(error) => return self.failed(error, "metadata"),
         };
-        let mtime = metadata.modified().ok().map(Timestamp::from_system_time);
-        let depth = u32::try_from(level).change_context(WalkError)?;
-        let name_len = u32::try_from(name.len()).change_context(WalkError)?;
+        let depth = narrow(level)?;
+        let name_len = narrow(name.len())?;
 
-        match kind {
-            EntryKind::Symlink => {
-                let target = match fs::read_link(listed.entry.path()) {
-                    Ok(target) => target,
+        match listed_kind {
+            Kind::Symlink { directory } => {
+                let target = match self.open(level).read_link(listed, listing) {
+                    Ok(Some(target)) => target,
+                    Ok(None) => {
+                        self.skip(SkipReason::NonUtf8);
+                        return Ok(());
+                    }
                     Err(error) => return self.failed(error, "target"),
                 };
-                let Some(target) = target.to_str() else {
-                    self.skip(SkipReason::NonUtf8);
-                    return Ok(());
+                let target = if target.contains('\\') {
+                    target.replace('\\', "/")
+                } else {
+                    target
                 };
-                let target = target.replace('\\', "/");
-                let target_len = u32::try_from(target.len()).change_context(WalkError)?;
+                let target_len = narrow(target.len())?;
                 let bytes = estimate(kind, name, &target);
                 self.text.push_str(name);
                 self.text.push_str(&target);
@@ -560,33 +611,15 @@ impl Walker<'_, '_> {
                         name_len,
                         target_len,
                         meta: Meta::Symlink {
-                            mtime,
-                            directory: symlink_is_directory(listed.file_type),
+                            mtime: stat.mtime,
+                            directory,
                         },
                     },
                     bytes,
                 )?;
                 self.recorded(kind, 0);
             }
-            EntryKind::File => {
-                let bytes = estimate(kind, name, "");
-                self.text.push_str(name);
-                self.push_leaf(
-                    Row {
-                        depth,
-                        name_len,
-                        target_len: 0,
-                        meta: Meta::File {
-                            size: metadata.len(),
-                            mtime,
-                            mode: mode_of(&metadata, false),
-                        },
-                    },
-                    bytes,
-                )?;
-                self.recorded(kind, metadata.len());
-            }
-            EntryKind::Directory => {
+            Kind::Directory => {
                 let bytes = estimate(kind, name, "");
                 self.text.push_str(name);
                 let row = self.base + self.rows.len();
@@ -595,17 +628,28 @@ impl Walker<'_, '_> {
                     name_len,
                     target_len: 0,
                     meta: Meta::Directory {
-                        mtime,
-                        mode: mode_of(&metadata, true),
+                        mtime: stat.mtime,
+                        mode: stat.mode,
                     },
                 });
                 self.recorded(kind, 0);
                 if let Some(progress) = self.options.progress {
                     progress.entered(&self.path);
                 }
-                let listing = self.list(&listed.entry.path())?;
+                let read = opened
+                    .expect("a directory was opened above")
+                    .and_then(|directory| Ok((directory.list(&mut self.scratch)?, directory)));
+                let (mut listing, directory) = match read {
+                    Ok((listing, directory)) => (listing, Some(directory)),
+                    Err(error) => {
+                        self.unreadable(error)?;
+                        (reader::Listing::default(), None)
+                    }
+                };
+                self.report(&mut listing)?;
                 self.stack.push(Level {
                     listing,
+                    directory,
                     next: 0,
                     path_len: self.path.len(),
                     row,
@@ -618,59 +662,129 @@ impl Walker<'_, '_> {
                 self.total += bytes;
                 self.check_budget()?;
             }
+            _ => {
+                let bytes = estimate(kind, name, "");
+                self.text.push_str(name);
+                self.push_leaf(
+                    Row {
+                        depth,
+                        name_len,
+                        target_len: 0,
+                        meta: Meta::File {
+                            size: stat.size,
+                            mtime: stat.mtime,
+                            mode: stat.mode,
+                        },
+                    },
+                    bytes,
+                )?;
+                self.recorded(kind, stat.size);
+            }
         }
         Ok(())
     }
 
-    // Read and sort a directory below the root. One that cannot be opened
-    // costs its whole subtree, so under `Skip` it has its own count.
-    fn list(&mut self, directory: &Path) -> Result<Vec<Listed>, Report<WalkError>> {
-        match fs::read_dir(directory) {
-            Ok(read) => self.collect(read),
-            Err(error) => match self.options.on_error {
-                OnError::Fail => Err(error)
-                    .attach_with(|| format!("listing {}", self.path))
-                    .change_context(WalkError),
-                OnError::Skip => {
-                    self.skip(SkipReason::Unreadable);
-                    Ok(Vec::new())
-                }
-            },
+    fn open(&self, level: usize) -> &Directory {
+        self.stack[level]
+            .directory
+            .as_ref()
+            .expect("`ensure_open` ran for this level")
+    }
+
+    // Opens a child of `level`. When the process has no handle left, the walk
+    // gives up the handle of its shallowest open ancestor and tries again.
+    // `ensure_open` opens that ancestor again when the walk returns to it.
+    fn open_child(
+        &mut self,
+        level: usize,
+        listed: &Listed,
+        listing: &reader::Listing,
+    ) -> std::io::Result<Directory> {
+        loop {
+            match self.open(level).open_child(listed, listing) {
+                Err(error) if Directory::out_of_handles(&error) && self.release_above(level) => {}
+                result => return result,
+            }
         }
     }
 
-    fn collect(&mut self, read: fs::ReadDir) -> Result<Vec<Listed>, Report<WalkError>> {
-        let mut listing = Vec::new();
-        for entry in read {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    self.failed(error, "listing")?;
-                    continue;
-                }
-            };
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(error) => {
-                    let parent_len = self.path.len();
-                    if parent_len > 0 {
-                        self.path.push('/');
-                    }
-                    self.path.push_str(&entry.file_name().to_string_lossy());
-                    let failed = self.failed(error, "kind");
-                    self.path.truncate(parent_len);
-                    failed?;
-                    continue;
-                }
-            };
-            listing.push(Listed {
-                name: entry.file_name(),
-                file_type,
-                entry,
-            });
+    fn release_above(&mut self, level: usize) -> bool {
+        let open = self.stack[..level]
+            .iter_mut()
+            .find(|above| above.directory.is_some());
+        match open {
+            Some(above) => {
+                above.directory = None;
+                true
+            }
+            None => false,
         }
-        listing.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(listing)
+    }
+
+    // `self.path` must name the directory of `level` or something below it.
+    fn ensure_open(&mut self, level: usize) -> Result<(), Report<WalkError>> {
+        if self.stack[level].directory.is_some() {
+            return Ok(());
+        }
+        let relative = &self.path[..self.stack[level].path_len];
+        let path = self.root.join(relative);
+        loop {
+            match Directory::open_root(&path) {
+                Ok(directory) => {
+                    self.stack[level].directory = Some(directory);
+                    return Ok(());
+                }
+                Err(error) if Directory::out_of_handles(&error) && self.release_above(level) => {}
+                Err(error) => {
+                    return Err(error)
+                        .attach_with(|| format!("opening {} again", path.display()))
+                        .change_context(WalkError);
+                }
+            }
+        }
+    }
+
+    // A directory below the root that cannot be opened or listed costs its
+    // whole subtree, so under `Skip` it has its own count.
+    fn unreadable(&mut self, error: std::io::Error) -> Result<(), Report<WalkError>> {
+        match self.options.on_error {
+            OnError::Fail => Err(error)
+                .attach_with(|| format!("listing {}", self.path))
+                .change_context(WalkError),
+            OnError::Skip => {
+                self.skip(SkipReason::Unreadable);
+                Ok(())
+            }
+        }
+    }
+
+    // Handles the entries a listing could not read. `self.path` names the
+    // listed directory.
+    fn report(&mut self, listing: &mut reader::Listing) -> Result<(), Report<WalkError>> {
+        for (error, name, what) in std::mem::take(&mut listing.failures) {
+            match name {
+                Some(name) => self.failed_at(error, &name, what)?,
+                None => self.failed(error, what)?,
+            }
+        }
+        Ok(())
+    }
+
+    // `failed` for the entry `name` inside the directory `self.path` names.
+    fn failed_at(
+        &mut self,
+        error: std::io::Error,
+        name: &str,
+        what: &str,
+    ) -> Result<(), Report<WalkError>> {
+        let parent_len = self.path.len();
+        if parent_len > 0 {
+            self.path.push('/');
+        }
+        self.path.push_str(name);
+        let failed = self.failed(error, what);
+        self.path.truncate(parent_len);
+        failed
     }
 
     // A file or symlink row, whose strings are already in `text`.
@@ -852,12 +966,12 @@ impl Walker<'_, '_> {
     }
 
     // Count a skip of `name` inside the directory `self.path` names.
-    fn skip_lossy(&mut self, name: &std::ffi::OsStr, reason: SkipReason) {
+    fn skip_named(&mut self, name: &str, reason: SkipReason) {
         let parent_len = self.path.len();
         if parent_len > 0 {
             self.path.push('/');
         }
-        self.path.push_str(&name.to_string_lossy());
+        self.path.push_str(name);
         self.skip(reason);
         self.path.truncate(parent_len);
     }
@@ -869,34 +983,11 @@ impl Walker<'_, '_> {
     }
 }
 
-// Whether a symlink is a directory link. Only Windows has the distinction.
-fn symlink_is_directory(file_type: FileType) -> Option<bool> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileTypeExt;
-        Some(file_type.is_symlink_dir())
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = file_type;
-        None
-    }
-}
-
-fn mode_of(metadata: &fs::Metadata, is_directory: bool) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let _ = is_directory;
-        metadata.mode() & 0o7777
-    }
-    #[cfg(not(unix))]
-    {
-        match (is_directory, metadata.permissions().readonly()) {
-            (true, true) => 0o555,
-            (true, false) => 0o755,
-            (false, true) => 0o444,
-            (false, false) => 0o644,
-        }
+// A length or a depth as the `u32` a row stores.
+#[inline]
+fn narrow(value: usize) -> Result<u32, Report<WalkError>> {
+    match u32::try_from(value) {
+        Ok(value) => Ok(value),
+        Err(error) => Err(Report::new(error).change_context(WalkError)),
     }
 }
