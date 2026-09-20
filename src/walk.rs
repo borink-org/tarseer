@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use error_stack::{Report, ResultExt as _};
 
-use crate::part::{EntryKind, Timestamp, TreePart};
+use crate::manifest::{EntryKind, Timestamp, TreePart};
 
 /// The budget of [`WalkOptions::default()`]: 4 MiB of estimated JSON per
 /// part.

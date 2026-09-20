@@ -1,26 +1,37 @@
-//! The manifest on disk: that it reads back as the parts the walk gave, and
-//! that it holds up against what a file can do wrong.
+//! A manifest as frames and as one zstd file: that it reads back as the parts
+//! the walk gave, that each frame stands alone, and that damage is refused.
 
 mod common;
 
 use std::path::Path;
 
-use common::{TempDir, fixture, wide_fixture};
-use tarseer::manifest::FOOTER_LEN;
-use tarseer::{Manifest, ReadError, WalkOptions, WriteOptions, Written, walk, write_manifest};
+use common::{TempDir, wide_fixture};
+use error_stack::Report;
+use tarseer::zstd::{SeekableFile, Written, Zstd, write_file};
+use tarseer::{
+    Frame, FrameKind, Plain, ReadError, Walk, WalkOptions, WriteError, decode_index, decode_line,
+    walk, write_frames,
+};
+
+fn options(budget: u64) -> WalkOptions<'static> {
+    WalkOptions {
+        budget,
+        ..WalkOptions::default()
+    }
+}
 
 fn write(root: &Path, budget: u64, threads: usize) -> (Vec<u8>, Written) {
     let mut out = Vec::new();
-    let options = WalkOptions {
-        budget,
-        ..WalkOptions::default()
-    };
-    let write_options = WriteOptions {
-        threads,
-        ..WriteOptions::default()
-    };
-    let written = write_manifest(root, &options, &write_options, &mut out).unwrap();
+    let written = write_file(root, &options(budget), &Zstd::default(), threads, &mut out).unwrap();
     (out, written)
+}
+
+fn lines(walked: &Walk) -> Vec<Vec<u8>> {
+    walked
+        .parts
+        .iter()
+        .map(|part| part.to_json().unwrap().into_bytes())
+        .collect()
 }
 
 #[test]
@@ -28,26 +39,22 @@ fn every_part_reads_back_as_the_json_the_walk_gave() {
     let temp_dir = wide_fixture("manifest-roundtrip");
     let budget = 300;
     let (bytes, written) = write(temp_dir.path(), budget, 4);
-    let options = WalkOptions {
-        budget,
-        ..WalkOptions::default()
-    };
-    let walked = walk(temp_dir.path(), &options).unwrap();
-
-    let manifest = Manifest::parse(&bytes).unwrap();
-    assert_eq!(manifest.index, written.index);
-    assert_eq!(written.len, bytes.len() as u64);
-    assert_eq!(manifest.index.parts.len(), walked.parts.len());
+    let walked = walk(temp_dir.path(), &options(budget)).unwrap();
     assert!(walked.parts.len() > 3, "the fixture is cut at this budget");
 
+    let file = SeekableFile::parse(&bytes).unwrap();
+    assert_eq!(file.index, written.index);
+    assert_eq!(written.len, bytes.len() as u64);
+    assert_eq!(file.index.parts.len(), walked.parts.len());
+    assert_eq!(file.index.entries(), walked.len() as u64);
+
     for (number, part) in walked.parts.iter().enumerate() {
-        let entry = &manifest.index.parts[number];
+        let entry = &file.index.parts[number];
         assert_eq!(
-            manifest.part_json(number).unwrap(),
+            file.part_json(number).unwrap(),
             part.to_json().unwrap().into_bytes(),
             "part {number}"
         );
-        assert_eq!(Some(&entry.first), part.first_path().as_ref());
         assert_eq!(entry.first, part.entries()[0].0);
         assert_eq!(
             (entry.directories, entry.files, entry.symlinks),
@@ -58,14 +65,101 @@ fn every_part_reads_back_as_the_json_the_walk_gave() {
             )
         );
     }
-    assert_eq!(manifest.index.entries(), walked.len() as u64);
+    assert!(
+        file.part_json(walked.parts.len()).is_err(),
+        "the index is no part"
+    );
+}
+
+#[test]
+fn a_plain_zstd_decoder_prints_the_parts_and_then_the_index_as_json_lines() {
+    let temp_dir = wide_fixture("manifest-jsonl");
+    let (bytes, written) = write(temp_dir.path(), 300, 2);
+    let walked = walk(temp_dir.path(), &options(300)).unwrap();
+
+    let mut want = Vec::new();
+    for line in lines(&walked) {
+        want.extend_from_slice(&line);
+        want.push(b'\n');
+    }
+    want.extend_from_slice(written.index.to_json().unwrap().as_bytes());
+    want.push(b'\n');
+    assert_eq!(written.raw_len, want.len() as u64);
+
+    // One call over the whole file: every frame in turn, the seek table
+    // passed over.
+    let mut decoded = Vec::with_capacity(want.len());
+    zstd_safe::decompress(&mut decoded, &bytes).unwrap();
+    assert_eq!(decoded, want);
+}
+
+fn frames_of(root: &Path, budget: u64, codec: &dyn tarseer::Codec) -> Vec<Frame> {
+    let mut frames = Vec::new();
+    write_frames(root, &options(budget), codec, 3, &mut |frame| {
+        frames.push(frame);
+        Ok(())
+    })
+    .unwrap();
+    frames
+}
+
+#[test]
+fn each_frame_decodes_on_its_own_and_the_file_is_the_frames_then_a_seek_table() {
+    let temp_dir = wide_fixture("manifest-frames");
+    let codec = Zstd::default();
+    let frames = frames_of(temp_dir.path(), 300, &codec);
+    let walked = walk(temp_dir.path(), &options(300)).unwrap();
+    let want = lines(&walked);
+
+    let (index_frame, part_frames) = frames.split_last().unwrap();
+    assert_eq!(part_frames.len(), want.len());
+    for (number, frame) in part_frames.iter().enumerate() {
+        assert_eq!(frame.kind, FrameKind::Part(number));
+        let line = decode_line(&codec, &frame.bytes).unwrap();
+        assert_eq!(line, want[number], "part {number}");
+        assert_eq!(frame.raw_len, line.len() as u64 + 1);
+    }
+    assert_eq!(index_frame.kind, FrameKind::Index);
+    let index = decode_index(&codec, &index_frame.bytes).unwrap();
+    assert_eq!(index.parts.len(), want.len());
+
+    let (file, _) = write(temp_dir.path(), 300, 1);
+    let joined: Vec<u8> = frames
+        .iter()
+        .flat_map(|frame| frame.bytes.clone())
+        .collect();
+    assert_eq!(&file[..joined.len()], joined);
+    let table = &file[joined.len()..];
+    assert_eq!(table.len(), 8 + frames.len() * 8 + 9);
+    assert_eq!(table[table.len() - 4..], 0x8F92_EAB1_u32.to_le_bytes());
+
+    let parsed = SeekableFile::parse(&file).unwrap();
+    for (number, frame) in frames.iter().enumerate() {
+        assert_eq!(parsed.frame(number), Some(&frame.bytes[..]));
+    }
+    assert_eq!(parsed.frame(frames.len()), None);
+}
+
+#[test]
+fn the_plain_codec_hands_out_the_json_lines_themselves() {
+    let temp_dir = wide_fixture("manifest-plain");
+    let frames = frames_of(temp_dir.path(), 300, &Plain);
+    let walked = walk(temp_dir.path(), &options(300)).unwrap();
+
+    let (index_frame, part_frames) = frames.split_last().unwrap();
+    for (frame, line) in part_frames.iter().zip(lines(&walked)) {
+        assert_eq!(frame.bytes[..frame.bytes.len() - 1], line);
+        assert_eq!(frame.bytes.last(), Some(&b'\n'));
+    }
+    let index = decode_index(&Plain, &index_frame.bytes).unwrap();
+    assert_eq!(index.entries(), walked.len() as u64);
 }
 
 #[test]
 fn the_bytes_do_not_depend_on_the_thread_count() {
     let temp_dir = wide_fixture("manifest-threads");
     let (one, _) = write(temp_dir.path(), 150, 1);
-    for threads in [2, 3, 16] {
+    for threads in [0, 2, 3, 16] {
         let (many, _) = write(temp_dir.path(), 150, threads);
         assert!(one == many, "{threads} threads wrote different bytes");
     }
@@ -74,27 +168,23 @@ fn the_bytes_do_not_depend_on_the_thread_count() {
 #[test]
 fn the_match_window_changes_the_bytes_but_not_what_they_say() {
     let temp_dir = wide_fixture("manifest-window");
-    let options = WalkOptions {
-        budget: 300,
-        ..WalkOptions::default()
-    };
-    let walked = walk(temp_dir.path(), &options).unwrap();
+    let walked = walk(temp_dir.path(), &options(300)).unwrap();
 
     // 0 is zstd's own choice, 10 the smallest window it accepts.
     for window_log in [0, 10, 17, 19, 27] {
-        let mut bytes = Vec::new();
-        let write_options = WriteOptions {
+        let codec = Zstd {
             window_log,
-            ..WriteOptions::default()
+            ..Zstd::default()
         };
-        write_manifest(temp_dir.path(), &options, &write_options, &mut bytes).unwrap();
+        let mut bytes = Vec::new();
+        write_file(temp_dir.path(), &options(300), &codec, 2, &mut bytes).unwrap();
 
-        let manifest = Manifest::parse(&bytes).unwrap();
-        assert_eq!(manifest.index.parts.len(), walked.parts.len());
-        for (number, part) in walked.parts.iter().enumerate() {
+        let file = SeekableFile::parse(&bytes).unwrap();
+        assert_eq!(file.index.parts.len(), walked.parts.len());
+        for (number, line) in lines(&walked).into_iter().enumerate() {
             assert_eq!(
-                manifest.part_json(number).unwrap(),
-                part.to_json().unwrap().into_bytes(),
+                file.part_json(number).unwrap(),
+                line,
                 "window {window_log}, part {number}"
             );
         }
@@ -102,45 +192,44 @@ fn the_match_window_changes_the_bytes_but_not_what_they_say() {
 }
 
 #[test]
-fn a_manifest_after_other_bytes_still_opens() {
-    let temp_dir = fixture("manifest-prefix");
-    let (bytes, _) = write(temp_dir.path(), 4 << 20, 2);
-    let mut archive = b"whatever payload comes first".to_vec();
-    archive.extend_from_slice(&bytes);
-
-    let alone = Manifest::parse(&bytes).unwrap();
-    let after = Manifest::parse(&archive).unwrap();
-    assert_eq!(after.index, alone.index);
-    assert_eq!(after.part_json(0).unwrap(), alone.part_json(0).unwrap());
+fn a_window_zstd_does_not_accept_fails_the_write() {
+    let temp_dir = wide_fixture("manifest-badwindow");
+    let codec = Zstd {
+        window_log: 99,
+        ..Zstd::default()
+    };
+    let report = write_file(temp_dir.path(), &options(300), &codec, 2, &mut Vec::new())
+        .expect_err("no such window");
+    assert_eq!(report.current_context(), &WriteError);
 }
 
 #[test]
-fn a_plain_zstd_decoder_skips_the_whole_manifest() {
-    let temp_dir = wide_fixture("manifest-skippable");
-    let (bytes, _) = write(temp_dir.path(), 300, 2);
-    let payload = b"exactly these bytes, and nothing of the manifest";
-    // zstd-safe writes into spare capacity only, so the buffer is sized first.
-    let mut archive = Vec::with_capacity(zstd_safe::compress_bound(payload.len()));
-    zstd_safe::compress(&mut archive, payload, 3).unwrap();
-    archive.reserve(bytes.len());
-    archive.extend_from_slice(&bytes);
-
-    let mut decoded = Vec::with_capacity(payload.len() * 4);
-    zstd_safe::decompress(&mut decoded, &archive).unwrap();
-    assert_eq!(decoded, payload);
+fn an_error_from_the_sink_stops_the_write_and_is_returned() {
+    let temp_dir = wide_fixture("manifest-sink");
+    let mut seen = 0;
+    let report = write_frames(temp_dir.path(), &options(150), &Plain, 2, &mut |_frame| {
+        seen += 1;
+        if seen == 2 {
+            return Err(Report::new(WriteError).attach("the sink is full"));
+        }
+        Ok(())
+    })
+    .expect_err("the sink refused the second frame");
+    assert!(format!("{report:?}").contains("the sink is full"));
+    assert_eq!(seen, 2);
 }
 
 #[test]
 fn an_empty_tree_has_an_index_and_no_parts() {
     let temp_dir = TempDir::new("manifest-empty");
     let (bytes, written) = write(temp_dir.path(), 4 << 20, 2);
-    let manifest = Manifest::parse(&bytes).unwrap();
-    assert!(manifest.index.parts.is_empty());
-    assert_eq!(manifest.index, written.index);
+    let file = SeekableFile::parse(&bytes).unwrap();
+    assert!(file.index.parts.is_empty());
+    assert_eq!(file.index, written.index);
 }
 
 fn refused(bytes: &[u8]) -> String {
-    let report = Manifest::parse(bytes).expect_err("damaged bytes are refused");
+    let report = SeekableFile::parse(bytes).expect_err("damaged bytes are refused");
     assert_eq!(report.current_context(), &ReadError);
     format!("{report:?}")
 }
@@ -148,73 +237,65 @@ fn refused(bytes: &[u8]) -> String {
 #[test]
 fn damage_anywhere_is_refused_rather_than_misread() {
     let temp_dir = wide_fixture("manifest-damage");
-    let (bytes, _) = write(temp_dir.path(), 300, 2);
+    let (bytes, written) = write(temp_dir.path(), 300, 2);
+    let frames = written.index.parts.len() + 1;
+    let table_at = bytes.len() - (8 + frames * 8 + 9);
 
-    // Too short to hold a footer at all.
-    refused(&bytes[..FOOTER_LEN - 1]);
+    // Too short to hold the end of a seek table at all.
+    refused(&bytes[..8]);
 
-    // The magic at the very end.
+    // The magic number at the very end.
     let mut magic = bytes.clone();
     *magic.last_mut().unwrap() ^= 0xff;
-    assert!(refused(&magic).contains("no tarseer footer"));
+    assert!(refused(&magic).contains("no seek table"));
 
-    // A truncated tail no longer ends in a footer.
+    // A truncated tail no longer ends in a seek table.
     refused(&bytes[..bytes.len() - 1]);
 
-    // A lie about the manifest's length.
-    let mut long = bytes.clone();
-    let at = bytes.len() - FOOTER_LEN + 8;
-    long[at..at + 8].copy_from_slice(&(bytes.len() as u64 + 1).to_le_bytes());
-    refused(&long);
+    // A lie about the number of frames.
+    let mut count = bytes.clone();
+    let at = bytes.len() - 9;
+    count[at..at + 4].copy_from_slice(&(u32::try_from(frames).unwrap() + 1).to_le_bytes());
+    refused(&count);
+
+    // A lie about the first frame's compressed size.
+    let mut size = bytes.clone();
+    size[table_at + 8] ^= 0x01;
+    refused(&size);
+
+    // Bytes before the first frame.
+    let mut prefixed = b"junk".to_vec();
+    prefixed.extend_from_slice(&bytes);
+    refused(&prefixed);
 
     // A byte inside the index's compressed JSON.
-    let index_len = usize::try_from(u64::from_le_bytes(
-        bytes[bytes.len() - FOOTER_LEN + 16..bytes.len() - FOOTER_LEN + 24]
-            .try_into()
-            .unwrap(),
-    ))
-    .unwrap();
+    let index_at = SeekableFile::parse(&bytes)
+        .unwrap()
+        .frame(frames - 1)
+        .unwrap()
+        .len();
     let mut index = bytes.clone();
-    let inside = bytes.len() - FOOTER_LEN - index_len / 2;
-    index[inside] ^= 0x55;
+    index[table_at - index_at / 2] ^= 0x55;
     refused(&index);
-}
-
-#[test]
-fn a_damaged_part_is_refused_when_it_is_read() {
-    let temp_dir = wide_fixture("manifest-part");
-    let (mut bytes, _) = write(temp_dir.path(), 300, 2);
-    let manifest = Manifest::parse(&bytes).unwrap();
-    let second = manifest.index.parts[1].clone();
-
-    // The tag of part 1: the index still opens, the part does not.
-    bytes[usize::try_from(second.offset).unwrap() + 8] ^= 0xff;
-    let manifest = Manifest::parse(&bytes).unwrap();
-    manifest.part_json(0).unwrap();
-    let report = manifest.part_json(1).expect_err("a bad tag is refused");
-    assert!(format!("{report:?}").contains("TSPT"));
 }
 
 #[test]
 fn a_flipped_byte_inside_a_part_is_refused_rather_than_decoded() {
     let temp_dir = wide_fixture("manifest-flip");
     let (bytes, _) = write(temp_dir.path(), 300, 2);
-    let part = Manifest::parse(&bytes).unwrap().index.parts[1].clone();
+    let file = SeekableFile::parse(&bytes).unwrap();
+    let start: usize = file.frame(0).unwrap().len();
+    let len = file.frame(1).unwrap().len();
 
     // Inside the compressed payload, past the frame's own header. Nothing but
     // the frame checksum notices this: the damage decodes, to JSON that may
     // well parse.
-    let start = usize::try_from(part.offset).unwrap();
-    for at in [
-        start + 20,
-        start + usize::try_from(part.frame_len).unwrap() / 2,
-    ] {
+    for at in [start + 12, start + len / 2] {
         let mut damaged = bytes.clone();
         damaged[at] ^= 0x55;
-        let manifest = Manifest::parse(&damaged).unwrap();
-        let report = manifest
-            .part_json(1)
-            .expect_err("a damaged part is refused");
+        let file = SeekableFile::parse(&damaged).unwrap();
+        file.part_json(0).unwrap();
+        let report = file.part_json(1).expect_err("a damaged part is refused");
         assert_eq!(report.current_context(), &ReadError);
     }
 }

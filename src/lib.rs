@@ -3,9 +3,13 @@
 //!
 //! [`walk_parts`] hands each [`TreePart`] to a sink as soon as the part is
 //! complete, and [`walk()`] collects them. The [`walk`](mod@walk) module
-//! describes the walk and where parts are cut. [`write_manifest`] writes a
-//! walk as a compressed manifest, and the [`manifest`] module describes that.
-//! The walk opens no file and reads no contents.
+//! describes the walk and where parts are cut. The walk opens no file and
+//! reads no contents.
+//!
+//! The [`manifest`] module holds what a walk produces: the parts and an
+//! index of them. [`write_frames`] encodes each part and the index into a
+//! frame of bytes with a [`Codec`] of your choice. The [`mod@zstd`] module has
+//! the zstd codec and writes the frames as one file.
 //!
 //! # Examples
 //!
@@ -35,18 +39,21 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod frames;
 pub mod json;
 pub mod manifest;
-pub mod part;
 pub mod tape;
 pub mod walk;
+pub mod zstd;
 
+pub use crate::frames::{
+    Codec, Encoder, Frame, FrameKind, Plain, ReadError, WriteError, decode_index, decode_line,
+    write_frames,
+};
 pub use crate::json::JsonError;
 pub use crate::manifest::{
-    Index, Manifest, PartEntry, ReadError, WriteError, WriteOptions, Written, write_manifest,
-};
-pub use crate::part::{
-    DirectoryRow, EntryKind, FileRow, SymlinkRow, Timestamp, TreePart, TreePartFull, walk_order,
+    DirectoryRow, EntryKind, FileRow, Index, PartEntry, SymlinkRow, Timestamp, TreePart,
+    TreePartFull, walk_order,
 };
 pub use crate::walk::{
     Cancelled, Candidate, DEFAULT_BUDGET, Filter, Listing, OnError, Progress, SkipReason, Skips,

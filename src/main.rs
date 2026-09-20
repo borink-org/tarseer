@@ -8,10 +8,9 @@ use std::process::ExitCode;
 use clap::{Arg, ArgMatches, Command, value_parser};
 use error_stack::{Report, ResultExt as _};
 
-use tarseer::{
-    DEFAULT_BUDGET, Skips, WalkError, WalkOptions, WriteError, WriteOptions, Written, walk_parts,
-    write_manifest,
-};
+use tarseer::frames::DEFAULT_THREADS;
+use tarseer::zstd::{Written, Zstd, write_file};
+use tarseer::{DEFAULT_BUDGET, Skips, WalkError, WalkOptions, WriteError, walk_parts};
 
 // mimalloc for the binary only. The comment on the dependency in Cargo.toml
 // records what it costs and which of its settings return memory sooner.
@@ -20,7 +19,7 @@ static GLOBAL: cyo_mimalloc::MiMalloc = cyo_mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
     let matches = Command::new("tarseer")
-        .about("Walk a directory tree into parts: JSON lines on stdout, or a compressed manifest")
+        .about("Walk a directory tree into parts: JSON lines on stdout, or the same lines as a zstd file")
         .version(env!("CARGO_PKG_VERSION"))
         .arg(
             Arg::new("dir")
@@ -39,7 +38,7 @@ fn main() -> ExitCode {
                 .long("out")
                 .short('o')
                 .value_parser(value_parser!(PathBuf))
-                .help("Write the compressed manifest here instead of JSON lines to stdout"),
+                .help("Write the lines, and an index as the last one, to this zstd file"),
         )
         .arg(
             Arg::new("level")
@@ -83,8 +82,8 @@ fn write(
     out: &Path,
     matches: &ArgMatches,
 ) -> ExitCode {
-    let defaults = WriteOptions::default();
-    let write_options = WriteOptions {
+    let defaults = Zstd::default();
+    let codec = Zstd {
         level: matches
             .get_one::<i32>("level")
             .copied()
@@ -93,11 +92,11 @@ fn write(
             .get_one::<u32>("window-log")
             .copied()
             .unwrap_or(defaults.window_log),
-        threads: matches
-            .get_one::<usize>("threads")
-            .copied()
-            .unwrap_or(defaults.threads),
     };
+    let threads = matches
+        .get_one::<usize>("threads")
+        .copied()
+        .unwrap_or(DEFAULT_THREADS);
     let file = match File::create(out)
         .attach_with(|| format!("creating {}", out.display()))
         .change_context(WriteError)
@@ -105,10 +104,11 @@ fn write(
         Ok(file) => file,
         Err(report) => return fail(&report),
     };
-    match write_manifest(
+    match write_file(
         directory,
         options,
-        &write_options,
+        &codec,
+        threads,
         &mut BufWriter::new(file),
     ) {
         Ok(written) => {
