@@ -2,8 +2,8 @@
 //!
 //! # How a write works
 //!
-//! 1. Choose a [`Format`]. [`Zstd`](crate::zstd::Zstd) is the one this crate
-//!    has.
+//! 1. Choose a [`Format`]. The `zstd` feature, on by default, has the one
+//!    this crate ships.
 //! 2. Call [`write_file`] with the root, a [`WalkOptions`], the format, a
 //!    thread count and a writer.
 //!
@@ -18,6 +18,8 @@
 //! # Examples
 //!
 //! ```
+//! # #[cfg(feature = "zstd")]
+//! # {
 //! use std::path::Path;
 //! use tarseer::file::{ManifestFile, write_file};
 //! use tarseer::{WalkOptions, zstd::Zstd};
@@ -31,6 +33,7 @@
 //! assert_eq!(file.index, written.index);
 //! let json = file.part_json(0).unwrap();
 //! assert!(json.starts_with(b"{\"stem\":[]"));
+//! # }
 //! ```
 //!
 //! # Writing another format

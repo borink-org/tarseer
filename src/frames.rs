@@ -3,8 +3,8 @@
 //!
 //! # How a write works
 //!
-//! 1. Choose a [`Codec`]: [`Zstd`](crate::zstd::Zstd), or [`Plain`] for no
-//!    compression.
+//! 1. Choose a [`Codec`]. [`Plain`] does no compression, and the `zstd`
+//!    feature has the zstd one.
 //! 2. Call [`write_frames`] with the root, a [`WalkOptions`], the codec, a
 //!    thread count and a sink. It walks the root and encodes each part on a
 //!    worker thread as soon as the walk seals it.

@@ -11,7 +11,6 @@ use std::io::Read;
 use common::wide_fixture;
 use format::Lz4;
 use tarseer::file::{ManifestFile, write_file};
-use tarseer::zstd::Zstd;
 use tarseer::{ReadError, WalkOptions, walk};
 
 fn options() -> WalkOptions<'static> {
@@ -79,8 +78,11 @@ fn a_flipped_byte_inside_an_lz4_part_is_refused() {
     assert_eq!(report.current_context(), &ReadError);
 }
 
+#[cfg(feature = "zstd")]
 #[test]
 fn the_lz4_and_zstd_formats_refuse_each_others_files() {
+    use tarseer::zstd::Zstd;
+
     let temp_dir = wide_fixture("lz4-cross");
     let zstd = Zstd::default();
     let mut lz4_bytes = Vec::new();

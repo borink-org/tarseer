@@ -10,8 +10,12 @@ tarseer <dir>              the walk as JSON, one part per line
 tarseer <dir> --out FILE   the same lines and an index, as one zstd file
 ```
 
-`tarseer --help` lists the options. The crate documentation describes the
-walk, where parts are cut, and the file. `zstd -dc FILE` prints it.
+`tarseer --help` lists the options, and `zstd -dc FILE` prints a file. The
+command is the `tarseer-cli` package in `cli/`.
+
+The library is the `tarseer` package. Its documentation describes the walk,
+where parts are cut, and the file. The `zstd` feature, on by default, is the
+only part that needs a compressor.
 
 ## Attribution
 

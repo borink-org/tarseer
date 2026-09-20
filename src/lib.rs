@@ -10,7 +10,15 @@
 //! index of them. [`write_frames`] encodes each part and the index into a
 //! frame of bytes with a [`Codec`] of your choice. The [`mod@file`] module writes
 //! the frames as one file and reads it back, in a [`Format`](file::Format)
-//! of your choice, and [`mod@zstd`] is the format this crate has.
+//! of your choice.
+#![cfg_attr(
+    feature = "zstd",
+    doc = "\nThe `zstd` feature, on by default, adds the [`mod@zstd`] module: the zstd codec and\nfile format."
+)]
+#![cfg_attr(
+    not(feature = "zstd"),
+    doc = "\nThe `zstd` feature, which is off in this build, adds the zstd codec and file format."
+)]
 //!
 //! # Examples
 //!
@@ -46,6 +54,7 @@ pub mod json;
 pub mod manifest;
 pub mod tape;
 pub mod walk;
+#[cfg(feature = "zstd")]
 pub mod zstd;
 
 pub use crate::frames::{

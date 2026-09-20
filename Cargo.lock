@@ -245,13 +245,21 @@ dependencies = [
 name = "tarseer"
 version = "0.0.1"
 dependencies = [
- "clap",
- "cyo-mimalloc",
  "error-stack",
  "lz4_flex",
  "serde",
  "serde_json",
  "zstd-safe",
+]
+
+[[package]]
+name = "tarseer-cli"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "cyo-mimalloc",
+ "error-stack",
+ "tarseer",
 ]
 
 [[package]]
