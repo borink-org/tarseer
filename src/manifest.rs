@@ -3,9 +3,9 @@
 //!
 //! # How a write works
 //!
-//! 1. Fill a [`WalkOptions`] and a [`WriteOptions`]. [`WriteOptions::default()`]
-//!    compresses at [`DEFAULT_LEVEL`] with a [`DEFAULT_WINDOW_LOG`] window on
-//!    [`DEFAULT_THREADS`] threads.
+//! 1. Fill a [`WalkOptions`] and a [`WriteOptions`].
+//!    [`WriteOptions::default()`] compresses at [`DEFAULT_LEVEL`] with a
+//!    [`DEFAULT_WINDOW_LOG`] window on [`DEFAULT_THREADS`] threads.
 //! 2. Call [`write_manifest`] with the root, both option sets and a writer.
 //!    It walks the root, compresses each part as the walk seals it, and writes
 //!    the parts in walk order, then the index, then the footer.
@@ -94,7 +94,7 @@ use error_stack::{Report, ResultExt as _};
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 
 use crate::json::Column;
-use crate::part::Part;
+use crate::part::TreePart;
 use crate::walk::{Skips, WalkError, WalkOptions, walk_parts};
 
 /// The last eight bytes of every manifest: `TARSEER` and `0x1a`, the byte
@@ -430,7 +430,7 @@ pub fn write_manifest(
     let (in_order, walked) = thread::scope(|scope| {
         // Bounded, so a walk that outruns compression waits instead of
         // queueing parts without limit.
-        let (job_sender, job_receiver) = mpsc::sync_channel::<(usize, Part)>(threads);
+        let (job_sender, job_receiver) = mpsc::sync_channel::<(usize, TreePart)>(threads);
         let job_receiver = Arc::new(Mutex::new(job_receiver));
         let (done_sender, done_receiver) = mpsc::channel();
         for _ in 0..threads {
@@ -527,7 +527,7 @@ impl Compressor {
         })
     }
 
-    fn frame(&mut self, sequence: usize, part: &Part) -> Result<Framed, Report<WriteError>> {
+    fn frame(&mut self, sequence: usize, part: &TreePart) -> Result<Framed, Report<WriteError>> {
         part.write_json(&mut self.json).change_context(WriteError)?;
         self.compressed.clear();
         self.compressed

@@ -5,7 +5,7 @@ mod common;
 use common::{fixture, wide_fixture};
 use tarseer::{WalkOptions, walk};
 
-fn parse(part: &tarseer::Part) -> serde_json::Value {
+fn parse(part: &tarseer::TreePart) -> serde_json::Value {
     serde_json::from_str(&part.to_json().unwrap()).unwrap()
 }
 

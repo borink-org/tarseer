@@ -1,7 +1,7 @@
 //! Walks a directory tree and records every entry in it, in parts that each
 //! fit a memory budget.
 //!
-//! [`walk_parts`] hands each [`Part`] to a sink as soon as the part is
+//! [`walk_parts`] hands each [`TreePart`] to a sink as soon as the part is
 //! complete, and [`walk()`] collects them. The [`walk`](mod@walk) module
 //! describes the walk and where parts are cut. [`write_manifest`] writes a
 //! walk as a compressed manifest, and the [`manifest`] module describes that.
@@ -29,7 +29,7 @@
 //! Every fallible call returns an [`error_stack::Report`] over one of
 //! [`WalkError`], [`JsonError`], [`WriteError`] and [`ReadError`]. The report
 //! names what you cannot work out for yourself, such as the entry the walk
-//! failed on. [`Cancelled`] and [`PartFull`] keep their own types inside a
+//! failed on. [`Cancelled`] and [`TreePartFull`] keep their own types inside a
 //! [`WalkError`]: `report.contains::<Cancelled>()`.
 
 #![forbid(unsafe_code)]
@@ -46,7 +46,7 @@ pub use crate::manifest::{
     Index, Manifest, PartEntry, ReadError, WriteError, WriteOptions, Written, write_manifest,
 };
 pub use crate::part::{
-    DirectoryRow, EntryKind, FileRow, Part, PartFull, SymlinkRow, Timestamp, walk_order,
+    DirectoryRow, EntryKind, FileRow, SymlinkRow, Timestamp, TreePart, TreePartFull, walk_order,
 };
 pub use crate::walk::{
     Cancelled, Candidate, DEFAULT_BUDGET, Filter, Listing, OnError, Progress, SkipReason, Skips,

@@ -1,10 +1,10 @@
 //! One part of a walk: a contiguous run of walk order that you can read
 //! without any other part.
 //!
-//! A [`Part`] holds its rows in three tables, one per kind of entry:
-//! [`Part::directories`], [`Part::files`] and [`Part::symlinks`]. A row does not store
-//! its path. It stores the node id of its parent directory and its own name,
-//! and [`Part::path`] joins them back into a path.
+//! A [`TreePart`] holds its rows in three tables, one per kind of entry:
+//! [`TreePart::directories`], [`TreePart::files`] and [`TreePart::symlinks`]. A
+//! row does not store its path. It stores the node id of its parent directory
+//! and its own name, and [`TreePart::path`] joins them back into a path.
 //!
 //! # Node ids
 //!
@@ -12,8 +12,8 @@
 //!
 //! - `0` is the walk root;
 //! - `1..=stem` are the stem, the directories above the part's first row,
-//!   outermost first ([`Part::stem`]);
-//! - `stem + 1 + index` is `directories[index]` ([`Part::directory_node`]).
+//!   outermost first ([`TreePart::stem`]);
+//! - `stem + 1 + index` is `directories[index]` ([`TreePart::directory_node`]).
 //!
 //! Node ids and text indexes mean nothing outside the part they came from.
 
@@ -27,15 +27,15 @@ use crate::tape::StrTape;
 
 /// The part's text or node ids passed what a `u32` can address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PartFull;
+pub struct TreePartFull;
 
-impl fmt::Display for PartFull {
+impl fmt::Display for TreePartFull {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("part outgrew its u32 addressing")
     }
 }
 
-impl std::error::Error for PartFull {}
+impl std::error::Error for TreePartFull {}
 
 /// The kind of an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,7 +91,7 @@ impl Timestamp {
 pub struct FileRow {
     /// The node id of the directory that holds the file.
     pub parent: u32,
-    /// The text index of the file's name, for [`Part::text`].
+    /// The text index of the file's name, for [`TreePart::text`].
     pub name: u32,
     /// The file's size in bytes when the walk read its metadata.
     pub size: u64,
@@ -103,13 +103,13 @@ pub struct FileRow {
     pub mode: u32,
 }
 
-/// A directory. Its own node id is [`Part::directory_node`] of its index in
-/// [`Part::directories`].
+/// A directory. Its own node id is [`TreePart::directory_node`] of its index in
+/// [`TreePart::directories`].
 #[derive(Debug, Clone, Copy)]
 pub struct DirectoryRow {
     /// The node id of the directory that holds this one.
     pub parent: u32,
-    /// The text index of the directory's name, for [`Part::text`].
+    /// The text index of the directory's name, for [`TreePart::text`].
     pub name: u32,
     /// The modification time, or `None` if the filesystem reported none.
     pub mtime: Option<Timestamp>,
@@ -124,10 +124,10 @@ pub struct DirectoryRow {
 pub struct SymlinkRow {
     /// The node id of the directory that holds the link.
     pub parent: u32,
-    /// The text index of the link's name, for [`Part::text`].
+    /// The text index of the link's name, for [`TreePart::text`].
     pub name: u32,
-    /// The text index of the link's target, for [`Part::text`]. The target is
-    /// stored as the filesystem gave it, with any backslash replaced by a
+    /// The text index of the link's target, for [`TreePart::text`]. The target
+    /// is stored as the filesystem gave it, with any backslash replaced by a
     /// forward slash.
     pub target: u32,
     /// The modification time of the link itself, or `None` if the filesystem
@@ -141,11 +141,12 @@ pub struct SymlinkRow {
 
 /// A contiguous run of walk order, with the stem that places it in the tree.
 ///
-/// The walk fills a part through [`Part::push_stem`], [`Part::push_directory`],
-/// [`Part::push_file`] and [`Part::push_symlink`]. You read it through the row
-/// tables and [`Part::text`], or as JSON through [`Part::to_json`].
+/// The walk fills a part through [`TreePart::push_stem`],
+/// [`TreePart::push_directory`], [`TreePart::push_file`] and
+/// [`TreePart::push_symlink`]. You read it through the row tables and
+/// [`TreePart::text`], or as JSON through [`TreePart::to_json`].
 #[derive(Debug, Clone, Default)]
-pub struct Part {
+pub struct TreePart {
     text: StrTape,
     stem: Vec<u32>,
     /// Every directory in the part, in walk order.
@@ -156,7 +157,7 @@ pub struct Part {
     pub symlinks: Vec<SymlinkRow>,
 }
 
-impl Part {
+impl TreePart {
     /// Returns the string at text index `index`: a row's name, or a link's
     /// target.
     ///
@@ -279,21 +280,21 @@ impl Part {
         self.files.iter().map(|file| file.size).sum()
     }
 
-    fn intern(&mut self, text: &str) -> Result<u32, Report<PartFull>> {
-        let index = u32::try_from(self.text.len()).change_context(PartFull)?;
-        self.text.push(text).change_context(PartFull)?;
+    fn intern(&mut self, text: &str) -> Result<u32, Report<TreePartFull>> {
+        let index = u32::try_from(self.text.len()).change_context(TreePartFull)?;
+        self.text.push(text).change_context(TreePartFull)?;
         Ok(index)
     }
 
     /// Appends a stem component below the previous one.
     ///
     /// # Errors
-    /// [`PartFull`] if the text passed 4 GiB.
+    /// [`TreePartFull`] if the text passed 4 GiB.
     ///
     /// # Panics
     /// If a directory row was already pushed. The stem's node ids come before
     /// every directory's, so the stem must be complete first.
-    pub fn push_stem(&mut self, name: &str) -> Result<(), Report<PartFull>> {
+    pub fn push_stem(&mut self, name: &str) -> Result<(), Report<TreePartFull>> {
         assert!(
             self.directories.is_empty(),
             "push_stem called after {} directory rows; push the whole stem first",
@@ -307,7 +308,7 @@ impl Part {
     /// Appends a directory row and returns its node id.
     ///
     /// # Errors
-    /// [`PartFull`] if the text passed 4 GiB or the node id does not fit a
+    /// [`TreePartFull`] if the text passed 4 GiB or the node id does not fit a
     /// `u32`.
     pub fn push_directory(
         &mut self,
@@ -315,9 +316,9 @@ impl Part {
         name: &str,
         mtime: Option<Timestamp>,
         mode: u32,
-    ) -> Result<u32, Report<PartFull>> {
-        let node =
-            u32::try_from(1 + self.stem.len() + self.directories.len()).change_context(PartFull)?;
+    ) -> Result<u32, Report<TreePartFull>> {
+        let node = u32::try_from(1 + self.stem.len() + self.directories.len())
+            .change_context(TreePartFull)?;
         let name = self.intern(name)?;
         self.directories.push(DirectoryRow {
             parent,
@@ -331,7 +332,7 @@ impl Part {
     /// Appends a file row.
     ///
     /// # Errors
-    /// [`PartFull`] if the text passed 4 GiB.
+    /// [`TreePartFull`] if the text passed 4 GiB.
     pub fn push_file(
         &mut self,
         parent: u32,
@@ -339,7 +340,7 @@ impl Part {
         size: u64,
         mtime: Option<Timestamp>,
         mode: u32,
-    ) -> Result<(), Report<PartFull>> {
+    ) -> Result<(), Report<TreePartFull>> {
         let name = self.intern(name)?;
         self.files.push(FileRow {
             parent,
@@ -354,7 +355,7 @@ impl Part {
     /// Appends a symbolic link row.
     ///
     /// # Errors
-    /// [`PartFull`] if the text passed 4 GiB.
+    /// [`TreePartFull`] if the text passed 4 GiB.
     pub fn push_symlink(
         &mut self,
         parent: u32,
@@ -362,7 +363,7 @@ impl Part {
         target: &str,
         mtime: Option<Timestamp>,
         directory: Option<bool>,
-    ) -> Result<(), Report<PartFull>> {
+    ) -> Result<(), Report<TreePartFull>> {
         let name = self.intern(name)?;
         let target = self.intern(target)?;
         self.symlinks.push(SymlinkRow {

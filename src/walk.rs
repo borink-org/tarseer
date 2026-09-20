@@ -7,10 +7,10 @@
 //!    under the root, fails on the first entry it cannot read, and cuts parts
 //!    at [`DEFAULT_BUDGET`].
 //! 2. Call [`walk_parts`] with the root and a sink. The walk hands the sink
-//!    each [`Part`] as soon as the part is complete, in walk order, and holds
-//!    nothing of it afterwards. [`walk`] does the same and collects the parts
-//!    into a [`Walk`].
-//! 3. Read each part's rows, or write it with [`Part::to_json`].
+//!    each [`TreePart`] as soon as the part is complete, in walk order, and
+//!    holds nothing of it afterwards. [`walk`] does the same and collects the
+//!    parts into a [`Walk`].
+//! 3. Read each part's rows, or write it with [`TreePart::to_json`].
 //!
 //! The walk opens no file and reads no contents. Paths are relative to the
 //! root, and the root itself has no row.
@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use error_stack::{Report, ResultExt as _};
 
-use crate::part::{EntryKind, Part, Timestamp};
+use crate::part::{EntryKind, Timestamp, TreePart};
 
 /// The budget of [`WalkOptions::default()`]: 4 MiB of estimated JSON per
 /// part.
@@ -70,8 +70,9 @@ const SYMLINK_ROW: u64 = 46;
 /// The walk could not finish.
 ///
 /// The report names the entry the walk failed on. Two causes have their own
-/// types inside the report: [`Cancelled`] and [`PartFull`](crate::PartFull). Test for them
-/// with `report.contains::<Cancelled>()` and `report.contains::<PartFull>()`.
+/// types inside the report: [`Cancelled`] and
+/// [`TreePartFull`](crate::TreePartFull). Test for them with
+/// `report.contains::<Cancelled>()` and `report.contains::<TreePartFull>()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalkError;
 
@@ -261,7 +262,7 @@ impl Skips {
 #[derive(Debug, Clone, Default)]
 pub struct Walk {
     /// Every part, in walk order.
-    pub parts: Vec<Part>,
+    pub parts: Vec<TreePart>,
     /// What the walk skipped.
     pub skips: Skips,
 }
@@ -270,7 +271,7 @@ impl Walk {
     /// Returns every entry with its path, in walk order.
     #[must_use]
     pub fn entries(&self) -> Vec<(String, EntryKind)> {
-        self.parts.iter().flat_map(Part::entries).collect()
+        self.parts.iter().flat_map(TreePart::entries).collect()
     }
 
     /// Returns every path, in walk order.
@@ -278,7 +279,7 @@ impl Walk {
     pub fn paths(&self) -> Vec<String> {
         self.parts
             .iter()
-            .flat_map(Part::entries)
+            .flat_map(TreePart::entries)
             .map(|(path, _)| path)
             .collect()
     }
@@ -286,7 +287,7 @@ impl Walk {
     /// Returns the number of rows over every part.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.parts.iter().map(Part::len).sum()
+        self.parts.iter().map(TreePart::len).sum()
     }
 
     /// Returns `true` if the walk recorded nothing.
@@ -298,7 +299,7 @@ impl Walk {
     /// Returns the sum of every file's size.
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
-        self.parts.iter().map(Part::total_bytes).sum()
+        self.parts.iter().map(TreePart::total_bytes).sum()
     }
 }
 
@@ -307,7 +308,7 @@ impl Walk {
 /// anything but a link.
 ///
 /// The estimate is what the walk cuts parts against. It is not the number of
-/// bytes [`Part::to_json`] writes for the row.
+/// bytes [`TreePart::to_json`] writes for the row.
 #[must_use]
 pub fn estimate(kind: EntryKind, name: &str, target: &str) -> u64 {
     let fixed = match kind {
@@ -342,14 +343,15 @@ pub fn walk(root: &Path, options: &WalkOptions<'_>) -> Result<Walk, Report<WalkE
 /// unchanged.
 ///
 /// # Errors
-/// [`WalkError`] if `root` cannot be opened, if an entry cannot be read or
-/// a directory cannot be opened under [`OnError::Fail`], if [`WalkOptions::cancel`] was set
-/// ([`Cancelled`]), if a part passed the `u32` it addresses its text and
-/// nodes with ([`PartFull`](crate::PartFull)), or if `sink` returned an error.
+/// [`WalkError`] if `root` cannot be opened, if an entry cannot be read or a
+/// directory cannot be opened under [`OnError::Fail`], if
+/// [`WalkOptions::cancel`] was set ([`Cancelled`]), if a part passed the `u32`
+/// it addresses its text and nodes with
+/// ([`TreePartFull`](crate::TreePartFull)), or if `sink` returned an error.
 pub fn walk_parts(
     root: &Path,
     options: &WalkOptions<'_>,
-    sink: &mut dyn FnMut(Part) -> Result<(), Report<WalkError>>,
+    sink: &mut dyn FnMut(TreePart) -> Result<(), Report<WalkError>>,
 ) -> Result<Skips, Report<WalkError>> {
     let mut walker = Walker {
         options,
@@ -420,7 +422,7 @@ struct Level {
 
 struct Walker<'o, 's> {
     options: &'o WalkOptions<'o>,
-    sink: &'s mut dyn FnMut(Part) -> Result<(), Report<WalkError>>,
+    sink: &'s mut dyn FnMut(TreePart) -> Result<(), Report<WalkError>>,
     rows: Vec<Row>,
     text: String,
     // Absolute position of `rows[0]`; everything before it has been sealed.
@@ -777,7 +779,7 @@ impl Walker<'_, '_> {
         if count == 0 {
             return Ok(());
         }
-        let mut part = Part::default();
+        let mut part = TreePart::default();
 
         // The stem is the open directories above the first row.
         let stem_len = self.rows[0].depth as usize;

@@ -1,7 +1,7 @@
 //! Many strings in one allocation, each addressed by its index.
 //!
 //! [`StrTape`] holds every string in one text buffer and one `u32` offset per
-//! string. This crate uses it for the names in a [`Part`](crate::Part).
+//! string. This crate uses it for the names in a [`TreePart`](crate::TreePart).
 //!
 //! The layout is the one the `stringtape` crate uses (see the README). That
 //! crate reads its strings back through `from_utf8_unchecked`, and this crate

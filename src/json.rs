@@ -1,6 +1,6 @@
 //! The JSON form of a part.
 //!
-//! [`Part::to_json`] writes one document per part:
+//! [`TreePart::to_json`] writes one document per part:
 //!
 //! ```json
 //! {
@@ -12,12 +12,12 @@
 //! ```
 //!
 //! Each of `directories`, `files` and `symlinks` holds one array per column,
-//! and every array in a group has one value per row. `parent` is a node id
-//! and `name` a component, as in [`Part`]. A symlink's `directory` is `true`
-//! or `false` for a Windows directory or file link, and `null` where a
-//! symlink has no kind. `mtime` is whole seconds since the
-//! Unix epoch, or `null` when the filesystem reported no time; `mtime_nanos`
-//! is the nanoseconds after it, and `0` when `mtime` is `null`.
+//! and every array in a group has one value per row. `parent` is a node id and
+//! `name` a component, as in [`TreePart`]. A symlink's `directory` is `true` or
+//! `false` for a Windows directory or file link, and `null` where a symlink has
+//! no kind. `mtime` is whole seconds since the Unix epoch, or `null` when the
+//! filesystem reported no time; `mtime_nanos` is the nanoseconds after it, and
+//! `0` when `mtime` is `null`.
 //!
 //! The document is written straight from the rows, without a second copy of
 //! the part in memory.
@@ -27,7 +27,7 @@ use std::fmt;
 use error_stack::{Report, ResultExt as _};
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 
-use crate::part::{Part, Timestamp};
+use crate::part::{Timestamp, TreePart};
 
 /// The part could not be written as JSON.
 ///
@@ -70,7 +70,7 @@ fn nanos(mtime: Option<Timestamp>) -> u32 {
 
 // The directory columns. No size column: a directory's size is the space its
 // entry list takes on this filesystem, and nothing restores it.
-struct Directories<'a>(&'a Part);
+struct Directories<'a>(&'a TreePart);
 
 impl Serialize for Directories<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -92,7 +92,7 @@ impl Serialize for Directories<'_> {
     }
 }
 
-struct Files<'a>(&'a Part);
+struct Files<'a>(&'a TreePart);
 
 impl Serialize for Files<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -117,7 +117,7 @@ impl Serialize for Files<'_> {
 
 // No mode column: a symlink's permission bits are fixed at 0777 on Linux and
 // unused on macOS, and nothing restores them.
-struct Symlinks<'a>(&'a Part);
+struct Symlinks<'a>(&'a TreePart);
 
 impl Serialize for Symlinks<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -146,7 +146,7 @@ impl Serialize for Symlinks<'_> {
     }
 }
 
-impl Serialize for Part {
+impl Serialize for TreePart {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut out = serializer.serialize_struct("part", 4)?;
         out.serialize_field("stem", &Column(|| self.stem()))?;
@@ -157,7 +157,7 @@ impl Serialize for Part {
     }
 }
 
-impl Part {
+impl TreePart {
     /// Writes the part as a JSON document.
     ///
     /// # Errors
@@ -171,7 +171,7 @@ impl Part {
     /// to write many parts through one buffer.
     ///
     /// # Errors
-    /// As [`Part::to_json`].
+    /// As [`TreePart::to_json`].
     pub fn write_json(&self, out: &mut Vec<u8>) -> Result<(), Report<JsonError>> {
         out.clear();
         serde_json::to_writer(&mut *out, self).change_context(JsonError)
