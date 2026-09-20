@@ -14,34 +14,10 @@ doc = false
 
 [dependencies]
 tarseer = { path = "..", version = "0.0.1" }
-# Builder API only, and default features off drops color, suggestions,
-# wrap_help, unicode, env and derive.
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
 error-stack = "0.8"
-# The binary's global allocator; the library sets none.
-#
-# mimalloc V3 (3.5.3 at the pinned commit), Linux only, and with no Cargo
-# features at all: it is configured through the environment of the build that
-# produces the binary, so nothing in the dependency graph can turn a mode on
-# for the whole program.
-#
-# At its defaults it holds more than glibc here, and most of the difference is
-# freed memory it keeps. Peak RSS walking /nix/store (1.86M entries, 4 MiB
-# budget), and writing the same walk as a zstd file (2 threads, level 9, the
-# default window), measured 2026-09-19:
-#
-#                                 walk        file
-#   glibc                        25 MB       42 MB
-#   defaults                     63 MB      116 MB
-#   MIMALLOC_PURGE_DELAY=0       34 MB       73 MB
-#   + MIMALLOC_ARENA_EAGER_COMMIT=0
-#                                23 MB       43 MB
-#
-# 3.5.3 measures within noise of the `mimalloc` crate's 3.3.2. Most of the
-# file column is zstd's compression contexts, which come from the C
-# allocator, not this one.
-#
-# Git until it is published.
+# The binary's global allocator; the library sets none. Git until it is
+# published.
 cyo-mimalloc = { git = "https://github.com/cyo-alloc/mimalloc" }
 
 [lints]

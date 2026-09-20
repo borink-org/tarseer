@@ -13,7 +13,7 @@
 //! then the number of frames and the tag `TLZ4`.
 //!
 //! `lz4 -dc` over the file prints a JSON Lines document: one line per part,
-//! then the index. Checked with lz4 1.10.0 on a file of 103 frames.
+//! then the index.
 
 use std::io::{Read, Write};
 

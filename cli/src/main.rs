@@ -13,8 +13,7 @@ use tarseer::frames::DEFAULT_THREADS;
 use tarseer::zstd::Zstd;
 use tarseer::{DEFAULT_BUDGET, Skips, WalkError, WalkOptions, WriteError, walk_parts};
 
-// mimalloc for the binary only. The comment on the dependency in Cargo.toml
-// records what it costs and which of its settings return memory sooner.
+// mimalloc for the binary only; the library sets no allocator.
 #[global_allocator]
 static GLOBAL: cyo_mimalloc::MiMalloc = cyo_mimalloc::MiMalloc;
 

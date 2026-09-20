@@ -20,21 +20,10 @@ default = ["zstd"]
 zstd = ["dep:zstd-safe"]
 
 [dependencies]
-# The tree is columns of plain scalars and strings, so serializing it is a
-# handful of small adapters over the rows rather than a shadow document.
-# No `derive`: every impl here is hand-written anyway, and the feature would
-# pull syn and proc-macro2 into the build for nothing.
+# No `derive`: every impl is hand-written.
 serde = { version = "1", default-features = false, features = ["std"] }
 serde_json = "1"
-# Each part is one-shot compressed into its own frame, and read back the same
-# way, so the thin safe layer over libzstd is all that is needed; `std` for
-# its `Vec` output buffers.
 zstd-safe = { version = "7", features = ["std"], optional = true }
-# Errors: a Report over a context type, with what happened attached to it.
-# Chosen over snafu and stacked_errors because both hard-depend on a derive
-# crate and so put syn in the graph unconditionally; this has no normal
-# dependencies at all, and its own macros are declarative. Default features
-# are std + backtrace, neither of which pulls a crate in.
 error-stack = "0.8"
 
 [dev-dependencies]

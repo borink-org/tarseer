@@ -3,9 +3,7 @@
 //! [`StrTape`] holds every string in one text buffer and one `u32` offset per
 //! string. This crate uses it for the names in a [`TreePart`](crate::TreePart).
 //!
-//! The layout is the one the `stringtape` crate uses (see the README). That
-//! crate reads its strings back through `from_utf8_unchecked`, and this crate
-//! forbids `unsafe` code, so the layout is written out here instead.
+//! The layout is the one the `stringtape` crate uses (see the README).
 
 use std::fmt;
 

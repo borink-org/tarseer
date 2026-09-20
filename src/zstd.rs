@@ -44,11 +44,7 @@ pub const DEFAULT_LEVEL: i32 = 9;
 /// The match window of [`Zstd::default()`], as a power of two: 512 KiB.
 ///
 /// zstd sizes a compression context from the window, so the window sets how
-/// much memory each compression thread holds. At level 9 a context takes
-/// 10.5 MiB when zstd chooses the window from the input, 5.5 MiB at a window
-/// of 19, and 1.7 MiB at 17. Measured on a walk of `/nix/store` on
-/// 2026-09-19, a window of 19 made the output 0.19% larger and 17 made it
-/// 2.8% larger than zstd's own choice.
+/// much memory each compression thread holds.
 pub const DEFAULT_WINDOW_LOG: u32 = 19;
 
 /// The most bytes one frame may decompress to: 1 GiB, which is also the limit
