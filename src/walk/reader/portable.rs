@@ -33,6 +33,9 @@ impl Directory {
     /// on the parent.
     pub const STATS_ITSELF: bool = false;
 
+    /// Whether a value of this type keeps a file descriptor open.
+    pub const HOLDS_A_HANDLE: bool = false;
+
     /// Opens the root of a walk. A root that is a symlink is followed.
     // The signature is the linux reader's, which can fail here.
     #[allow(clippy::unnecessary_wraps)]

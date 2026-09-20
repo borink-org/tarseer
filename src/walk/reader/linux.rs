@@ -46,6 +46,9 @@ impl Directory {
     /// on the parent.
     pub const STATS_ITSELF: bool = true;
 
+    /// Whether a value of this type keeps a file descriptor open.
+    pub const HOLDS_A_HANDLE: bool = true;
+
     /// Opens the root of a walk. A root that is a symlink is followed.
     pub fn open_root(root: &Path) -> io::Result<Self> {
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;

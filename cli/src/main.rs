@@ -58,6 +58,12 @@ fn main() -> ExitCode {
                 .value_parser(value_parser!(usize))
                 .help("Compression threads [default: 2]"),
         )
+        .arg(
+            Arg::new("walk-threads")
+                .long("walk-threads")
+                .value_parser(value_parser!(usize))
+                .help("Threads that read directories ahead of the walk [default: 0]"),
+        )
         .get_matches();
 
     let directory: &PathBuf = matches
@@ -68,6 +74,10 @@ fn main() -> ExitCode {
             .get_one::<u64>("budget")
             .copied()
             .unwrap_or(DEFAULT_BUDGET),
+        threads: matches
+            .get_one::<usize>("walk-threads")
+            .copied()
+            .unwrap_or(0),
         ..WalkOptions::default()
     };
     match matches.get_one::<PathBuf>("out") {
