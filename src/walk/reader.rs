@@ -8,26 +8,14 @@ use std::cmp::Ordering;
 
 use crate::manifest::Timestamp;
 
-#[cfg(all(
-    any(target_os = "linux", target_os = "android"),
-    not(tarseer_portable_reader)
-))]
+#[cfg(all(target_os = "linux", not(tarseer_portable_reader)))]
 mod linux;
-#[cfg(all(
-    any(target_os = "linux", target_os = "android"),
-    not(tarseer_portable_reader)
-))]
+#[cfg(all(target_os = "linux", not(tarseer_portable_reader)))]
 use linux as imp;
 
-#[cfg(not(all(
-    any(target_os = "linux", target_os = "android"),
-    not(tarseer_portable_reader)
-)))]
+#[cfg(not(all(target_os = "linux", not(tarseer_portable_reader))))]
 mod portable;
-#[cfg(not(all(
-    any(target_os = "linux", target_os = "android"),
-    not(tarseer_portable_reader)
-)))]
+#[cfg(not(all(target_os = "linux", not(tarseer_portable_reader))))]
 use portable as imp;
 
 pub(super) use imp::{Directory, Scratch};
@@ -61,10 +49,7 @@ pub(super) struct Listed {
     pub kind: Kind,
     // The entry's place in `Held`, for the reader that needs it.
     #[cfg_attr(
-        all(
-            any(target_os = "linux", target_os = "android"),
-            not(tarseer_portable_reader)
-        ),
+        all(target_os = "linux", not(tarseer_portable_reader)),
         allow(dead_code)
     )]
     slot: u32,
@@ -110,10 +95,7 @@ pub(super) struct Listing {
     pub names: Vec<u8>,
     // What the reader keeps until the entries have been visited.
     #[cfg_attr(
-        all(
-            any(target_os = "linux", target_os = "android"),
-            not(tarseer_portable_reader)
-        ),
+        all(target_os = "linux", not(tarseer_portable_reader)),
         allow(dead_code)
     )]
     held: imp::Held,

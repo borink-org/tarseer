@@ -136,6 +136,7 @@ fn kind_of(file_type: FileType) -> Kind {
 }
 
 // Whether a symlink is a directory link. Only Windows has the distinction.
+#[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
 fn symlink_is_directory(file_type: FileType) -> Option<bool> {
     #[cfg(windows)]
     {
