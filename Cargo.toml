@@ -57,3 +57,6 @@ cyo-mimalloc = { git = "https://github.com/cyo-alloc/mimalloc" }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+
+[dev-dependencies]
+lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-encode", "safe-decode", "frame"] }
