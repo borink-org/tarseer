@@ -9,6 +9,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -185,10 +186,9 @@ fn jq_turns_the_columns_of_a_part_into_rows() {
         .find(|(_, part)| !part.files.is_empty())
         .unwrap();
     let printed = run(directory.path(), ROWS, &file.part_json(number).unwrap());
-    let want: String = part
-        .files
-        .iter()
-        .map(|row| format!("{}\t{}\n", part.text(row.name), row.size))
-        .collect();
+    let mut want = String::new();
+    for row in &part.files {
+        writeln!(want, "{}\t{}", part.text(row.name), row.size).unwrap();
+    }
     assert_eq!(String::from_utf8(printed).unwrap(), want);
 }
