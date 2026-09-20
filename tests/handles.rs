@@ -1,10 +1,10 @@
 //! A tree deeper than the process has file descriptors for. This test lowers
 //! the limit of its whole process, so it has a test binary to itself.
 //!
-//! Only the unix reader recovers. Through `std::fs`, every listed entry keeps
+//! Only the linux reader recovers. Through `std::fs`, every listed entry keeps
 //! its directory open, and std gives no way to let go of it.
 
-#![cfg(all(unix, not(tarseer_portable_reader)))]
+#![cfg(all(target_os = "linux", not(tarseer_portable_reader)))]
 
 mod common;
 

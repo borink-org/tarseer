@@ -1,4 +1,4 @@
-// How the walk reads directories. Two readers share one interface: `unix`
+// How the walk reads directories. Two readers share one interface: `linux`
 // asks the kernel directly, and `portable` goes through `std::fs`.
 //
 // A listing keeps every name in one buffer and one small record per entry, so
@@ -8,14 +8,26 @@ use std::cmp::Ordering;
 
 use crate::manifest::Timestamp;
 
-#[cfg(all(unix, not(tarseer_portable_reader)))]
-mod unix;
-#[cfg(all(unix, not(tarseer_portable_reader)))]
-use unix as imp;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(tarseer_portable_reader)
+))]
+mod linux;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(tarseer_portable_reader)
+))]
+use linux as imp;
 
-#[cfg(not(all(unix, not(tarseer_portable_reader))))]
+#[cfg(not(all(
+    any(target_os = "linux", target_os = "android"),
+    not(tarseer_portable_reader)
+)))]
 mod portable;
-#[cfg(not(all(unix, not(tarseer_portable_reader))))]
+#[cfg(not(all(
+    any(target_os = "linux", target_os = "android"),
+    not(tarseer_portable_reader)
+)))]
 use portable as imp;
 
 pub(super) use imp::{Directory, Scratch};
@@ -48,7 +60,13 @@ pub(super) struct Listed {
     len: u32,
     pub kind: Kind,
     // The entry's place in `Held`, for the reader that needs it.
-    #[cfg_attr(all(unix, not(tarseer_portable_reader)), allow(dead_code))]
+    #[cfg_attr(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            not(tarseer_portable_reader)
+        ),
+        allow(dead_code)
+    )]
     slot: u32,
 }
 
@@ -62,7 +80,7 @@ impl Listed {
         let head = name.len().min(8);
         prefix[..head].copy_from_slice(&name[..head]);
         names.extend_from_slice(name);
-        // The unix reader passes names to the kernel, which wants this NUL.
+        // The linux reader passes names to the kernel, which wants this NUL.
         names.push(0);
         Some(Self {
             prefix: u64::from_be_bytes(prefix),
@@ -91,7 +109,13 @@ pub(super) struct Listing {
     pub entries: Vec<Listed>,
     pub names: Vec<u8>,
     // What the reader keeps until the entries have been visited.
-    #[cfg_attr(all(unix, not(tarseer_portable_reader)), allow(dead_code))]
+    #[cfg_attr(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            not(tarseer_portable_reader)
+        ),
+        allow(dead_code)
+    )]
     held: imp::Held,
     /// Entries the reader could not list: the error, the name if it is
     /// known, and what could not be read.

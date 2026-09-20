@@ -46,7 +46,7 @@
 //! directory with millions of children costs its whole listing while the walk
 //! is inside it.
 //!
-//! On Unix the walk also keeps each of those directories open, one file
+//! On Linux the walk also keeps each of those directories open, one file
 //! descriptor per level of depth. When the process runs out of descriptors, the
 //! walk closes the shallowest one. It opens that directory again, by its path,
 //! when it returns to it.

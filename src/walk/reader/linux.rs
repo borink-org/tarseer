@@ -1,5 +1,5 @@
-// The reader for Unix: `getdents64` into one buffer, and `statx`, `openat` and
-// `readlinkat` relative to the open directory.
+// The reader for Linux: `getdents64` into one buffer, and `statx`, `openat`
+// and `readlinkat` relative to the open directory.
 
 use std::ffi::CStr;
 use std::io;
@@ -102,13 +102,13 @@ impl Directory {
     pub fn stat(&self, listed: &Listed, listing: &Listing) -> io::Result<Stat> {
         let name = c_name(listed, &listing.names);
         let stat = rustix::fs::statx(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW, WANTED)?;
-        Ok(converted(&stat))
+        converted(&stat)
     }
 
     /// Reads the metadata of this directory.
     pub fn stat_self(&self) -> io::Result<Stat> {
         let stat = rustix::fs::statx(&self.fd, c"", AtFlags::EMPTY_PATH, WANTED)?;
-        Ok(converted(&stat))
+        converted(&stat)
     }
 
     /// Reads the target of the symlink `listed`. `None` if it is not UTF-8.
@@ -135,8 +135,16 @@ fn kind_of(file_type: FileType) -> Kind {
     }
 }
 
-fn converted(stat: &Statx) -> Stat {
-    Stat {
+// `statx` says in `stx_mask` which fields it filled, and a filesystem may fill
+// fewer than were asked for. Reading a size that was not filled would record
+// the file as empty.
+fn converted(stat: &Statx) -> io::Result<Stat> {
+    if stat.stx_mask & WANTED.bits() != WANTED.bits() {
+        return Err(io::Error::other(
+            "the filesystem did not report the type, mode, size and mtime",
+        ));
+    }
+    Ok(Stat {
         kind: kind_of(FileType::from_raw_mode(u32::from(stat.stx_mode))),
         size: stat.stx_size,
         mtime: Some(Timestamp {
@@ -144,5 +152,5 @@ fn converted(stat: &Statx) -> Stat {
             nanos: stat.stx_mtime.tv_nsec,
         }),
         mode: u32::from(stat.stx_mode) & 0o7777,
-    }
+    })
 }

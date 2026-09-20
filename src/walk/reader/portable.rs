@@ -25,7 +25,7 @@ pub struct Directory {
     path: PathBuf,
 }
 
-// The methods share the unix reader's signatures, which read through the
+// The methods share the linux reader's signatures, which read through the
 // open directory.
 #[allow(clippy::unused_self)]
 impl Directory {
@@ -34,7 +34,7 @@ impl Directory {
     pub const STATS_ITSELF: bool = false;
 
     /// Opens the root of a walk. A root that is a symlink is followed.
-    // The signature is the unix reader's, which can fail here.
+    // The signature is the linux reader's, which can fail here.
     #[allow(clippy::unnecessary_wraps)]
     pub fn open_root(root: &Path) -> io::Result<Self> {
         Ok(Self {
