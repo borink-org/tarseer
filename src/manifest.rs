@@ -168,7 +168,7 @@ pub struct PartEntry {
     pub directories: u64,
     /// The number of file rows in the part.
     pub files: u64,
-    /// The number of link rows in the part.
+    /// The number of symlink rows in the part.
     pub symlinks: u64,
     /// The path of the part's first row in walk order. Empty if the part
     /// holds no rows.
@@ -573,9 +573,9 @@ fn skippable(magic: u32, pieces: &[&[u8]]) -> Result<Vec<u8>, Report<WriteError>
     Ok(frame)
 }
 
-// The level and the window, on a context about to compress one thing. A
-// window of 0 is zstd's own choice, which is what it makes when nobody sets
-// the parameter at all.
+// Sets the level, the window and the checksum flag on `context`. A window of
+// 0 leaves the parameter unset, and zstd then chooses the window from the
+// input.
 fn set_parameters(
     context: &mut zstd_safe::CCtx<'_>,
     level: i32,
@@ -592,9 +592,9 @@ fn set_parameters(
     if window_log != 0 {
         set(zstd_safe::CParameter::WindowLog(window_log))?;
     }
-    // Four bytes a frame for a checksum over what it decodes to. Without it a
-    // flipped byte inside a frame can still decode, to JSON that parses and
-    // says something else; with it, the decoder refuses the frame.
+    // A checksum of the decoded content, four bytes a frame. Without it a
+    // flipped byte inside a frame can still decode, to JSON that parses with
+    // different values. With it the decoder refuses the frame.
     set(zstd_safe::CParameter::ChecksumFlag(true))?;
     Ok(())
 }

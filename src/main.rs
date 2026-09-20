@@ -61,7 +61,9 @@ fn main() -> ExitCode {
         )
         .get_matches();
 
-    let dir: &PathBuf = matches.get_one("dir").expect("required");
+    let dir: &PathBuf = matches
+        .get_one("dir")
+        .expect("clap requires the dir argument");
     let options = WalkOptions {
         budget: matches
             .get_one::<u64>("budget")

@@ -164,9 +164,12 @@ impl Part {
     /// If `index` did not come from a row or the stem of this part.
     #[must_use]
     pub fn text(&self, index: u32) -> &str {
-        self.text
-            .get(index as usize)
-            .expect("part tape index in range")
+        self.text.get(index as usize).unwrap_or_else(|| {
+            panic!(
+                "text index {index} is not from this part, which holds {} strings",
+                self.text.len()
+            )
+        })
     }
 
     /// Returns the stem's components, outermost first. The stem is empty when
@@ -293,7 +296,8 @@ impl Part {
     pub fn push_stem(&mut self, name: &str) -> Result<(), Report<PartFull>> {
         assert!(
             self.directories.is_empty(),
-            "the stem precedes every directory row"
+            "push_stem called after {} directory rows; push the whole stem first",
+            self.directories.len()
         );
         let name = self.intern(name)?;
         self.stem.push(name);

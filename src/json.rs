@@ -44,9 +44,9 @@ impl fmt::Display for JsonError {
 
 impl std::error::Error for JsonError {}
 
-// A column, serialized from a fresh iterator over the rows it lives in. The
-// closure is there because `serialize_field` needs something it can borrow and
-// serialize, and an iterator is consumed by being one.
+// A column, serialized from a fresh iterator over its rows. The closure is
+// there because `serialize_field` takes a value it can borrow, and serializing
+// an iterator consumes it.
 pub(crate) struct Column<F>(pub(crate) F);
 
 impl<F, I> Serialize for Column<F>
@@ -68,8 +68,8 @@ fn nanos(mtime: Option<Timestamp>) -> u32 {
     mtime.map_or(0, |time| time.nanos)
 }
 
-// The directory columns. No size: a directory's own size is the filesystem's
-// bookkeeping, not anything to write back out.
+// The directory columns. No size column: a directory's size is the space its
+// entry list takes on this filesystem, and nothing restores it.
 struct Directories<'a>(&'a Part);
 
 impl Serialize for Directories<'_> {
@@ -115,8 +115,8 @@ impl Serialize for Files<'_> {
     }
 }
 
-// No mode: a symlink's own bits are platform folklore, and nothing restores
-// them.
+// No mode column: a symlink's permission bits are fixed at 0777 on Linux and
+// unused on macOS, and nothing restores them.
 struct Symlinks<'a>(&'a Part);
 
 impl Serialize for Symlinks<'_> {

@@ -69,10 +69,9 @@ use crate::part::{EntryKind, Part, Timestamp};
 /// part.
 pub const DEFAULT_BUDGET: u64 = 4 << 20;
 
-// Fixed per-row estimates: every column a row adds to its part's JSON except
-// its strings, with room for columns a later stage may add (checksum, frame,
-// offset). Fixed, because the real digit widths are not known at walk time
-// and a cut must not move with them.
+// Fixed per-row estimates: what a row adds to its part's JSON apart from its
+// strings, rounded up. Fixed, because the digit widths of the real values are
+// not known when a cut is decided, and a cut must not move with them.
 const FILE_ROW: u64 = 140;
 const DIR_ROW: u64 = 45;
 const LINK_ROW: u64 = 46;
@@ -451,8 +450,8 @@ impl Walker<'_, '_> {
         }
         let listing = match fs::read_dir(root) {
             Ok(read) => self.collect(read)?,
-            // No root, no tree: a skip here would report an empty walk as a
-            // success. Every other unreadable directory is a skip.
+            // An error under either policy: counting the root as a skip would
+            // report an empty walk as a success.
             Err(error) => {
                 return Err(error)
                     .attach_with(|| format!("listing {}", root.display()))
@@ -485,8 +484,8 @@ impl Walker<'_, '_> {
             {
                 return Err(Report::new(Cancelled).change_context(WalkError));
             }
-            // The listing is moved out while its entry is handled, so the rest
-            // of the walker stays free to change.
+            // The listing is moved out while its entry is handled, so that
+            // `visit` can borrow the walker mutably.
             let level = self.stack.len() - 1;
             let listing = std::mem::take(&mut self.stack[level].listing);
             let visited = self.visit(level, &listing, index);
@@ -496,8 +495,8 @@ impl Walker<'_, '_> {
         Ok(())
     }
 
-    // One entry's whole handling, top to bottom: split up, it only moves the
-    // shared bookkeeping into more signatures.
+    // Handles one entry from start to finish. Splitting it would pass the
+    // same walker state through several more functions.
     #[allow(clippy::too_many_lines)]
     fn visit(
         &mut self,
@@ -757,9 +756,9 @@ impl Walker<'_, '_> {
         // Sealed before the pop: a part starting inside this directory needs it
         // for its stem.
         let this = &self.stack[level];
-        // A directory whose row never left — possible only when the row alone
-        // passes the budget — takes it out now rather than letting it drift into
-        // a later sibling's part.
+        // A directory's own row is still waiting here only when that row alone
+        // passes the budget. Seal it now, so that it does not go into a later
+        // sibling's part.
         if this.split && (this.group_first < end || self.base <= this.row) {
             self.seal(end)?;
         }
