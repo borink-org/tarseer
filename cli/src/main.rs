@@ -44,7 +44,7 @@ fn main() -> ExitCode {
             Arg::new("level")
                 .long("level")
                 .value_parser(value_parser!(i32))
-                .help("zstd level for every part and the index [default: 9]"),
+                .help("zstd level for every part and the index [default: 3]"),
         )
         .arg(
             Arg::new("window-log")

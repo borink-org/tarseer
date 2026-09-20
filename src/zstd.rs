@@ -39,7 +39,7 @@ use crate::file::{Format, FrameSize, FrameSpan};
 use crate::frames::{Codec, Encoder, ReadError, WriteError};
 
 /// The zstd level of [`Zstd::default()`].
-pub const DEFAULT_LEVEL: i32 = 9;
+pub const DEFAULT_LEVEL: i32 = 3;
 
 /// The match window of [`Zstd::default()`], as a power of two: 512 KiB.
 ///
