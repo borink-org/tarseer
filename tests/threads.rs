@@ -7,11 +7,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-use common::{TempDir, fixture, wide_fixture};
+use common::{TempDir, wide_fixture};
 use error_stack::Report;
-use tarseer::{
-    Cancelled, Candidate, EntryKind, Filter, OnError, WalkError, WalkOptions, walk, walk_parts,
-};
+use tarseer::{Cancelled, Candidate, EntryKind, Filter, WalkError, WalkOptions, walk, walk_parts};
 
 const THREADS: [usize; 4] = [1, 2, 3, 8];
 
@@ -92,6 +90,9 @@ fn a_filter_refuses_the_same_entries_from_any_thread() {
 #[test]
 fn an_unreadable_directory_is_reported_the_same_with_threads() {
     use std::os::unix::fs::PermissionsExt;
+
+    use common::fixture;
+    use tarseer::OnError;
 
     let temp_dir = fixture("threads-locked");
     let locked = temp_dir.path().join("zed");
