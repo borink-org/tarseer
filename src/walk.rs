@@ -65,19 +65,22 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use error_stack::{Report, ResultExt as _};
 
-use crate::manifest::{EntryKind, Timestamp, TreePart};
+use crate::manifest::{EntryKind, TreePart};
 
+mod assemble;
 mod pool;
 mod reader;
 mod scan;
 
-use self::pool::Pool;
+use self::assemble::{Piece, Plan, Segment, Subtree};
+use self::pool::{Got, Pool, Whole};
 use self::reader::{Kind, Listed, Scratch};
-use self::scan::{Found, Held, Item, Job, Scanned, Scanner, key_below};
+use self::scan::{Found, Held, Item, Job, Rows, Scanned, Scanner, key_below};
 
 /// The budget of [`WalkOptions::default()`]: 4 MiB of estimated JSON per
 /// part.
@@ -401,9 +404,10 @@ pub fn walk_parts(
         return Ok(walker.skips);
     }
 
-    // The window of results that wait for the walk is one budget, so that
-    // the budget stays the one setting that bounds the walk's memory.
-    let pool = Pool::new(&scanner, options.budget);
+    // The scans that wait for the walk are limited to one budget for each
+    // thread, so that the budget and the threads bound the walk's memory.
+    let threads = u64::try_from(options.threads).unwrap_or(u64::MAX);
+    let pool = Pool::new(&scanner, options.budget.saturating_mul(threads));
     std::thread::scope(|scope| {
         // Closed on every way out, so that the scope can join the workers.
         let _closed = CloseOnDrop(&pool);
@@ -414,6 +418,7 @@ pub fn walk_parts(
         let ahead = Source::Ahead {
             pool: &pool,
             taken: VecDeque::new(),
+            whole: None,
         };
         let mut walker = Walker::new(options, sink, &scanner, ahead);
         walker.run(root, None)?;
@@ -435,38 +440,17 @@ enum Source<'p> {
     Inline(Scratch),
     // Worker threads scan ahead of it. `taken` holds the scans that came along
     // with one it asked for, in the order it will need them.
+    // `whole` is set while the first scans of `taken` are a whole subtree,
+    // with how many of them.
     Ahead {
         pool: &'p Pool<'p>,
         taken: VecDeque<(Box<[u32]>, Scanned)>,
+        whole: Option<(Whole, usize)>,
     },
 }
 
-// A row waiting for its part. Its strings sit in `Walker::text`, in row order.
-struct Row {
-    depth: u32,
-    name_len: u32,
-    target_len: u32,
-    meta: Meta,
-}
-
-enum Meta {
-    Directory {
-        mtime: Option<Timestamp>,
-        mode: u32,
-    },
-    File {
-        size: u64,
-        mtime: Option<Timestamp>,
-        mode: u32,
-    },
-    Symlink {
-        mtime: Option<Timestamp>,
-        directory: Option<bool>,
-    },
-}
-
-// An open directory. Row positions are absolute: `Walker::base` plus an index
-// into `Walker::rows`.
+// An open directory. Row positions are absolute: the first row of the walk is
+// at 0.
 struct Level {
     scanned: Scanned,
     next: usize,
@@ -494,10 +478,16 @@ struct Level {
 struct Walker<'o, 's> {
     options: &'o WalkOptions<'o>,
     sink: &'s mut dyn FnMut(TreePart) -> Result<(), Report<WalkError>>,
-    rows: Vec<Row>,
-    text: String,
-    // Absolute position of `rows[0]`; everything before it has been sealed.
+    // The rows that are not in a part yet, in walk order. The walk keeps where
+    // they are and never copies them.
+    waiting: VecDeque<Piece>,
+    // The position of the first waiting row, and of the next row to come.
     base: usize,
+    position: usize,
+    // With worker threads, the parts that were planned and the parts the sink
+    // has been given. A worker builds each part between the two.
+    planned: usize,
+    delivered: usize,
     // Running estimate of every row so far.
     total: u64,
     path: String,
@@ -521,9 +511,11 @@ impl<'o, 's> Walker<'o, 's> {
         Self {
             options,
             sink,
-            rows: Vec::new(),
-            text: String::new(),
+            waiting: VecDeque::new(),
             base: 0,
+            position: 0,
+            planned: 0,
+            delivered: 0,
             total: 0,
             path: String::new(),
             stack: Vec::new(),
@@ -545,7 +537,7 @@ impl<'o, 's> Walker<'o, 's> {
             mut scanned,
             directories,
             rest,
-        } = self.scan(first);
+        } = self.scan(first)?;
         // An error under either policy: counting the root as a skip would
         // report an empty walk as a success.
         if let Some(error) = scanned.unreadable.take() {
@@ -568,9 +560,9 @@ impl<'o, 's> Walker<'o, 's> {
         });
 
         while let Some(top) = self.stack.last_mut() {
-            if top.next == top.scanned.items.len() {
+            if top.next == top.scanned.rows.items.len() {
                 match top.scanned.next {
-                    Some(start) => self.read_on(start),
+                    Some(start) => self.read_on(start)?,
                     None => self.finish_level()?,
                 }
                 continue;
@@ -592,41 +584,129 @@ impl<'o, 's> Walker<'o, 's> {
             self.stack[level].scanned = scanned;
             visited?;
         }
+        self.deliver(true)
+    }
+
+    // Gives the sink the parts that workers have built, in the order they were
+    // planned. With `all` it waits for every part. Otherwise it waits only
+    // while more parts are planned than the workers can be building.
+    fn deliver(&mut self, all: bool) -> Result<(), Report<WalkError>> {
+        let Source::Ahead { pool, .. } = &self.source else {
+            return Ok(());
+        };
+        while self.delivered < self.planned {
+            let behind = self.planned - self.delivered;
+            let built = if all || behind > self.options.threads + 1 {
+                match pool.wait_for(Some(self.delivered), None) {
+                    Got::Part(built) => built,
+                    Got::Scans(_) => unreachable!("no scan was asked for"),
+                }
+            } else {
+                match pool.part_if_built(self.delivered) {
+                    Some(built) => built,
+                    None => return Ok(()),
+                }
+            };
+            self.delivered += 1;
+            (self.sink)(built.change_context(WalkError)?)?;
+        }
+        Ok(())
+    }
+
+    // With worker threads, waits until the scan of the directory with
+    // `self.key` is the first of `taken`. While it waits, the walk gives the
+    // sink the parts the workers have built.
+    fn fetch(&mut self) -> Result<(), Report<WalkError>> {
+        let Self {
+            source,
+            sink,
+            key,
+            planned,
+            delivered,
+            ..
+        } = self;
+        let Source::Ahead { pool, taken, whole } = source else {
+            return Ok(());
+        };
+        while taken.front().is_none_or(|(first, _)| **first != **key) {
+            debug_assert!(taken.is_empty(), "scans are taken in walk order");
+            let part = (*delivered < *planned).then_some(*delivered);
+            match pool.wait_for(part, Some(key)) {
+                Got::Scans(bundle) => {
+                    *whole = bundle.whole.map(|totals| (totals, bundle.scans.len()));
+                    taken.extend(bundle.scans);
+                }
+                Got::Part(built) => {
+                    *delivered += 1;
+                    sink(built.change_context(WalkError)?)?;
+                }
+            }
+        }
         Ok(())
     }
 
     // Returns the scan of the directory `self.path` names. `job` is its job
     // when the walk scans for itself.
-    fn scan(&mut self, job: Option<Job>) -> Found {
-        match &mut self.source {
-            Source::Ahead { pool, taken } => {
-                // A worker hands over the scans of a small subtree together.
-                if taken.front().is_none_or(|(key, _)| **key != *self.key) {
-                    debug_assert!(taken.is_empty(), "scans are taken in walk order");
-                    taken.extend(pool.take(&self.key));
-                }
-                let (_, scanned) = taken.pop_front().expect("the scan that was asked for");
-                Found {
+    fn scan(&mut self, job: Option<Job>) -> Result<Found, Report<WalkError>> {
+        self.fetch()?;
+        let Self {
+            source,
+            scanner,
+            stack,
+            ..
+        } = self;
+        match source {
+            Source::Ahead { taken, whole, .. } => {
+                // The walk goes into this subtree, so it is not taken as one.
+                *whole = None;
+                let (_, scanned) = taken.pop_front().expect("the scan that was fetched");
+                Ok(Found {
                     scanned,
                     directories: Vec::new(),
                     rest: Vec::new(),
-                }
+                })
             }
             Source::Inline(scratch) => {
                 let job = job.expect("the walk holds the jobs when it scans for itself");
-                let scanner = self.scanner;
-                let stack = &mut self.stack;
+                let scanner = *scanner;
                 // With no handle left, close the directories that the jobs of
                 // the open levels hold.
-                scanner.scan(job, scratch, &mut || {
+                Ok(scanner.scan(job, scratch, &mut || {
                     let mut released = false;
                     for waiting in stack.iter_mut().flat_map(|level| level.jobs.as_mut_slice()) {
                         released |= waiting.release(&scanner.held);
                     }
                     released
-                })
+                }))
             }
         }
+    }
+
+    // Takes the subtree of the directory with `self.key` as one, if worker
+    // threads scanned all of it and it fits a part together with the
+    // directory's own row, which is `row_bytes`. A subtree that fits is never
+    // split, so only its totals matter to where parts are cut.
+    fn take_whole(
+        &mut self,
+        row_bytes: u64,
+    ) -> Result<Option<(Whole, Vec<Scanned>)>, Report<WalkError>> {
+        // Progress hears of every entry, which a subtree taken as one skips.
+        if self.options.progress.is_some() {
+            return Ok(None);
+        }
+        self.fetch()?;
+        let Source::Ahead { taken, whole, .. } = &mut self.source else {
+            return Ok(None);
+        };
+        let Some((totals, scans)) = *whole else {
+            return Ok(None);
+        };
+        if row_bytes + totals.bytes > self.options.budget {
+            return Ok(None);
+        }
+        *whole = None;
+        let scans = taken.drain(..scans).map(|(_, scanned)| scanned).collect();
+        Ok(Some((totals, scans)))
     }
 
     // Handles one item from start to finish. Splitting it would pass the
@@ -641,9 +721,10 @@ impl<'o, 's> Walker<'o, 's> {
         let parent_len = self.stack[level].path_len;
         self.path.truncate(parent_len);
 
-        let (name, kind) = match scanned.items[index] {
+        let rows = &scanned.rows;
+        let (name, kind) = match rows.items[index] {
             Item::Skipped { name, reason } => {
-                self.skip_named(scanned.text(name), reason);
+                self.skip_named(rows.text(name), reason);
                 return Ok(());
             }
             Item::Failed { name, what, error } => {
@@ -651,7 +732,7 @@ impl<'o, 's> Walker<'o, 's> {
                     .take()
                     .expect("each error is reported once");
                 return match name {
-                    Some(name) => self.failed_at(error, scanned.text(name), what),
+                    Some(name) => self.failed_at(error, rows.text(name), what),
                     None => self.failed(error, what),
                 };
             }
@@ -659,77 +740,59 @@ impl<'o, 's> Walker<'o, 's> {
             Item::Symlink { name, .. } => (name, EntryKind::Symlink),
             Item::Directory { name, .. } => (name, EntryKind::Directory),
         };
-        let name = scanned.text(name);
+        let name = rows.text(name);
         if parent_len > 0 {
             self.path.push('/');
         }
         self.path.push_str(name);
-        let depth = narrow(level)?;
-        let name_len = narrow(name.len())?;
-        let bytes;
+        self.extend(level, rows, index);
 
-        match scanned.items[index] {
-            Item::Symlink {
-                target,
-                mtime,
-                directory,
-                ..
-            } => {
-                let target = scanned.text(target);
-                let target_len = narrow(target.len())?;
-                bytes = estimate(kind, name, target);
-                self.text.push_str(name);
-                self.text.push_str(target);
-                self.push_leaf(
-                    Row {
-                        depth,
-                        name_len,
-                        target_len,
-                        meta: Meta::Symlink { mtime, directory },
-                    },
-                    bytes,
-                )?;
+        match rows.items[index] {
+            Item::Symlink { target, .. } => {
+                self.push_leaf(estimate(kind, name, rows.text(target)))?;
                 self.recorded(kind, 0);
             }
-            Item::File {
-                size, mtime, mode, ..
-            } => {
-                bytes = estimate(kind, name, "");
-                self.text.push_str(name);
-                self.push_leaf(
-                    Row {
-                        depth,
-                        name_len,
-                        target_len: 0,
-                        meta: Meta::File { size, mtime, mode },
-                    },
-                    bytes,
-                )?;
+            Item::File { size, .. } => {
+                self.push_leaf(estimate(kind, name, ""))?;
                 self.recorded(kind, size);
             }
-            Item::Directory {
-                mtime, mode, place, ..
-            } => {
-                bytes = estimate(kind, name, "");
-                self.text.push_str(name);
-                let row = self.base + self.rows.len();
-                self.rows.push(Row {
-                    depth,
-                    name_len,
-                    target_len: 0,
-                    meta: Meta::Directory { mtime, mode },
-                });
+            Item::Directory { place, .. } => {
+                let bytes = estimate(kind, name, "");
+                let row = self.position;
+                self.position += 1;
                 self.recorded(kind, 0);
                 if let Some(progress) = self.options.progress {
                     progress.entered(&self.path);
                 }
                 let job = self.stack[level].jobs.next();
                 self.key = key_below(&self.key[..level], place, true).into_vec();
+                if let Some((totals, scans)) = self.take_whole(bytes)? {
+                    // What `finish_level` does for a directory that was not
+                    // split, without the level.
+                    self.position += totals.count;
+                    self.total += bytes + totals.bytes;
+                    // An empty subtree has no rows to build, and a piece
+                    // without rows would give the next part its stem.
+                    if totals.count > 0 {
+                        self.waiting.push_back(Piece::Subtree(Subtree {
+                            scans,
+                            depth: level + 1,
+                            count: totals.count,
+                        }));
+                    }
+                    let subtree = bytes + totals.bytes;
+                    if self.stack[level].split {
+                        self.add_to_group(level, row, subtree)?;
+                    } else {
+                        self.stack[level].completed.push((row, subtree));
+                    }
+                    return self.check_budget();
+                }
                 let Found {
                     mut scanned,
                     directories,
                     rest,
-                } = self.scan(job);
+                } = self.scan(job)?;
                 if let Some(error) = scanned.unreadable.take() {
                     self.unreadable(error)?;
                 }
@@ -754,18 +817,40 @@ impl<'o, 's> Walker<'o, 's> {
         Ok(())
     }
 
+    // Adds item `index` of `rows`, an entry of the directory at `depth`, to the
+    // waiting rows.
+    fn extend(&mut self, depth: usize, rows: &Arc<Rows>, index: usize) {
+        // The last segment goes on if nothing came between: the entries of a
+        // subdirectory would have started a segment of their own.
+        if let Some(Piece::Rows(last)) = self.waiting.back_mut()
+            && Arc::ptr_eq(&last.rows, rows)
+        {
+            last.to = index + 1;
+            last.count += 1;
+            return;
+        }
+        self.waiting.push_back(Piece::Rows(Segment {
+            rows: Arc::clone(rows),
+            from: index,
+            to: index + 1,
+            depth,
+            count: 1,
+        }));
+    }
+
     // Replaces the scan of the top level, which the walk has used up, with
     // the scan of the same directory from `start` on.
-    fn read_on(&mut self, start: usize) {
+    fn read_on(&mut self, start: usize) -> Result<(), Report<WalkError>> {
         let level = self.stack.len() - 1;
         self.path.truncate(self.stack[level].path_len);
         self.key = key_below(&self.key[..level], start, false).into_vec();
         let job = self.stack[level].rest.next();
-        let found = self.scan(job);
+        let found = self.scan(job)?;
         let top = &mut self.stack[level];
         top.scanned = found.scanned;
         top.next = 0;
         top.jobs = found.directories.into_iter();
+        Ok(())
     }
 
     // A directory below the root that cannot be opened or listed costs its
@@ -800,9 +885,9 @@ impl<'o, 's> Walker<'o, 's> {
     }
 
     // A file or symlink row, whose strings are already in `text`.
-    fn push_leaf(&mut self, row: Row, bytes: u64) -> Result<(), Report<WalkError>> {
-        let position = self.base + self.rows.len();
-        self.rows.push(row);
+    fn push_leaf(&mut self, bytes: u64) -> Result<(), Report<WalkError>> {
+        let position = self.position;
+        self.position += 1;
         self.total += bytes;
         let level = self.stack.len() - 1;
         if self.stack[level].split {
@@ -865,7 +950,7 @@ impl<'o, 's> Walker<'o, 's> {
 
     fn finish_level(&mut self) -> Result<(), Report<WalkError>> {
         let level = self.stack.len() - 1;
-        let end = self.base + self.rows.len();
+        let end = self.position;
         if level == 0 {
             self.seal(end)?;
             self.stack.pop();
@@ -905,50 +990,48 @@ impl<'o, 's> Walker<'o, 's> {
         if count == 0 {
             return Ok(());
         }
-        let mut part = TreePart::default();
-
         // The stem is the open directories above the first row.
-        let stem_len = self.rows[0].depth as usize;
-        for level in 1..=stem_len {
-            let start = match self.stack[level - 1].path_len {
-                0 => 0,
-                parent_len => parent_len + 1,
-            };
-            part.push_stem(&self.path[start..self.stack[level].path_len])
-                .change_context(WalkError)?;
-        }
-        let mut nodes: Vec<u32> = (0..=stem_len)
-            .map(|node| u32::try_from(node).expect("stem depth fits a u32"))
+        let first = self.waiting.front().expect("a row for every position");
+        let stem = (1..=first.depth())
+            .map(|level| {
+                let start = match self.stack[level - 1].path_len {
+                    0 => 0,
+                    parent_len => parent_len + 1,
+                };
+                self.path[start..self.stack[level].path_len].to_owned()
+            })
             .collect();
 
-        let mut cursor = 0;
-        for row in &self.rows[..count] {
-            let name_end = cursor + row.name_len as usize;
-            let name = &self.text[cursor..name_end];
-            let target = &self.text[name_end..name_end + row.target_len as usize];
-            cursor = name_end + row.target_len as usize;
-            let depth = row.depth as usize;
-            let parent = nodes[depth];
-            match row.meta {
-                Meta::Directory { mtime, mode } => {
-                    let node = part
-                        .push_directory(parent, name, mtime, mode)
-                        .change_context(WalkError)?;
-                    nodes.truncate(depth + 1);
-                    nodes.push(node);
-                }
-                Meta::File { size, mtime, mode } => part
-                    .push_file(parent, name, size, mtime, mode)
-                    .change_context(WalkError)?,
-                Meta::Symlink { mtime, directory } => part
-                    .push_symlink(parent, name, target, mtime, directory)
-                    .change_context(WalkError)?,
+        let mut pieces = Vec::new();
+        let mut left = count;
+        while left > 0 {
+            let front = self.waiting.front_mut().expect("a row for every position");
+            if front.count() <= left {
+                left -= front.count();
+                pieces.extend(self.waiting.pop_front());
+            } else {
+                let Piece::Rows(segment) = front else {
+                    unreachable!("a part is never cut inside a subtree that fits one");
+                };
+                pieces.push(Piece::Rows(segment.split_off_front(left)));
+                left = 0;
             }
         }
-        self.rows.drain(..count);
-        self.text.drain(..cursor);
         self.base = end;
-        (self.sink)(part)
+        self.emit(Plan { stem, pieces })
+    }
+
+    // Has the part of `plan` built and given to the sink: here and now, or by
+    // a worker thread and in its turn.
+    fn emit(&mut self, plan: Plan) -> Result<(), Report<WalkError>> {
+        match &self.source {
+            Source::Inline(_) => (self.sink)(plan.assemble().change_context(WalkError)?),
+            Source::Ahead { pool, .. } => {
+                pool.plan(self.planned, plan);
+                self.planned += 1;
+                self.deliver(false)
+            }
+        }
     }
 
     fn failed(&mut self, error: std::io::Error, what: &str) -> Result<(), Report<WalkError>> {
@@ -992,14 +1075,5 @@ impl<'o, 's> Walker<'o, 's> {
         if let Some(progress) = self.options.progress {
             progress.recorded(kind, size);
         }
-    }
-}
-
-// A length or a depth as the `u32` a row stores.
-#[inline]
-fn narrow(value: usize) -> Result<u32, Report<WalkError>> {
-    match u32::try_from(value) {
-        Ok(value) => Ok(value),
-        Err(error) => Err(Report::new(error).change_context(WalkError)),
     }
 }

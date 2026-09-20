@@ -32,7 +32,7 @@ fn parts(root: &Path, options: &WalkOptions<'_>) -> Vec<String> {
 }
 
 /// A directory too large for one scan, with subdirectories among its files, so
-/// that a later scan of it finds directories as well.
+/// that a later scan of it finds directories as well. Some of them are empty.
 fn large_fixture(tag: &str) -> TempDir {
     let temp_dir = wide_fixture(tag);
     let large = temp_dir.path().join("large");
@@ -41,7 +41,10 @@ fn large_fixture(tag: &str) -> TempDir {
         if index % 400 == 0 {
             let directory = large.join(format!("e{index:04}.d"));
             fs::create_dir(&directory).unwrap();
-            fs::write(directory.join("inner"), b"i").unwrap();
+            // Every other one stays empty: a subtree with no rows.
+            if index % 800 != 0 {
+                fs::write(directory.join("inner"), b"i").unwrap();
+            }
         } else {
             fs::write(large.join(format!("e{index:04}")), b"").unwrap();
         }
@@ -59,6 +62,19 @@ fn the_parts_are_the_same_with_any_number_of_threads() {
             let got = parts(temp_dir.path(), &options(budget, threads));
             assert_eq!(got, want, "budget {budget}, {threads} threads");
         }
+    }
+}
+
+// Threads take a subtree that fits a part as one piece, where a walk without
+// them visits every row. Many budgets put the cuts in many places, among them
+// right after an empty directory, which is a subtree with no rows.
+#[test]
+fn the_parts_are_the_same_wherever_the_budget_puts_the_cuts() {
+    let temp_dir = large_fixture("threads-budgets");
+    for budget in (150..6_000).step_by(83) {
+        let want = parts(temp_dir.path(), &options(budget, 0));
+        let got = parts(temp_dir.path(), &options(budget, 3));
+        assert_eq!(got, want, "budget {budget}");
     }
 }
 

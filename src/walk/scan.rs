@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::reader::{self, Directory, Kind, Listed, Scratch};
-use super::{Candidate, Filter, Listing, OnError, SkipReason};
+use super::{Candidate, Filter, Listing, OnError, SkipReason, estimate};
 use crate::manifest::{EntryKind, Timestamp};
 
 /// The most open directories that waiting jobs may hold between them.
@@ -98,6 +98,15 @@ pub(super) struct Found {
     pub rest: Vec<Job>,
 }
 
+// A scan's result while it is being made.
+struct Finding {
+    scanned: Reading,
+    /// One job for each directory among the items, in walk order.
+    pub directories: Vec<Job>,
+    /// The scans of the rest of the directory, in walk order.
+    pub rest: Vec<Job>,
+}
+
 /// A range of [`Scanned::text`].
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Span {
@@ -139,11 +148,37 @@ pub(super) enum Item {
     },
 }
 
+impl Item {
+    /// Returns `true` if the walk records this item as a row.
+    pub fn is_row(&self) -> bool {
+        matches!(
+            self,
+            Self::File { .. } | Self::Symlink { .. } | Self::Directory { .. }
+        )
+    }
+}
+
+/// The rows a scan found, which parts are later built from. Several parts can
+/// share them, so they do not change once the scan is done.
+#[derive(Default)]
+pub(super) struct Rows {
+    pub text: String,
+    pub items: Vec<Item>,
+}
+
+impl Rows {
+    pub fn text(&self, span: Span) -> &str {
+        &self.text[span.start as usize..(span.start + span.len) as usize]
+    }
+}
+
 /// What a scan found in one directory.
 #[derive(Default)]
 pub(super) struct Scanned {
-    pub text: String,
-    pub items: Vec<Item>,
+    pub rows: Arc<Rows>,
+    /// The estimate of the rows, as the walk adds it up, and their number.
+    pub bytes: u64,
+    pub count: usize,
     pub errors: Vec<Option<io::Error>>,
     /// Set when the directory could not be opened or listed. It then holds no
     /// items.
@@ -154,15 +189,31 @@ pub(super) struct Scanned {
 }
 
 impl Scanned {
-    pub fn text(&self, span: Span) -> &str {
-        &self.text[span.start as usize..(span.start + span.len) as usize]
+    /// Returns `true` if the directory was read and every item is a row, so
+    /// that the walk has nothing to count or report for it.
+    pub fn is_clean(&self) -> bool {
+        self.unreadable.is_none() && self.count == self.rows.items.len()
     }
 
     /// The bytes this result holds, for the limit on results that wait.
     pub fn held_bytes(&self) -> u64 {
-        (self.text.len() + self.items.len() * size_of::<Item>()) as u64
+        (self.rows.text.len() + self.rows.items.len() * size_of::<Item>()) as u64
     }
+}
 
+// A scan while it is being made.
+#[derive(Default)]
+struct Reading {
+    text: String,
+    items: Vec<Item>,
+    bytes: u64,
+    count: usize,
+    errors: Vec<Option<io::Error>>,
+    unreadable: Option<io::Error>,
+    next: Option<usize>,
+}
+
+impl Reading {
     fn span(&mut self, text: &str) -> io::Result<Span> {
         let too_large = || io::Error::other("the directory's names are larger than 4 GiB");
         let start = u32::try_from(self.text.len()).map_err(|_| too_large())?;
@@ -200,6 +251,9 @@ impl Scanned {
             target
         };
         let target = self.span(&target)?;
+        let (name_len, target_len) = (name.len as usize, target.len as usize);
+        self.bytes += estimate(EntryKind::Symlink, "", "") + (name_len + target_len) as u64;
+        self.count += 1;
         self.items.push(Item::Symlink {
             name,
             target,
@@ -207,6 +261,12 @@ impl Scanned {
             directory,
         });
         Ok(())
+    }
+
+    // Counts a row that is about to be pushed.
+    fn row(&mut self, kind: EntryKind, name: &str, target: &str) {
+        self.bytes += estimate(kind, name, target);
+        self.count += 1;
     }
 
     fn failed(&mut self, name: Option<Span>, what: &'static str, error: io::Error) {
@@ -227,6 +287,32 @@ struct Offered<'l> {
     kind: EntryKind,
     listed_kind: Kind,
     stat: Option<reader::Stat>,
+}
+
+impl Finding {
+    fn finish(self) -> Found {
+        let Reading {
+            text,
+            items,
+            bytes,
+            count,
+            errors,
+            unreadable,
+            next,
+        } = self.scanned;
+        Found {
+            scanned: Scanned {
+                rows: Arc::new(Rows { text, items }),
+                bytes,
+                count,
+                errors,
+                unreadable,
+                next,
+            },
+            directories: self.directories,
+            rest: self.rest,
+        }
+    }
 }
 
 /// How many open directories the waiting jobs hold, and how many they may.
@@ -283,15 +369,15 @@ impl Scanner<'_> {
         scratch: &mut Scratch,
         release: &mut dyn FnMut() -> bool,
     ) -> Found {
-        let mut found = Found {
-            scanned: Scanned::default(),
+        let mut found = Finding {
+            scanned: Reading::default(),
             directories: Vec::new(),
             rest: Vec::new(),
         };
         let (path, opened, refused) = match job.work {
             Work::Rest { listed, start } => {
                 self.entries(&listed, start, &mut found);
-                return found;
+                return found.finish();
             }
             Work::Directory {
                 path,
@@ -301,7 +387,7 @@ impl Scanner<'_> {
         };
         if let Some(error) = refused {
             found.scanned.unreadable = Some(error);
-            return found;
+            return found.finish();
         }
         let directory = match opened {
             Some(directory) => {
@@ -317,7 +403,7 @@ impl Scanner<'_> {
             Ok(listed) => listed,
             Err(error) => {
                 found.scanned.unreadable = Some(error);
-                return found;
+                return found.finish();
             }
         };
 
@@ -325,7 +411,7 @@ impl Scanner<'_> {
             let name = name.and_then(|name| found.scanned.span(&name).ok());
             found.scanned.failed(name, what, error);
             if self.on_error == OnError::Fail {
-                return found;
+                return found.finish();
             }
         }
         let listed = ListedDirectory {
@@ -336,7 +422,7 @@ impl Scanner<'_> {
         };
         if listed.listing.entries.len() <= CHUNK {
             self.entries(&listed, 0, &mut found);
-            return found;
+            return found.finish();
         }
         let listed = Arc::new(listed);
         for start in (CHUNK..listed.listing.entries.len()).step_by(CHUNK) {
@@ -349,11 +435,11 @@ impl Scanner<'_> {
             });
         }
         self.entries(&listed, 0, &mut found);
-        found
+        found.finish()
     }
 
     // Reads up to `CHUNK` entries of `listed`, from `start`.
-    fn entries(&self, listed: &ListedDirectory, start: usize, found: &mut Found) {
+    fn entries(&self, listed: &ListedDirectory, start: usize, found: &mut Finding) {
         let end = listed.listing.entries.len().min(start + CHUNK);
         if end < listed.listing.entries.len() {
             found.scanned.next = Some(end);
@@ -394,7 +480,7 @@ impl Scanner<'_> {
         &self,
         within: &'l ListedDirectory,
         listed: &Listed,
-        scanned: &mut Scanned,
+        scanned: &mut Reading,
     ) -> io::Result<Option<Offered<'l>>> {
         let ListedDirectory {
             path: parent,
@@ -506,7 +592,7 @@ impl Scanner<'_> {
 
     // Reads one entry into `scanned`. The error it returns is one that leaves
     // the scan unable to say which entry failed.
-    fn entry(&self, within: &ListedDirectory, place: usize, found: &mut Found) -> io::Result<()> {
+    fn entry(&self, within: &ListedDirectory, place: usize, found: &mut Finding) -> io::Result<()> {
         let ListedDirectory {
             key,
             path: parent,
@@ -571,6 +657,7 @@ impl Scanner<'_> {
                         refused,
                     },
                 });
+                scanned.row(EntryKind::Directory, name, "");
                 scanned.items.push(Item::Directory {
                     name: name_span,
                     place,
@@ -578,12 +665,15 @@ impl Scanner<'_> {
                     mode: stat.mode,
                 });
             }
-            _ => scanned.items.push(Item::File {
-                name: name_span,
-                size: stat.size,
-                mtime: stat.mtime,
-                mode: stat.mode,
-            }),
+            _ => {
+                scanned.row(EntryKind::File, name, "");
+                scanned.items.push(Item::File {
+                    name: name_span,
+                    size: stat.size,
+                    mtime: stat.mtime,
+                    mode: stat.mode,
+                });
+            }
         }
         Ok(())
     }
@@ -646,7 +736,7 @@ mod tests {
 
         assert_eq!(asked, 1);
         assert!(found.scanned.unreadable.is_none());
-        assert_eq!(found.scanned.items.len(), 2);
+        assert_eq!(found.scanned.rows.items.len(), 2);
         // The one descriptor that was released went to the directory itself,
         // so its subdirectory waits for a scan that opens it by its path.
         assert_eq!(found.directories.len(), 1);
