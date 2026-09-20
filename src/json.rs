@@ -199,7 +199,13 @@ struct Parts<'a>(&'a [PartEntry]);
 impl Serialize for Parts<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let rows = self.0;
-        let mut out = serializer.serialize_struct("parts", 4)?;
+        // Left out when every part is in the frame of its own number, which is
+        // so whenever the parts were written in walk order.
+        let moved = rows
+            .iter()
+            .enumerate()
+            .any(|(place, row)| row.frame != place as u64);
+        let mut out = serializer.serialize_struct("parts", 4 + usize::from(moved))?;
         out.serialize_field("first", &Column(|| rows.iter().map(|row| &row.first)))?;
         out.serialize_field(
             "directories",
@@ -207,6 +213,9 @@ impl Serialize for Parts<'_> {
         )?;
         out.serialize_field("files", &Column(|| rows.iter().map(|row| row.files)))?;
         out.serialize_field("symlinks", &Column(|| rows.iter().map(|row| row.symlinks)))?;
+        if moved {
+            out.serialize_field("frame", &Column(|| rows.iter().map(|row| row.frame)))?;
+        }
         out.end()
     }
 }
@@ -276,6 +285,22 @@ impl Index {
         {
             return malformed(|| "index columns disagree on the number of parts".to_owned());
         }
+        // Without the column, each part is in the frame of its own number.
+        let frames = match parts.get("frame") {
+            Some(_) => column("frame")?,
+            None => (0..count as u64).collect(),
+        };
+        let mut seen = vec![false; count];
+        let each_once = frames.len() == count
+            && frames.iter().all(|&frame| {
+                usize::try_from(frame)
+                    .ok()
+                    .and_then(|frame| seen.get_mut(frame))
+                    .is_some_and(|seen| !std::mem::replace(seen, true))
+            });
+        if !each_once {
+            return malformed(|| "index column frame does not name every frame once".to_owned());
+        }
         let mut entries = Vec::with_capacity(count);
         for row in 0..count {
             let Some(first) = first[row].as_str() else {
@@ -286,6 +311,7 @@ impl Index {
                 directories: directories[row],
                 files: files[row],
                 symlinks: symlinks[row],
+                frame: frames[row],
             });
         }
 

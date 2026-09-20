@@ -65,6 +65,22 @@ impl Job {
         }
     }
 
+    /// Where in its directory's listing this scan starts.
+    pub fn start(&self) -> usize {
+        match &self.work {
+            Work::Directory { .. } => 0,
+            Work::Rest { start, .. } => *start,
+        }
+    }
+
+    /// The path of the directory, for a scan that opens one.
+    pub fn path(&self) -> Option<&str> {
+        match &self.work {
+            Work::Directory { path, .. } => Some(path),
+            Work::Rest { .. } => None,
+        }
+    }
+
     /// Closes the directory this job holds for its scan, if it holds one that
     /// the scan can open again. Returns `true` if it did.
     pub fn release(&mut self, held: &Held) -> bool {
@@ -193,11 +209,6 @@ impl Scanned {
     /// that the walk has nothing to count or report for it.
     pub fn is_clean(&self) -> bool {
         self.unreadable.is_none() && self.count == self.rows.items.len()
-    }
-
-    /// The bytes this result holds, for the limit on results that wait.
-    pub fn held_bytes(&self) -> u64 {
-        (self.rows.text.len() + self.rows.items.len() * size_of::<Item>()) as u64
     }
 }
 

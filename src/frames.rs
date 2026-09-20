@@ -34,8 +34,8 @@ use std::thread;
 
 use error_stack::{Report, ResultExt as _};
 
-use crate::manifest::{Index, PartEntry, TreePart};
-use crate::walk::{WalkError, WalkOptions, walk_parts};
+use crate::manifest::{Index, PartEntry, TreePart, walk_order};
+use crate::walk::{PartOrder, WalkError, WalkOptions, walk_parts};
 
 /// The number of worker threads the `tarseer` command uses.
 pub const DEFAULT_THREADS: usize = 2;
@@ -220,8 +220,13 @@ pub fn write_frames(
         let in_order = orderer.join().expect("the sink does not panic");
         (in_order, walked)
     });
-    let parts = in_order?;
+    let mut parts = in_order?;
     let skips = walked.change_context(WriteError)?;
+    // The frames are in the order the walk gave the parts. The index is in
+    // walk order, and each entry says which frame is its part.
+    if walk_options.order == PartOrder::Completion {
+        parts.sort_by(|left, right| walk_order(&left.first, &right.first));
+    }
 
     let index = Index { parts, skips };
     let mut line = index.to_json().change_context(WriteError)?.into_bytes();
@@ -261,7 +266,7 @@ impl Worker {
             sequence,
             bytes: self.frame.clone(),
             raw_len: self.line.len() as u64,
-            entry: PartEntry::of(part),
+            entry: PartEntry::of(part, sequence as u64),
         })
     }
 }

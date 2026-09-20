@@ -9,7 +9,9 @@ use std::sync::atomic::AtomicBool;
 
 use common::{TempDir, wide_fixture};
 use error_stack::Report;
-use tarseer::{Cancelled, Candidate, EntryKind, Filter, WalkError, WalkOptions, walk, walk_parts};
+use tarseer::{
+    Cancelled, Candidate, EntryKind, Filter, PartOrder, WalkError, WalkOptions, walk, walk_parts,
+};
 
 const THREADS: [usize; 4] = [1, 2, 3, 8];
 
@@ -75,6 +77,24 @@ fn the_parts_are_the_same_wherever_the_budget_puts_the_cuts() {
         let want = parts(temp_dir.path(), &options(budget, 0));
         let got = parts(temp_dir.path(), &options(budget, 3));
         assert_eq!(got, want, "budget {budget}");
+    }
+}
+
+#[test]
+fn in_completion_order_the_parts_are_the_same_ones() {
+    let temp_dir = large_fixture("threads-completion");
+    for budget in [300, 2_000, 20_000] {
+        let mut want = parts(temp_dir.path(), &options(budget, 0));
+        want.sort();
+        for threads in THREADS {
+            let as_built = WalkOptions {
+                order: PartOrder::Completion,
+                ..options(budget, threads)
+            };
+            let mut got = parts(temp_dir.path(), &as_built);
+            got.sort();
+            assert_eq!(got, want, "budget {budget}, {threads} threads");
+        }
     }
 }
 

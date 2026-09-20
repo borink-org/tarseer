@@ -25,23 +25,29 @@ pub struct PartEntry {
     pub files: u64,
     /// The number of symlink rows in the part.
     pub symlinks: u64,
+    /// The number of the frame that holds the part. This is the entry's own
+    /// place in the index, unless the parts were written in another order
+    /// than walk order.
+    pub frame: u64,
 }
 
 impl PartEntry {
-    /// Returns the index entry for `part`.
+    /// Returns the index entry for `part`, which frame `frame` holds.
     #[must_use]
-    pub fn of(part: &TreePart) -> Self {
+    pub fn of(part: &TreePart, frame: u64) -> Self {
         Self {
             first: part.first_path().unwrap_or_default(),
             directories: part.directories.len() as u64,
             files: part.files.len() as u64,
             symlinks: part.symlinks.len() as u64,
+            frame,
         }
     }
 }
 
 /// The index of a manifest: one entry per part, in walk order, and what the
-/// walk skipped.
+/// walk skipped. The entries are in walk order whatever order the parts were
+/// written in, and [`PartEntry::frame`] says where each part is.
 ///
 /// A directory is one contiguous run of the walk, so a search over
 /// [`PartEntry::first`] with [`walk_order`] finds the parts it spans.

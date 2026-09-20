@@ -40,23 +40,41 @@
 //!
 //! # Threads
 //!
-//! Reading a directory, which is listing it and reading the metadata of its
-//! entries, is most of a walk. With [`WalkOptions::threads`] above 0, that many
-//! threads read directories ahead of the walk, in walk order. The walk itself
-//! stays on the calling thread, takes what they read, and cuts the same parts
-//! as it does without them. A directory of more than 1,024 entries is read in
-//! pieces, which several threads read at once.
+//! With [`WalkOptions::threads`] above 0, that many threads walk, and the
+//! calling thread gives the parts to the sink. The parts are the same as
+//! without threads, row for row.
+//!
+//! 1. The threads read the directories, several at once. A directory of more
+//!    than 1,024 entries is read in pieces, which several threads read too.
+//! 2. Every directory whose subtree does not fit a part is cut by itself, on
+//!    whichever thread is free. Two such directories do not wait for each
+//!    other, so parts of a tree that have nothing in common are walked side by
+//!    side.
+//! 3. The threads build the parts.
+//!
+//! [`WalkOptions::order`] says in which order the sink gets them. In
+//! [`PartOrder::Walk`] a part waits for every part before it, so one slow
+//! directory holds up all that follow. In [`PartOrder::Completion`] no part
+//! waits for another. Choose that for a tree on slow or remote storage. Give
+//! such a walk many more threads than the machine has cores, since they
+//! spend their time waiting for the storage.
+//!
+//! With threads, a [`Filter`] and a [`Progress`] are called from the threads,
+//! several at once and in no particular order. A walk that fails reports one
+//! of the entries it could not read, and not always the first in walk order.
 //!
 //! # Memory
 //!
-//! The walk holds the rows that are not yet in a sealed part, and their
-//! estimates add up to less than about two budgets. It also holds entries it
-//! has read and not yet visited. Those are at most 1,024 for each directory
-//! between the root and the entry being visited. A directory larger than that
-//! costs the names of its whole listing while the walk is inside it.
+//! Without threads, the walk holds the rows that are not yet in a sealed
+//! part. Their estimates add up to less than about two budgets. It also
+//! holds entries it has read and not yet visited. Those are at most 1,024 for
+//! each directory between the root and the entry being visited. A directory
+//! larger than that costs the names of its whole listing while the walk is
+//! inside it.
 //!
-//! Threads add what they have read ahead of the walk, which is limited to one
-//! more budget.
+//! With threads, the limit is on the rows that have been read and not yet
+//! given to the sink. It is about two budgets, and 2,048 rows for each thread. At
+//! the limit the threads read only what the next part in walk order needs.
 //!
 //! On Linux the walk keeps some of the directories it is about to read open,
 //! at most 128. When the process runs out of file descriptors, the walk closes
@@ -73,14 +91,14 @@ use error_stack::{Report, ResultExt as _};
 use crate::manifest::{EntryKind, TreePart};
 
 mod assemble;
-mod pool;
+mod engine;
 mod reader;
 mod scan;
 
-use self::assemble::{Piece, Plan, Segment, Subtree};
-use self::pool::{Got, Pool, Whole};
+use self::assemble::{Piece, Plan, Segment};
+use self::engine::Engine;
 use self::reader::{Kind, Listed, Scratch};
-use self::scan::{Found, Held, Item, Job, Rows, Scanned, Scanner, key_below};
+use self::scan::{Found, Held, Item, Job, Rows, Scanned, Scanner};
 
 /// The budget of [`WalkOptions::default()`]: 4 MiB of estimated JSON per
 /// part.
@@ -192,6 +210,10 @@ impl<'a> Listing<'a> {
 
 /// Receives a call for each step the walk takes. Every method does nothing
 /// unless you override it.
+///
+/// Without threads the calls come in walk order. With
+/// [`WalkOptions::threads`] above 0 they come from those threads, when a
+/// directory is read, several at once and in no particular order.
 pub trait Progress: Send + Sync {
     /// Called before the walk lists the directory at `directory`, which is
     /// empty for the root.
@@ -218,6 +240,22 @@ pub enum SkipReason {
     /// The entry's type, metadata or link target could not be read, and the
     /// policy is [`OnError::Skip`].
     Failed,
+}
+
+/// The order in which a walk with threads gives its parts to the sink. The
+/// parts themselves are the same in either order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PartOrder {
+    /// Walk order. A part waits for every part before it, so a slow directory
+    /// holds up what comes after it. The threads stop reading ahead once the
+    /// memory limit is reached.
+    #[default]
+    Walk,
+    /// The order in which the threads finish the parts. No part waits for
+    /// another, which is what a tree on slow or remote storage wants.
+    /// [`TreePart::first_path`] and [`walk_order`](crate::walk_order) put the
+    /// parts back in walk order.
+    Completion,
 }
 
 /// What the walk does with an entry it cannot read: one whose type, metadata
@@ -248,10 +286,12 @@ pub struct WalkOptions<'a> {
     pub cancel: Option<&'a AtomicBool>,
     /// What the walk does with an entry it cannot read.
     pub on_error: OnError,
-    /// The number of threads that read directories ahead of the walk. With 0,
-    /// the walk reads each directory itself when it enters it. The parts are
-    /// the same either way.
+    /// The number of threads that walk. With 0 the calling thread walks alone.
+    /// The parts are the same either way.
     pub threads: usize,
+    /// The order in which the sink gets the parts. It matters only with
+    /// [`threads`](Self::threads) above 0.
+    pub order: PartOrder,
 }
 
 impl Default for WalkOptions<'_> {
@@ -263,6 +303,7 @@ impl Default for WalkOptions<'_> {
             cancel: None,
             on_error: OnError::Fail,
             threads: 0,
+            order: PartOrder::Walk,
         }
     }
 }
@@ -399,54 +440,29 @@ pub fn walk_parts(
         held: Held::new(),
     };
     if options.threads == 0 {
-        let mut walker = Walker::new(options, sink, &scanner, Source::Inline(Scratch::default()));
-        walker.run(root, Some(Job::root()))?;
+        let mut walker = Walker::new(options, sink, &scanner);
+        walker.run(root, Job::root())?;
         return Ok(walker.skips);
     }
 
-    // The scans that wait for the walk are limited to one budget for each
-    // thread, so that the budget and the threads bound the walk's memory.
-    let threads = u64::try_from(options.threads).unwrap_or(u64::MAX);
-    let pool = Pool::new(&scanner, options.budget.saturating_mul(threads));
+    let engine = Engine::new(&scanner, options, root);
     std::thread::scope(|scope| {
         // Closed on every way out, so that the scope can join the workers.
-        let _closed = CloseOnDrop(&pool);
+        let _closed = CloseOnDrop(&engine);
         for _ in 0..options.threads {
-            scope.spawn(|| pool.work());
+            scope.spawn(|| engine.work());
         }
-        pool.submit(Job::root());
-        let ahead = Source::Ahead {
-            pool: &pool,
-            taken: VecDeque::new(),
-            whole: None,
-        };
-        let mut walker = Walker::new(options, sink, &scanner, ahead);
-        walker.run(root, None)?;
-        Ok(walker.skips)
+        engine.run(sink)?;
+        Ok(engine.skips())
     })
 }
 
-struct CloseOnDrop<'p, 'a>(&'p Pool<'a>);
+struct CloseOnDrop<'e, 'a>(&'e Engine<'a>);
 
 impl Drop for CloseOnDrop<'_, '_> {
     fn drop(&mut self) {
         self.0.close();
     }
-}
-
-// Where the walk gets the scan of a directory it enters.
-enum Source<'p> {
-    // It scans the directory itself.
-    Inline(Scratch),
-    // Worker threads scan ahead of it. `taken` holds the scans that came along
-    // with one it asked for, in the order it will need them.
-    // `whole` is set while the first scans of `taken` are a whole subtree,
-    // with how many of them.
-    Ahead {
-        pool: &'p Pool<'p>,
-        taken: VecDeque<(Box<[u32]>, Scanned)>,
-        whole: Option<(Whole, usize)>,
-    },
 }
 
 // An open directory. Row positions are absolute: the first row of the walk is
@@ -455,8 +471,7 @@ struct Level {
     scanned: Scanned,
     next: usize,
     // The jobs of the subdirectories in `scanned` that the walk has not
-    // entered yet, and the scans of the rest of this directory. Both are empty
-    // when worker threads scan ahead, since they hold them.
+    // entered yet, and the scans of the rest of this directory.
     jobs: std::vec::IntoIter<Job>,
     rest: std::vec::IntoIter<Job>,
     // Length of this directory's relative path in `Walker::path`.
@@ -484,10 +499,6 @@ struct Walker<'o, 's> {
     // The position of the first waiting row, and of the next row to come.
     base: usize,
     position: usize,
-    // With worker threads, the parts that were planned and the parts the sink
-    // has been given. A worker builds each part between the two.
-    planned: usize,
-    delivered: usize,
     // Running estimate of every row so far.
     total: u64,
     path: String,
@@ -495,10 +506,8 @@ struct Walker<'o, 's> {
     // Index of the outermost measuring level; `stack.len()` if none.
     measuring: usize,
     skips: Skips,
-    // The key of the directory `path` names. See `Job::key`.
-    key: Vec<u32>,
     scanner: &'s Scanner<'s>,
-    source: Source<'s>,
+    scratch: Scratch,
 }
 
 impl<'o, 's> Walker<'o, 's> {
@@ -506,7 +515,6 @@ impl<'o, 's> Walker<'o, 's> {
         options: &'o WalkOptions<'o>,
         sink: &'s mut dyn FnMut(TreePart) -> Result<(), Report<WalkError>>,
         scanner: &'s Scanner<'s>,
-        source: Source<'s>,
     ) -> Self {
         Self {
             options,
@@ -514,22 +522,17 @@ impl<'o, 's> Walker<'o, 's> {
             waiting: VecDeque::new(),
             base: 0,
             position: 0,
-            planned: 0,
-            delivered: 0,
             total: 0,
             path: String::new(),
             stack: Vec::new(),
             measuring: 1,
             skips: Skips::default(),
-            key: Vec::new(),
             scanner,
-            source,
+            scratch: Scratch::default(),
         }
     }
 
-    // `first` is the root's job when the walk scans for itself. Worker threads
-    // were given it otherwise.
-    fn run(&mut self, root: &Path, first: Option<Job>) -> Result<(), Report<WalkError>> {
+    fn run(&mut self, root: &Path, first: Job) -> Result<(), Report<WalkError>> {
         if let Some(progress) = self.options.progress {
             progress.entered("");
         }
@@ -537,7 +540,7 @@ impl<'o, 's> Walker<'o, 's> {
             mut scanned,
             directories,
             rest,
-        } = self.scan(first)?;
+        } = self.scan(first);
         // An error under either policy: counting the root as a skip would
         // report an empty walk as a success.
         if let Some(error) = scanned.unreadable.take() {
@@ -562,7 +565,7 @@ impl<'o, 's> Walker<'o, 's> {
         while let Some(top) = self.stack.last_mut() {
             if top.next == top.scanned.rows.items.len() {
                 match top.scanned.next {
-                    Some(start) => self.read_on(start)?,
+                    Some(_) => self.read_on(),
                     None => self.finish_level()?,
                 }
                 continue;
@@ -584,129 +587,22 @@ impl<'o, 's> Walker<'o, 's> {
             self.stack[level].scanned = scanned;
             visited?;
         }
-        self.deliver(true)
-    }
-
-    // Gives the sink the parts that workers have built, in the order they were
-    // planned. With `all` it waits for every part. Otherwise it waits only
-    // while more parts are planned than the workers can be building.
-    fn deliver(&mut self, all: bool) -> Result<(), Report<WalkError>> {
-        let Source::Ahead { pool, .. } = &self.source else {
-            return Ok(());
-        };
-        while self.delivered < self.planned {
-            let behind = self.planned - self.delivered;
-            let built = if all || behind > self.options.threads + 1 {
-                match pool.wait_for(Some(self.delivered), None) {
-                    Got::Part(built) => built,
-                    Got::Scans(_) => unreachable!("no scan was asked for"),
-                }
-            } else {
-                match pool.part_if_built(self.delivered) {
-                    Some(built) => built,
-                    None => return Ok(()),
-                }
-            };
-            self.delivered += 1;
-            (self.sink)(built.change_context(WalkError)?)?;
-        }
         Ok(())
     }
 
-    // With worker threads, waits until the scan of the directory with
-    // `self.key` is the first of `taken`. While it waits, the walk gives the
-    // sink the parts the workers have built.
-    fn fetch(&mut self) -> Result<(), Report<WalkError>> {
-        let Self {
-            source,
-            sink,
-            key,
-            planned,
-            delivered,
-            ..
-        } = self;
-        let Source::Ahead { pool, taken, whole } = source else {
-            return Ok(());
-        };
-        while taken.front().is_none_or(|(first, _)| **first != **key) {
-            debug_assert!(taken.is_empty(), "scans are taken in walk order");
-            let part = (*delivered < *planned).then_some(*delivered);
-            match pool.wait_for(part, Some(key)) {
-                Got::Scans(bundle) => {
-                    *whole = bundle.whole.map(|totals| (totals, bundle.scans.len()));
-                    taken.extend(bundle.scans);
-                }
-                Got::Part(built) => {
-                    *delivered += 1;
-                    sink(built.change_context(WalkError)?)?;
-                }
+    // Scans the directory of `job`.
+    fn scan(&mut self, job: Job) -> Found {
+        let scanner = self.scanner;
+        let stack = &mut self.stack;
+        // With no handle left, close the directories that the jobs of the open
+        // levels hold.
+        scanner.scan(job, &mut self.scratch, &mut || {
+            let mut released = false;
+            for waiting in stack.iter_mut().flat_map(|level| level.jobs.as_mut_slice()) {
+                released |= waiting.release(&scanner.held);
             }
-        }
-        Ok(())
-    }
-
-    // Returns the scan of the directory `self.path` names. `job` is its job
-    // when the walk scans for itself.
-    fn scan(&mut self, job: Option<Job>) -> Result<Found, Report<WalkError>> {
-        self.fetch()?;
-        let Self {
-            source,
-            scanner,
-            stack,
-            ..
-        } = self;
-        match source {
-            Source::Ahead { taken, whole, .. } => {
-                // The walk goes into this subtree, so it is not taken as one.
-                *whole = None;
-                let (_, scanned) = taken.pop_front().expect("the scan that was fetched");
-                Ok(Found {
-                    scanned,
-                    directories: Vec::new(),
-                    rest: Vec::new(),
-                })
-            }
-            Source::Inline(scratch) => {
-                let job = job.expect("the walk holds the jobs when it scans for itself");
-                let scanner = *scanner;
-                // With no handle left, close the directories that the jobs of
-                // the open levels hold.
-                Ok(scanner.scan(job, scratch, &mut || {
-                    let mut released = false;
-                    for waiting in stack.iter_mut().flat_map(|level| level.jobs.as_mut_slice()) {
-                        released |= waiting.release(&scanner.held);
-                    }
-                    released
-                }))
-            }
-        }
-    }
-
-    // Takes the subtree of the directory with `self.key` as one, if worker
-    // threads scanned all of it and it fits a part together with the
-    // directory's own row, which is `row_bytes`. A subtree that fits is never
-    // split, so only its totals matter to where parts are cut.
-    fn take_whole(
-        &mut self,
-        row_bytes: u64,
-    ) -> Result<Option<(Whole, Vec<Scanned>)>, Report<WalkError>> {
-        // Progress hears of every entry, which a subtree taken as one skips.
-        if self.options.progress.is_some() {
-            return Ok(None);
-        }
-        self.fetch()?;
-        let Source::Ahead { taken, whole, .. } = &mut self.source else {
-            return Ok(None);
-        };
-        let Some((totals, scans)) = *whole else {
-            return Ok(None);
-        };
-        if row_bytes + totals.bytes > self.options.budget {
-            return Ok(None);
-        }
-        *whole = None;
-        let scans = taken.drain(..scans).map(|(_, scanned)| scanned).collect();
-        Ok(Some((totals, scans)))
+            released
+        })
     }
 
     // Handles one item from start to finish. Splitting it would pass the
@@ -756,7 +652,7 @@ impl<'o, 's> Walker<'o, 's> {
                 self.push_leaf(estimate(kind, name, ""))?;
                 self.recorded(kind, size);
             }
-            Item::Directory { place, .. } => {
+            Item::Directory { .. } => {
                 let bytes = estimate(kind, name, "");
                 let row = self.position;
                 self.position += 1;
@@ -764,35 +660,15 @@ impl<'o, 's> Walker<'o, 's> {
                 if let Some(progress) = self.options.progress {
                     progress.entered(&self.path);
                 }
-                let job = self.stack[level].jobs.next();
-                self.key = key_below(&self.key[..level], place, true).into_vec();
-                if let Some((totals, scans)) = self.take_whole(bytes)? {
-                    // What `finish_level` does for a directory that was not
-                    // split, without the level.
-                    self.position += totals.count;
-                    self.total += bytes + totals.bytes;
-                    // An empty subtree has no rows to build, and a piece
-                    // without rows would give the next part its stem.
-                    if totals.count > 0 {
-                        self.waiting.push_back(Piece::Subtree(Subtree {
-                            scans,
-                            depth: level + 1,
-                            count: totals.count,
-                        }));
-                    }
-                    let subtree = bytes + totals.bytes;
-                    if self.stack[level].split {
-                        self.add_to_group(level, row, subtree)?;
-                    } else {
-                        self.stack[level].completed.push((row, subtree));
-                    }
-                    return self.check_budget();
-                }
+                let job = self.stack[level]
+                    .jobs
+                    .next()
+                    .expect("a job for every directory a scan found");
                 let Found {
                     mut scanned,
                     directories,
                     rest,
-                } = self.scan(job)?;
+                } = self.scan(job);
                 if let Some(error) = scanned.unreadable.take() {
                     self.unreadable(error)?;
                 }
@@ -839,18 +715,19 @@ impl<'o, 's> Walker<'o, 's> {
     }
 
     // Replaces the scan of the top level, which the walk has used up, with
-    // the scan of the same directory from `start` on.
-    fn read_on(&mut self, start: usize) -> Result<(), Report<WalkError>> {
+    // the scan of the rest of the same directory.
+    fn read_on(&mut self) {
         let level = self.stack.len() - 1;
         self.path.truncate(self.stack[level].path_len);
-        self.key = key_below(&self.key[..level], start, false).into_vec();
-        let job = self.stack[level].rest.next();
-        let found = self.scan(job)?;
+        let job = self.stack[level]
+            .rest
+            .next()
+            .expect("a job for the rest of a directory that has more");
+        let found = self.scan(job);
         let top = &mut self.stack[level];
         top.scanned = found.scanned;
         top.next = 0;
         top.jobs = found.directories.into_iter();
-        Ok(())
     }
 
     // A directory below the root that cannot be opened or listed costs its
@@ -1018,20 +895,11 @@ impl<'o, 's> Walker<'o, 's> {
             }
         }
         self.base = end;
-        self.emit(Plan { stem, pieces })
+        self.emit(&Plan { stem, pieces })
     }
 
-    // Has the part of `plan` built and given to the sink: here and now, or by
-    // a worker thread and in its turn.
-    fn emit(&mut self, plan: Plan) -> Result<(), Report<WalkError>> {
-        match &self.source {
-            Source::Inline(_) => (self.sink)(plan.assemble().change_context(WalkError)?),
-            Source::Ahead { pool, .. } => {
-                pool.plan(self.planned, plan);
-                self.planned += 1;
-                self.deliver(false)
-            }
-        }
+    fn emit(&mut self, plan: &Plan) -> Result<(), Report<WalkError>> {
+        (self.sink)(plan.assemble().change_context(WalkError)?)
     }
 
     fn failed(&mut self, error: std::io::Error, what: &str) -> Result<(), Report<WalkError>> {

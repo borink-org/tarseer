@@ -11,7 +11,7 @@ use error_stack::{Report, ResultExt as _};
 use tarseer::file::{Written, write_file};
 use tarseer::frames::DEFAULT_THREADS;
 use tarseer::zstd::Zstd;
-use tarseer::{DEFAULT_BUDGET, Skips, WalkError, WalkOptions, WriteError, walk_parts};
+use tarseer::{DEFAULT_BUDGET, PartOrder, Skips, WalkError, WalkOptions, WriteError, walk_parts};
 
 // mimalloc for the binary only; the library sets no allocator.
 #[global_allocator]
@@ -62,7 +62,13 @@ fn main() -> ExitCode {
             Arg::new("walk-threads")
                 .long("walk-threads")
                 .value_parser(value_parser!(usize))
-                .help("Threads that read directories ahead of the walk [default: 0]"),
+                .help("Threads that walk, besides the one that writes [default: 0]"),
+        )
+        .arg(
+            Arg::new("as-built")
+                .long("as-built")
+                .action(clap::ArgAction::SetTrue)
+                .help("Write each part when it is built, not in walk order; for slow storage"),
         )
         .get_matches();
 
@@ -78,6 +84,11 @@ fn main() -> ExitCode {
             .get_one::<usize>("walk-threads")
             .copied()
             .unwrap_or(0),
+        order: if matches.get_flag("as-built") {
+            PartOrder::Completion
+        } else {
+            PartOrder::Walk
+        },
         ..WalkOptions::default()
     };
     match matches.get_one::<PathBuf>("out") {

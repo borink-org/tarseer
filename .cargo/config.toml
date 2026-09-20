@@ -1,0 +1,6 @@
+[env]
+# A build-time default of the command's allocator. It would otherwise commit
+# the memory of every thread's arena at once, which with many walk threads is
+# most of what the command holds. The allocator makes its first arena before
+# `main` runs, so the command cannot set this itself.
+MI_DEFAULT_ARENA_EAGER_COMMIT = "0"

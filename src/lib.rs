@@ -67,6 +67,6 @@ pub use crate::manifest::{
     TreePartFull, walk_order,
 };
 pub use crate::walk::{
-    Cancelled, Candidate, DEFAULT_BUDGET, Filter, Listing, OnError, Progress, SkipReason, Skips,
-    Walk, WalkError, WalkOptions, estimate, walk, walk_parts,
+    Cancelled, Candidate, DEFAULT_BUDGET, Filter, Listing, OnError, PartOrder, Progress,
+    SkipReason, Skips, Walk, WalkError, WalkOptions, estimate, walk, walk_parts,
 };

@@ -245,7 +245,8 @@ impl<'a> ManifestFile<'a> {
         Some(&self.bytes[span.start..span.start + span.len])
     }
 
-    /// Decodes part `number` and returns its JSON.
+    /// Decodes part `number`, counted in walk order as the index does, and
+    /// returns its JSON.
     ///
     /// # Errors
     /// [`ReadError`] if there is no part `number`, if the frame is damaged,
@@ -254,7 +255,12 @@ impl<'a> ManifestFile<'a> {
         if number >= self.index.parts.len() {
             return corrupt(|| format!("there is no part {number}"));
         }
-        let span = self.frames[number];
+        let held = usize::try_from(self.index.parts[number].frame)
+            .ok()
+            .and_then(|at| self.frames.get(at));
+        let Some(&span) = held else {
+            return corrupt(|| format!("part {number} is in a frame the file does not hold"));
+        };
         let frame = &self.bytes[span.start..span.start + span.len];
         let line =
             decode_line(self.format.codec(), frame).attach_with(|| format!("part {number}"))?;

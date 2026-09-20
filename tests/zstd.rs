@@ -12,8 +12,8 @@ use common::{TempDir, wide_fixture};
 use tarseer::file::{ManifestFile, Written, write_file};
 use tarseer::zstd::Zstd;
 use tarseer::{
-    Frame, FrameKind, ReadError, Walk, WalkOptions, WriteError, decode_index, decode_line, walk,
-    write_frames,
+    Frame, FrameKind, Index, PartEntry, ReadError, Walk, WalkOptions, WriteError, decode_index,
+    decode_line, walk, write_frames,
 };
 
 static ZSTD: Zstd = Zstd {
@@ -275,4 +275,71 @@ fn a_flipped_byte_inside_a_part_is_refused_rather_than_decoded() {
         let report = file.part_json(1).expect_err("a damaged part is refused");
         assert_eq!(report.current_context(), &ReadError);
     }
+}
+
+#[test]
+fn a_file_written_as_the_parts_were_built_reads_back_in_walk_order() {
+    use tarseer::PartOrder;
+
+    let temp_dir = wide_fixture("manifest-as-built");
+    let (in_order, _) = write(temp_dir.path(), 300, 2);
+    let in_order = ManifestFile::parse(&ZSTD, &in_order).unwrap();
+
+    let as_built = WalkOptions {
+        threads: 4,
+        order: PartOrder::Completion,
+        ..options(300)
+    };
+    let mut bytes = Vec::new();
+    let written = write_file(temp_dir.path(), &as_built, &ZSTD, 2, &mut bytes).unwrap();
+    let file = ManifestFile::parse(&ZSTD, &bytes).unwrap();
+
+    // The index is in walk order whatever order the frames are in, and part
+    // `n` is the same part in both files.
+    assert_eq!(file.index, written.index);
+    let firsts = |file: &ManifestFile<'_>| -> Vec<String> {
+        file.index
+            .parts
+            .iter()
+            .map(|part| part.first.clone())
+            .collect()
+    };
+    assert_eq!(firsts(&file), firsts(&in_order));
+    assert!(file.index.parts.len() > 3);
+    for number in 0..file.index.parts.len() {
+        assert_eq!(
+            file.part_json(number).unwrap(),
+            in_order.part_json(number).unwrap()
+        );
+    }
+    let mut frames: Vec<u64> = file.index.parts.iter().map(|part| part.frame).collect();
+    frames.sort_unstable();
+    assert_eq!(frames, (0..frames.len() as u64).collect::<Vec<_>>());
+}
+
+#[test]
+fn an_index_that_does_not_name_every_frame_once_is_refused() {
+    let index = Index {
+        parts: vec![
+            PartEntry {
+                first: "a".to_owned(),
+                directories: 0,
+                files: 1,
+                symlinks: 0,
+                frame: 1,
+            },
+            PartEntry {
+                first: "b".to_owned(),
+                directories: 0,
+                files: 1,
+                symlinks: 0,
+                frame: 1,
+            },
+        ],
+        skips: tarseer::Skips::default(),
+    };
+    let json = index.to_json().unwrap();
+    assert!(json.contains("\"frame\":[1,1]"));
+    let refused = Index::from_json(json.as_bytes()).expect_err("frame 1 twice and frame 0 never");
+    assert!(format!("{refused:?}").contains("every frame once"));
 }
