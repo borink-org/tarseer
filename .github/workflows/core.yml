@@ -19,7 +19,11 @@ jobs:
 
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # tests/tools.rs runs `zstd` and `jq`, and skips where they are missing.
+      # Here they must be present.
       - run: cargo test --locked --workspace
+        env:
+          TARSEER_REQUIRE_TOOLS: 1
       - run: RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
 
       # The `std::fs` directory reader, which other platforms use.

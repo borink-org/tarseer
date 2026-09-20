@@ -25,6 +25,32 @@
 //! The level and the window are not recorded. Two writes with different
 //! settings differ in bytes and read back the same.
 //!
+//! # Reading a file without this crate
+//!
+//! The stock `zstd` tool reads a file, here `tree.zst`. `tests/tools.rs` runs
+//! each of these commands.
+//!
+//! ```text
+//! zstd -dc tree.zst
+//! zstd -t tree.zst
+//! zstd -l tree.zst
+//! ```
+//!
+//! 1. `-dc` prints the parts and then the index, one JSON line each.
+//! 2. `-t` checks the checksum of every frame and prints nothing.
+//! 3. `-l` counts the frames: the parts, the index, and the seek table as the
+//!    one skippable frame.
+//!
+//! A frame cut out of the file is a zstd file of its own, so `zstd -dc` reads
+//! that too.
+//!
+//! A part holds its rows as columns. `jq` turns two columns of a part's line
+//! into rows, here the name and the size of every file:
+//!
+//! ```text
+//! jq -r '.files | [.name, .size] | transpose | .[] | @tsv'
+//! ```
+//!
 //! # Memory
 //!
 //! zstd sizes a compression context from the level and the window, not from
