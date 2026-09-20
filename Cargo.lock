@@ -65,16 +65,16 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cyo-mimalloc"
-version = "0.5.4"
-source = "git+https://github.com/cyo-alloc/mimalloc#ddaefbf81c5c05af69bb39a8919125e301089be7"
+version = "0.0.1"
+source = "git+https://github.com/cyo-alloc/mimalloc#d6c5bb857369e3bfb82b01364f7941cbe5fb5a6b"
 dependencies = [
  "cyo-mimalloc-sys",
 ]
 
 [[package]]
 name = "cyo-mimalloc-sys"
-version = "0.5.4"
-source = "git+https://github.com/cyo-alloc/mimalloc#ddaefbf81c5c05af69bb39a8919125e301089be7"
+version = "0.0.1"
+source = "git+https://github.com/cyo-alloc/mimalloc#d6c5bb857369e3bfb82b01364f7941cbe5fb5a6b"
 dependencies = [
  "cc",
 ]
