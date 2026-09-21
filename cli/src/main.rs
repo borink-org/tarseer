@@ -65,10 +65,10 @@ fn main() -> ExitCode {
                 .help("Threads that walk, besides the one that writes [default: 0]"),
         )
         .arg(
-            Arg::new("as-built")
-                .long("as-built")
-                .action(clap::ArgAction::SetTrue)
-                .help("Write each part when it is built, not in walk order; for slow storage"),
+            Arg::new("order")
+                .long("order")
+                .value_parser(["walk", "completion"])
+                .help("Order of the parts with walk threads: walk order, or as each is complete, for slow storage [default: walk]"),
         )
         .get_matches();
 
@@ -84,10 +84,9 @@ fn main() -> ExitCode {
             .get_one::<usize>("walk-threads")
             .copied()
             .unwrap_or(0),
-        order: if matches.get_flag("as-built") {
-            PartOrder::Completion
-        } else {
-            PartOrder::Walk
+        order: match matches.get_one::<String>("order").map(String::as_str) {
+            Some("completion") => PartOrder::Completion,
+            _ => PartOrder::Walk,
         },
         ..WalkOptions::default()
     };

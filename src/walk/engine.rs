@@ -362,7 +362,7 @@ impl<'a> Engine<'a> {
 
         match self.options.order {
             PartOrder::Walk => self.deliver_in_walk_order(&root, sink),
-            PartOrder::Completion => self.deliver_as_built(sink),
+            PartOrder::Completion => self.deliver_in_completion_order(sink),
         }
     }
 
@@ -417,7 +417,7 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn deliver_as_built(
+    fn deliver_in_completion_order(
         &self,
         sink: &mut dyn FnMut(TreePart) -> Result<(), Report<WalkError>>,
     ) -> Result<(), Report<WalkError>> {
@@ -1222,9 +1222,9 @@ impl<'a> Engine<'a> {
             drop(state);
         }
         // In walk order the calling thread follows what the sequencers make.
-        // As built, it takes parts, and a worker that builds one tells it. It
-        // then needs to hear of a sequencer only that the last one is done.
-        // Every needless wake-up takes a processor from a worker.
+        // In completion order it takes parts, and a worker that builds one
+        // tells it. It then needs to hear of a sequencer only that the last
+        // one is done. Every needless wake-up takes a processor from a worker.
         if done || self.options.order == PartOrder::Walk {
             self.announce();
         }
