@@ -115,7 +115,8 @@ pub(super) struct Found {
 }
 
 // A scan's result while it is being made.
-struct Finding {
+#[derive(Default)]
+pub(super) struct Finding {
     scanned: Reading,
     /// One job for each directory among the items, in walk order.
     pub directories: Vec<Job>,
@@ -184,14 +185,22 @@ pub(super) struct Rows {
 
 impl Rows {
     pub fn text(&self, span: Span) -> &str {
-        &self.text[span.start as usize..(span.start + span.len) as usize]
+        text_of(&self.text, span)
     }
 }
 
+/// The part of `text` that `span` names.
+pub(super) fn text_of(text: &str, span: Span) -> &str {
+    &text[span.start as usize..(span.start + span.len) as usize]
+}
+
 /// What a scan found in one directory.
-#[derive(Default)]
 pub(super) struct Scanned {
     pub rows: Arc<Rows>,
+    /// Which of the rows' items are this scan's. The scans of a subtree that
+    /// one thread read share their rows, so that a directory costs no
+    /// allocation of its own. An item is named by its place in the rows.
+    pub items: std::ops::Range<usize>,
     /// The estimate of the rows, as the walk adds it up, and their number.
     pub bytes: u64,
     pub count: usize,
@@ -204,11 +213,31 @@ pub(super) struct Scanned {
     pub next: Option<usize>,
 }
 
+impl Default for Scanned {
+    fn default() -> Self {
+        Self {
+            rows: Arc::default(),
+            items: 0..0,
+            bytes: 0,
+            count: 0,
+            errors: Vec::new(),
+            unreadable: None,
+            next: None,
+        }
+    }
+}
+
 impl Scanned {
+    /// The items of this scan.
+    pub fn items(&self) -> &[Item] {
+        &self.rows.items[self.items.clone()]
+    }
+
+
     /// Returns `true` if the directory was read and every item is a row, so
     /// that the walk has nothing to count or report for it.
     pub fn is_clean(&self) -> bool {
-        self.unreadable.is_none() && self.count == self.rows.items.len()
+        self.unreadable.is_none() && self.count == self.items.len()
     }
 }
 
@@ -300,7 +329,42 @@ struct Offered<'l> {
     stat: Option<reader::Stat>,
 }
 
+/// What one scan added to a [`Finding`] that takes several.
+pub(super) struct Added {
+    /// The scan's items, by their places in the rows.
+    pub items: std::ops::Range<usize>,
+    pub bytes: u64,
+    pub count: usize,
+    /// Whether the scan read its directory to the end and found nothing but
+    /// rows.
+    pub plain: bool,
+}
+
 impl Finding {
+    /// The items found so far, and the text their spans name.
+    pub fn items(&self) -> &[Item] {
+        &self.scanned.items
+    }
+
+    pub fn text(&self) -> &str {
+        &self.scanned.text
+    }
+
+    /// Ends a finding that took several scans. Returns their rows, and what
+    /// the last scan could not read: only the last can have that, since the
+    /// caller stops at a scan that is not plain.
+    pub fn into_rows(self) -> (Arc<Rows>, Vec<Option<io::Error>>, Option<io::Error>, Option<usize>) {
+        let Reading {
+            text,
+            items,
+            errors,
+            unreadable,
+            next,
+            ..
+        } = self.scanned;
+        (Arc::new(Rows { text, items }), errors, unreadable, next)
+    }
+
     fn finish(self) -> Found {
         let Reading {
             text,
@@ -313,6 +377,7 @@ impl Finding {
         } = self.scanned;
         Found {
             scanned: Scanned {
+                items: 0..items.len(),
                 rows: Arc::new(Rows { text, items }),
                 bytes,
                 count,
@@ -380,17 +445,53 @@ impl Scanner<'_> {
         scratch: &mut Scratch,
         release: &mut dyn FnMut() -> bool,
     ) -> Found {
-        let mut found = Finding {
-            scanned: Reading::default(),
-            directories: Vec::new(),
-            rest: Vec::new(),
-        };
+        let mut found = Finding::default();
+        self.fill(job, scratch, release, &mut found);
+        found.finish()
+    }
+
+    /// Makes the scan of `job` and adds what it finds to `found`, which may
+    /// hold other scans already. The jobs of the subdirectories are added to
+    /// [`Finding::directories`].
+    pub fn scan_into(
+        &self,
+        job: Job,
+        scratch: &mut Scratch,
+        release: &mut dyn FnMut() -> bool,
+        found: &mut Finding,
+    ) -> Added {
+        let (items, bytes, count) = (
+            found.scanned.items.len(),
+            found.scanned.bytes,
+            found.scanned.count,
+        );
+        self.fill(job, scratch, release, found);
+        let scanned = &found.scanned;
+        let added = items..scanned.items.len();
+        Added {
+            plain: found.rest.is_empty()
+                && scanned.unreadable.is_none()
+                && scanned.next.is_none()
+                && scanned.count - count == added.len(),
+            items: added,
+            bytes: scanned.bytes - bytes,
+            count: scanned.count - count,
+        }
+    }
+
+    fn fill(
+        &self,
+        job: Job,
+        scratch: &mut Scratch,
+        release: &mut dyn FnMut() -> bool,
+        found: &mut Finding,
+    ) {
         let (path, opened, refused) = match job.work {
             Work::Rest { listed, start } => {
                 let entries = listed.listing.entries.len() - start;
                 found.scanned.items.reserve(entries.min(CHUNK));
-                self.entries(&listed, start, &mut found);
-                return found.finish();
+                self.entries(&listed, start, found);
+                return;
             }
             Work::Directory {
                 path,
@@ -400,7 +501,7 @@ impl Scanner<'_> {
         };
         if let Some(error) = refused {
             found.scanned.unreadable = Some(error);
-            return found.finish();
+            return;
         }
         let directory = match opened {
             Some(directory) => {
@@ -416,7 +517,7 @@ impl Scanner<'_> {
             Ok(listed) => listed,
             Err(error) => {
                 found.scanned.unreadable = Some(error);
-                return found.finish();
+                return;
             }
         };
 
@@ -424,7 +525,7 @@ impl Scanner<'_> {
             let name = name.and_then(|name| found.scanned.span(&name).ok());
             found.scanned.failed(name, what, error);
             if self.on_error == OnError::Fail {
-                return found.finish();
+                return;
             }
         }
         let listed = ListedDirectory {
@@ -439,10 +540,10 @@ impl Scanner<'_> {
         found.scanned.items.reserve(entries.min(CHUNK));
         if entries <= CHUNK {
             found.scanned.text.reserve(listed.listing.names().len());
-            self.entries(&listed, 0, &mut found);
+            self.entries(&listed, 0, found);
             // The listing's buffers serve the next directory.
             scratch.spare = listed.listing.into_spare();
-            return found.finish();
+            return;
         }
         let listed = Arc::new(listed);
         for start in (CHUNK..listed.listing.entries.len()).step_by(CHUNK) {
@@ -454,8 +555,7 @@ impl Scanner<'_> {
                 },
             });
         }
-        self.entries(&listed, 0, &mut found);
-        found.finish()
+        self.entries(&listed, 0, found);
     }
 
     // Reads up to `CHUNK` entries of `listed`, from `start`.

@@ -157,14 +157,15 @@ fn unfold(
     subtree: &Subtree,
 ) -> Result<(), Report<TreePartFull>> {
     // The directories being read: the scan, the next item in it, the depth.
-    let mut open = vec![(0, 0, subtree.depth)];
+    let first = subtree.scans.first().map_or(0, |scanned| scanned.items.start);
+    let mut open = vec![(0, first, subtree.depth)];
     let mut unread = 1;
     while let Some((scan, next, depth)) = open.last_mut() {
         let scanned = &subtree.scans[*scan];
-        let Some(item) = scanned.rows.items.get(*next) else {
+        let Some(item) = scanned.items.contains(next).then(|| &scanned.rows.items[*next]) else {
             // The rest of a large directory is a scan of its own.
             if scanned.next.is_some() {
-                (*scan, *next) = (unread, 0);
+                (*scan, *next) = (unread, subtree.scans[unread].items.start);
                 unread += 1;
             } else {
                 open.pop();
@@ -174,7 +175,7 @@ fn unfold(
         *next += 1;
         let depth = *depth;
         if push(part, nodes, &scanned.rows, item, depth)? {
-            open.push((unread, 0, depth + 1));
+            open.push((unread, subtree.scans[unread].items.start, depth + 1));
             unread += 1;
         }
     }

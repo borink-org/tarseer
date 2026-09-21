@@ -34,7 +34,7 @@ use error_stack::{Report, ResultExt as _};
 
 use super::assemble::{Piece, Plan, Segment, Subtree};
 use super::reader::Scratch;
-use super::scan::{CHUNK, Item, Job, Rows, Scanned, Scanner, key_below};
+use super::scan::{Added, CHUNK, Finding, Item, Job, Rows, Scanned, Scanner, key_below, text_of};
 use super::{Cancelled, OnError, PartOrder, SkipReason, Skips, WalkError, WalkOptions, estimate};
 use crate::manifest::{EntryKind, TreePart};
 
@@ -155,16 +155,20 @@ struct Cut {
 // follow it there.
 struct Frame {
     scan: usize,
-    // The jobs of the subdirectories not entered yet, and of the rest of a
-    // directory that one scan did not read.
-    jobs: std::vec::IntoIter<Job>,
+    // The jobs of the subdirectories not entered yet, as a range of the jobs
+    // that `deep` keeps, and where the directory's jobs start there. Then the
+    // jobs of the rest of a directory that one scan did not read.
+    jobs: std::ops::Range<usize>,
+    first_job: usize,
     rest: Vec<Job>,
-    // The first item that has not been looked at.
+    // The first item that has not been looked at, and the end of the items.
     next: usize,
-    // Where the directory's row is in its parent, and that row: a scan of
-    // the parent, and the item in it.
+    end: usize,
+    // Where the directory's row is in its parent, and that row: the item. The
+    // outermost directory's row is in `deep`'s `from`, and the others' are
+    // in the rows being read.
     place: Place,
-    from: (Arc<Rows>, usize),
+    from: usize,
     // Whether `Engine::report` has had the scan.
     reported: bool,
     // The rows read below the directory's own row.
@@ -611,7 +615,7 @@ impl<'a> Engine<'a> {
                         job,
                         &parent,
                         place,
-                        from,
+                        &from,
                         &mut read,
                         scratch,
                         &mut release,
@@ -632,7 +636,7 @@ impl<'a> Engine<'a> {
                         }
                         released || self.release()
                     });
-                    read += found.scanned.rows.items.len();
+                    read += found.scanned.items.len();
                     self.report(&node.path, &found.scanned);
 
                     let rows = Arc::clone(&found.scanned.rows);
@@ -647,15 +651,13 @@ impl<'a> Engine<'a> {
                     // The node hears of its subdirectories before any of them
                     // can answer.
                     let jobs = found.directories;
+                    let found_items = found.scanned.items.clone();
                     self.arrived(&node, start, found.scanned, jobs.len(), true);
 
                     // The nth directory among the items belongs to the nth job.
-                    let places = rows
-                        .items
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, item)| matches!(item, Item::Directory { .. }));
-                    children.extend(jobs.into_iter().zip(places).map(|(job, (index, _))| Task {
+                    let places = found_items
+                        .filter(|&index| matches!(rows.items[index], Item::Directory { .. }));
+                    children.extend(jobs.into_iter().zip(places).map(|(job, index)| Task {
                         job,
                         at: At::Below {
                             parent: Arc::clone(&node),
@@ -725,15 +727,19 @@ impl<'a> Engine<'a> {
         if scanned.is_clean() && self.options.progress.is_none() {
             return;
         }
-        let rows = &scanned.rows;
-        for item in &rows.items {
+        self.report_items(path, &scanned.rows.text, scanned.items());
+    }
+
+    // The part of `report` that is about the items, whose spans name `text`.
+    fn report_items(&self, path: &str, text: &str, items: &[Item]) {
+        for item in items {
             match *item {
                 Item::Skipped { name, reason } => {
-                    self.skip(&joined(path, rows.text(name)), reason);
+                    self.skip(&joined(path, text_of(text, name)), reason);
                 }
                 Item::Failed { name, .. } if self.options.on_error == OnError::Skip => {
                     let path = match name {
-                        Some(name) => joined(path, rows.text(name)),
+                        Some(name) => joined(path, text_of(text, name)),
                         None => path.to_owned(),
                     };
                     self.skip(&path, SkipReason::Failed);
@@ -836,8 +842,8 @@ impl<'a> Engine<'a> {
             return None;
         }
         let rows = Arc::clone(&scanned.rows);
-        rows.items.iter().enumerate().find_map(|(index, item)| {
-            let Item::Failed { name, what, error } = *item else {
+        scanned.items.clone().find_map(|index| {
+            let Item::Failed { name, what, error } = rows.items[index] else {
                 return None;
             };
             let error = scanned.errors[error as usize].take()?;
@@ -916,21 +922,27 @@ impl<'a> Engine<'a> {
         job: Job,
         parent: &Arc<Node>,
         place: Place,
-        from: (Arc<Rows>, usize),
+        from: &(Arc<Rows>, usize),
         read: &mut usize,
         scratch: &mut Scratch,
         release: &mut dyn FnMut() -> bool,
         out: &mut Vec<Task>,
     ) {
         let mut frames: Vec<Frame> = Vec::new();
-        // Every scan made here, in the order the walk enters the directories.
-        // A subtree read to its end is a range of it, so nothing is moved when
-        // a directory is done.
-        let mut scans: Vec<Scanned> = Vec::new();
+        // Every scan made here shares one set of rows, so a directory costs
+        // no allocation of its own. `scans` has the items of each, in the
+        // order the walk enters the directories. A subtree read to its end is
+        // a range of it, so nothing is moved when a directory is done.
+        let mut found = Finding::default();
+        let mut scans: Vec<Added> = Vec::new();
+        // The jobs of the subdirectories found and not entered, those of the
+        // innermost directory last. A directory that is done takes its own
+        // along.
+        let mut jobs: Vec<Option<Job>> = Vec::new();
         // The estimate of the subtree with the row of its root.
         let mut total = row_estimate(&from.0, &from.0.items[from.1]);
-        let mut enter = Some((job, place, from));
-        while let Some((job, place, from)) = enter.take() {
+        let mut enter = Some((job, place, from.1));
+        while let Some((job, place, row)) = enter.take() {
             // With a receiver of progress the path is needed at once.
             let path = self
                 .options
@@ -939,62 +951,71 @@ impl<'a> Engine<'a> {
             if let (Some(progress), Some(path)) = (self.options.progress, &path) {
                 progress.entered(path);
             }
-            let found = self.scanner.scan(job, scratch, &mut || {
-                let mut released = false;
-                for frame in &mut frames {
-                    for waiting in frame.jobs.as_mut_slice() {
+            let added = self.scanner.scan_into(
+                job,
+                scratch,
+                &mut || {
+                    let mut released = false;
+                    for waiting in jobs.iter_mut().flatten() {
                         released |= waiting.release(&self.scanner.held);
                     }
-                }
-                released || release() || self.release()
-            });
-            *read += found.scanned.rows.items.len();
-            self.held.fetch_add(found.scanned.count, Ordering::Relaxed);
-            total += found.scanned.bytes;
+                    released || release() || self.release()
+                },
+                &mut found,
+            );
+            *read += added.items.len();
+            self.held.fetch_add(added.count, Ordering::Relaxed);
+            total += added.bytes;
             // A scan with anything but rows goes the ordinary way, which
             // knows what to do with a failure.
-            let plain = found.rest.is_empty() && found.scanned.is_clean();
-            if let Some(path) = &path {
-                self.report(path, &found.scanned);
+            let plain = added.plain;
+            if let Some(path) = path.as_ref().filter(|_| plain) {
+                self.report_items(path, found.text(), &found.items()[added.items.clone()]);
             }
+            let first = jobs.len();
+            jobs.extend(found.directories.drain(..).map(Some));
             frames.push(Frame {
-                bytes: found.scanned.bytes,
-                count: found.scanned.count,
+                bytes: added.bytes,
+                count: added.count,
                 scan: scans.len(),
-                jobs: found.directories.into_iter(),
-                rest: found.rest,
-                next: 0,
+                jobs: first..jobs.len(),
+                first_job: first,
+                rest: std::mem::take(&mut found.rest),
+                next: added.items.start,
+                end: added.items.end,
                 place,
-                from,
-                reported: path.is_some(),
+                from: row,
+                reported: path.is_some() && plain,
                 done: Vec::new(),
             });
-            scans.push(found.scanned);
+            scans.push(added);
             if !plain || total > self.options.budget {
-                return self.hand_back(frames, scans, parent, out);
+                return self.hand_back(frames, found, scans, jobs, parent, from, out);
             }
 
             // Up through the directories that are read to their end, to the
             // next subdirectory to enter.
             while let Some(top) = frames.last_mut() {
-                let rows = &scans[top.scan].rows;
-                let next = (top.next..rows.items.len())
-                    .find(|&index| matches!(rows.items[index], Item::Directory { .. }));
+                let items = found.items();
+                let next = (top.next..top.end)
+                    .find(|&index| matches!(items[index], Item::Directory { .. }));
                 if let Some(index) = next {
                     if !self.alone() {
-                        return self.hand_back(frames, scans, parent, out);
+                        return self.hand_back(frames, found, scans, jobs, parent, from, out);
                     }
                     top.next = index + 1;
-                    let job = top.jobs.next().expect("a job for every directory");
-                    enter = Some((job, (0, index), (Arc::clone(rows), index)));
+                    let job = jobs[top.jobs.start].take().expect("a job for every directory");
+                    top.jobs.start += 1;
+                    enter = Some((job, (0, index), index));
                     break;
                 }
                 let frame = frames.pop().expect("checked above");
+                jobs.truncate(frame.first_job);
                 let Some(above) = frames.last_mut() else {
                     let whole = Child::Whole {
                         bytes: frame.bytes,
                         count: frame.count,
-                        scans,
+                        scans: shared(found, scans),
                     };
                     return self.decided(Arc::clone(parent), frame.place, whole);
                 };
@@ -1012,13 +1033,19 @@ impl<'a> Engine<'a> {
 
     // Makes nodes of the directories `deep` was inside of, the outermost
     // first, and gives each what was read of it.
+    #[allow(clippy::too_many_arguments)]
     fn hand_back(
         &self,
         frames: Vec<Frame>,
-        mut scans: Vec<Scanned>,
+        found: Finding,
+        scans: Vec<Added>,
+        mut jobs: Vec<Option<Job>>,
         parent: &Arc<Node>,
+        from: &(Arc<Rows>, usize),
         out: &mut Vec<Task>,
     ) {
+        let mut scans = shared(found, scans);
+        let rows = Arc::clone(&scans[0].rows);
         // Each directory's scan, and the subtrees below it that are whole. The
         // list is taken apart from its end, so the innermost comes first.
         let mut taken: Vec<(Scanned, Vec<(Place, Child)>)> = Vec::new();
@@ -1039,15 +1066,17 @@ impl<'a> Engine<'a> {
         let mut above = Arc::clone(parent);
         // The scans not made, of each directory, innermost last.
         let mut left: Vec<Vec<Task>> = Vec::new();
-        for frame in frames {
+        for (depth, frame) in frames.into_iter().enumerate() {
             let (scanned, done) = taken.pop().expect("one for every directory");
-            let node = node_below(&above, frame.place, &frame.from.0, frame.from.1);
+            let node = match depth {
+                0 => node_below(&above, frame.place, &from.0, from.1),
+                _ => node_below(&above, frame.place, &rows, frame.from),
+            };
             if !frame.reported {
                 self.report(&node.path, &scanned);
             }
-            let rows = Arc::clone(&scanned.rows);
-            let directories = rows
-                .items
+            let directories = scanned
+                .items()
                 .iter()
                 .filter(|item| matches!(item, Item::Directory { .. }))
                 .count();
@@ -1055,13 +1084,14 @@ impl<'a> Engine<'a> {
             for (place, whole) in done {
                 self.decided(Arc::clone(&node), place, whole);
             }
-            let places = (frame.next..rows.items.len())
+            let places = (frame.next..frame.end)
                 .filter(|&index| matches!(rows.items[index], Item::Directory { .. }));
             let mut tasks: Vec<Task> = frame
                 .jobs
+                .clone()
                 .zip(places)
                 .map(|(job, index)| Task {
-                    job,
+                    job: jobs[job].take().expect("a job that was not entered"),
                     at: At::Below {
                         parent: Arc::clone(&node),
                         place: (0, index),
@@ -1126,9 +1156,10 @@ impl<'a> Engine<'a> {
         let mut scans = Vec::new();
         for (start, scanned) in std::mem::take(&mut state.scans) {
             let rows = Arc::clone(&scanned.rows);
+            let items = scanned.items.clone();
             scans.push(scanned);
-            for (index, item) in rows.items.iter().enumerate() {
-                if !matches!(item, Item::Directory { .. }) {
+            for index in items {
+                if !matches!(rows.items[index], Item::Directory { .. }) {
                     continue;
                 }
                 match state.children.remove(&(start, index)) {
@@ -1201,7 +1232,9 @@ impl<'a> Engine<'a> {
                 .filter(|(place, _)| place.0 == cut.start)
                 .map(|(place, _)| place.1);
 
-            while cut.item < rows.items.len() {
+            let last = scanned.items.end;
+            cut.item = cut.item.max(scanned.items.start);
+            while cut.item < last {
                 let index = cut.item;
                 if fails_at == Some(index) {
                     let (_, report) = state.failure.take().expect("checked above");
@@ -1412,6 +1445,28 @@ fn node_below(parent: &Arc<Node>, place: Place, rows: &Rows, index: usize) -> Ar
         row_bytes: row_estimate(rows, item),
         state: Mutex::default(),
     })
+}
+
+// The scans that `Engine::deep` made, which share their rows. What a scan
+// could not read is the last one's, since `deep` stops there.
+fn shared(found: Finding, scans: Vec<Added>) -> Vec<Scanned> {
+    let (rows, errors, unreadable, next) = found.into_rows();
+    let mut scans: Vec<Scanned> = scans
+        .into_iter()
+        .map(|added| Scanned {
+            rows: Arc::clone(&rows),
+            items: added.items,
+            bytes: added.bytes,
+            count: added.count,
+            errors: Vec::new(),
+            unreadable: None,
+            next: None,
+        })
+        .collect();
+    if let Some(last) = scans.last_mut() {
+        (last.errors, last.unreadable, last.next) = (errors, unreadable, next);
+    }
+    scans
 }
 
 fn joined(directory: &str, name: &str) -> String {
