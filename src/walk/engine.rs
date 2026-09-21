@@ -169,6 +169,8 @@ struct Frame {
     // in the rows being read.
     place: Place,
     from: usize,
+    // How long the directory's path is, in the path that `deep` keeps.
+    path: usize,
     // Whether `Engine::report` has had the scan.
     reported: bool,
     // The rows read below the directory's own row.
@@ -355,7 +357,7 @@ impl<'a> Engine<'a> {
             job: Job::root(),
             at: At::Node(Arc::clone(&root)),
         };
-        self.lock().waiting.insert(first.job.key.clone(), first);
+        self.lock().waiting.insert(first.key(), first);
         self.work.notify_one();
 
         match self.options.order {
@@ -624,12 +626,13 @@ impl<'a> Engine<'a> {
                 }
                 At::Node(node) => {
                     let start = job.start();
-                    if let (Some(progress), Some(path)) = (self.options.progress, job.path()) {
-                        progress.entered(path);
+                    // The scans of the rest of a directory enter nothing new.
+                    if let Some(progress) = self.options.progress.filter(|_| start == 0) {
+                        progress.entered(&node.path);
                     }
                     // With no handle left, this worker first closes the
                     // directories that its own jobs hold.
-                    let found = self.scanner.scan(job, scratch, &mut || {
+                    let found = self.scanner.scan(job, &node.path, scratch, &mut || {
                         let mut released = false;
                         for waiting in mine.iter_mut().chain(others.iter_mut()) {
                             released |= waiting.job.release(&self.scanner.held);
@@ -691,11 +694,11 @@ impl<'a> Engine<'a> {
         }
         others.extend(mine);
 
+        // The keys are made before the lock is taken.
+        let others = keyed(others);
         let mut state = self.lock();
         let added = others.len();
-        for task in others {
-            state.waiting.insert(task.job.key.clone(), task);
-        }
+        state.waiting.extend(others);
         state.scanning -= 1;
         // This worker takes one of the new jobs itself. At the limit the
         // others wait for the last scan to end, which this may have been.
@@ -709,11 +712,10 @@ impl<'a> Engine<'a> {
 
     // Puts `tasks` in the queue for the other workers.
     fn give(&self, tasks: Vec<Task>) {
+        let tasks = keyed(tasks);
         self.enqueue(|state| {
             let added = tasks.len();
-            for task in tasks {
-                state.waiting.insert(task.job.key.clone(), task);
-            }
+            state.waiting.extend(tasks);
             added
         });
     }
@@ -941,18 +943,18 @@ impl<'a> Engine<'a> {
         let mut jobs: Vec<Option<Job>> = Vec::new();
         // The estimate of the subtree with the row of its root.
         let mut total = row_estimate(&from.0, &from.0.items[from.1]);
+        // The path of the directory being read: one buffer for the whole
+        // subtree, which grows and shrinks with the depth.
+        let mut path = job_path(&parent.path, &from.0, &from.0.items[from.1]);
         let mut enter = Some((job, place, from.1));
         while let Some((job, place, row)) = enter.take() {
-            // With a receiver of progress the path is needed at once.
-            let path = self
-                .options
-                .progress
-                .and_then(|_| job.path().map(str::to_owned));
-            if let (Some(progress), Some(path)) = (self.options.progress, &path) {
-                progress.entered(path);
+            if let Some(progress) = self.options.progress {
+                progress.entered(&path);
             }
+            let reports = self.options.progress.is_some();
             let added = self.scanner.scan_into(
                 job,
+                &path,
                 scratch,
                 &mut || {
                     let mut released = false;
@@ -969,8 +971,8 @@ impl<'a> Engine<'a> {
             // A scan with anything but rows goes the ordinary way, which
             // knows what to do with a failure.
             let plain = added.plain;
-            if let Some(path) = path.as_ref().filter(|_| plain) {
-                self.report_items(path, found.text(), &found.items()[added.items.clone()]);
+            if reports && plain {
+                self.report_items(&path, found.text(), &found.items()[added.items.clone()]);
             }
             let first = jobs.len();
             jobs.extend(found.directories.drain(..).map(Some));
@@ -985,7 +987,8 @@ impl<'a> Engine<'a> {
                 end: added.items.end,
                 place,
                 from: row,
-                reported: path.is_some() && plain,
+                path: path.len(),
+                reported: reports && plain,
                 done: Vec::new(),
             });
             scans.push(added);
@@ -1006,6 +1009,12 @@ impl<'a> Engine<'a> {
                     top.next = index + 1;
                     let job = jobs[top.jobs.start].take().expect("a job for every directory");
                     top.jobs.start += 1;
+                    let Item::Directory { name, .. } = items[index] else {
+                        unreachable!("found as a directory above");
+                    };
+                    path.truncate(top.path);
+                    path.push('/');
+                    path.push_str(text_of(found.text(), name));
                     enter = Some((job, (0, index), index));
                     break;
                 }
@@ -1418,6 +1427,29 @@ impl<'a> Engine<'a> {
         }
         true
     }
+}
+
+impl Task {
+    // The key of the task's scan, which the queue is ordered by. It is made
+    // when a task is shared, and not for every directory. See `key_below`.
+    fn key(&self) -> Box<[u32]> {
+        match &self.at {
+            At::Node(node) => match self.job.start() {
+                0 => node.key.clone(),
+                start => key_below(&node.key, start, false),
+            },
+            At::Below { parent, from, .. } => {
+                let Item::Directory { place, .. } = from.0.items[from.1] else {
+                    unreachable!("a task below a node is a directory");
+                };
+                key_below(&parent.key, place, true)
+            }
+        }
+    }
+}
+
+fn keyed(tasks: Vec<Task>) -> Vec<(Box<[u32]>, Task)> {
+    tasks.into_iter().map(|task| (task.key(), task)).collect()
 }
 
 impl Node {

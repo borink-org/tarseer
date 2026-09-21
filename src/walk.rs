@@ -596,7 +596,7 @@ impl<'o, 's> Walker<'o, 's> {
         let stack = &mut self.stack;
         // With no handle left, close the directories that the jobs of the open
         // levels hold.
-        scanner.scan(job, &mut self.scratch, &mut || {
+        scanner.scan(job, &self.path, &mut self.scratch, &mut || {
             let mut released = false;
             for waiting in stack.iter_mut().flat_map(|level| level.jobs.as_mut_slice()) {
                 released |= waiting.release(&scanner.held);

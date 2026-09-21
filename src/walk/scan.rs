@@ -21,24 +21,20 @@ const MAX_HELD: usize = 128;
 pub(super) const CHUNK: usize = 1024;
 
 /// A scan waiting to be made.
+///
+/// A job holds neither the path of its directory nor its place in the walk.
+/// Whoever makes the scan knows both, and a walk would otherwise allocate
+/// twice for every directory it finds.
 pub(super) struct Job {
-    /// Where the scan's first entry is in the tree. From the root down, each
-    /// level adds one number: twice the entry's place in its listing, plus
-    /// one for a subdirectory. Keys compare in the order the walk needs the
-    /// scans, and a comparison reads a few integers where one of paths would
-    /// read every byte.
-    pub key: Box<[u32]>,
     pub work: Work,
 }
 
 pub(super) enum Work {
     /// Open and list a directory, and read its first [`CHUNK`] entries.
     Directory {
-        /// The path relative to the root. Empty for the root.
-        path: String,
         /// The directory, if the scan of its parent could open it and the
         /// limit on held directories allowed. Otherwise this scan opens it by
-        /// its path.
+        /// the path it is given.
         opened: Option<Directory>,
         /// Why the directory could not be opened, if its parent's scan found
         /// out.
@@ -56,9 +52,7 @@ impl Job {
     /// The job of the root.
     pub fn root() -> Self {
         Self {
-            key: Box::default(),
             work: Work::Directory {
-                path: String::new(),
                 opened: None,
                 refused: None,
             },
@@ -73,13 +67,6 @@ impl Job {
         }
     }
 
-    /// The path of the directory, for a scan that opens one.
-    pub fn path(&self) -> Option<&str> {
-        match &self.work {
-            Work::Directory { path, .. } => Some(path),
-            Work::Rest { .. } => None,
-        }
-    }
 
     /// Closes the directory this job holds for its scan, if it holds one that
     /// the scan can open again. Returns `true` if it did.
@@ -99,10 +86,27 @@ impl Job {
 
 /// A directory with more than [`CHUNK`] entries, shared by its scans.
 pub(super) struct ListedDirectory {
-    key: Box<[u32]>,
     path: String,
     directory: Directory,
     listing: reader::Listing,
+}
+
+// A directory that is being read: its path relative to the root, which is
+// empty for the root, and its listing.
+struct Within<'a> {
+    path: &'a str,
+    directory: &'a Directory,
+    listing: &'a reader::Listing,
+}
+
+impl ListedDirectory {
+    fn within(&self) -> Within<'_> {
+        Within {
+            path: &self.path,
+            directory: &self.directory,
+            listing: &self.listing,
+        }
+    }
 }
 
 /// What one scan returns.
@@ -434,7 +438,8 @@ pub(super) struct Scanner<'a> {
 }
 
 impl Scanner<'_> {
-    /// Makes the scan of `job`.
+    /// Makes the scan of `job`, whose directory is at `path`, relative to the
+    /// root.
     ///
     /// `release` is called when the process has no handle left to open the
     /// directory with. It closes directories that waiting jobs hold and
@@ -442,11 +447,12 @@ impl Scanner<'_> {
     pub fn scan(
         &self,
         job: Job,
+        path: &str,
         scratch: &mut Scratch,
         release: &mut dyn FnMut() -> bool,
     ) -> Found {
         let mut found = Finding::default();
-        self.fill(job, scratch, release, &mut found);
+        self.fill(job, path, scratch, release, &mut found);
         found.finish()
     }
 
@@ -456,6 +462,7 @@ impl Scanner<'_> {
     pub fn scan_into(
         &self,
         job: Job,
+        path: &str,
         scratch: &mut Scratch,
         release: &mut dyn FnMut() -> bool,
         found: &mut Finding,
@@ -465,7 +472,7 @@ impl Scanner<'_> {
             found.scanned.bytes,
             found.scanned.count,
         );
-        self.fill(job, scratch, release, found);
+        self.fill(job, path, scratch, release, found);
         let scanned = &found.scanned;
         let added = items..scanned.items.len();
         Added {
@@ -482,22 +489,19 @@ impl Scanner<'_> {
     fn fill(
         &self,
         job: Job,
+        path: &str,
         scratch: &mut Scratch,
         release: &mut dyn FnMut() -> bool,
         found: &mut Finding,
     ) {
-        let (path, opened, refused) = match job.work {
+        let (opened, refused) = match job.work {
             Work::Rest { listed, start } => {
                 let entries = listed.listing.entries.len() - start;
                 found.scanned.items.reserve(entries.min(CHUNK));
-                self.entries(&listed, start, found);
+                self.entries(&listed.within(), start, found);
                 return;
             }
-            Work::Directory {
-                path,
-                opened,
-                refused,
-            } => (path, opened, refused),
+            Work::Directory { opened, refused } => (opened, refused),
         };
         if let Some(error) = refused {
             found.scanned.unreadable = Some(error);
@@ -510,7 +514,7 @@ impl Scanner<'_> {
                 }
                 Ok(directory)
             }
-            None => self.open(&path, release),
+            None => self.open(path, release),
         };
         let listing = directory.and_then(|directory| Ok((directory.list(scratch)?, directory)));
         let (mut listing, directory) = match listing {
@@ -528,38 +532,41 @@ impl Scanner<'_> {
                 return;
             }
         }
-        let listed = ListedDirectory {
-            key: job.key,
-            path,
-            directory,
-            listing,
-        };
         // One allocation for the names and one for the items, where growing
         // them entry by entry would take several. A link's target comes on top.
-        let entries = listed.listing.entries.len();
+        let entries = listing.entries.len();
         found.scanned.items.reserve(entries.min(CHUNK));
         if entries <= CHUNK {
-            found.scanned.text.reserve(listed.listing.names().len());
-            self.entries(&listed, 0, found);
+            found.scanned.text.reserve(listing.names().len());
+            let within = Within {
+                path,
+                directory: &directory,
+                listing: &listing,
+            };
+            self.entries(&within, 0, found);
             // The listing's buffers serve the next directory.
-            scratch.spare = listed.listing.into_spare();
+            scratch.spare = listing.into_spare();
             return;
         }
-        let listed = Arc::new(listed);
+        // The scans of the rest need the path too, and outlive this call.
+        let listed = Arc::new(ListedDirectory {
+            path: path.to_owned(),
+            directory,
+            listing,
+        });
         for start in (CHUNK..listed.listing.entries.len()).step_by(CHUNK) {
             found.rest.push(Job {
-                key: key_below(&listed.key, start, false),
                 work: Work::Rest {
                     listed: Arc::clone(&listed),
                     start,
                 },
             });
         }
-        self.entries(&listed, 0, found);
+        self.entries(&listed.within(), 0, found);
     }
 
     // Reads up to `CHUNK` entries of `listed`, from `start`.
-    fn entries(&self, listed: &ListedDirectory, start: usize, found: &mut Finding) {
+    fn entries(&self, listed: &Within<'_>, start: usize, found: &mut Finding) {
         let end = listed.listing.entries.len().min(start + CHUNK);
         if end < listed.listing.entries.len() {
             found.scanned.next = Some(end);
@@ -598,17 +605,15 @@ impl Scanner<'_> {
     // `None` if the entry is dealt with: skipped, failed or refused.
     fn offered<'l>(
         &self,
-        within: &'l ListedDirectory,
+        within: &Within<'l>,
         listed: &Listed,
         scanned: &mut Reading,
     ) -> io::Result<Option<Offered<'l>>> {
-        let ListedDirectory {
+        let Within {
             path: parent,
             directory,
             listing,
-            ..
-        } = within;
-        let parent = parent.as_str();
+        } = *within;
         let raw = listed.name(listing.names());
         let name = match listing.name_text(listed) {
             Some(name) if listed.kind != Kind::NonUtf8 => name,
@@ -712,17 +717,13 @@ impl Scanner<'_> {
 
     // Reads one entry into `scanned`. The error it returns is one that leaves
     // the scan unable to say which entry failed.
-    fn entry(&self, within: &ListedDirectory, place: usize, found: &mut Finding) -> io::Result<()> {
-        let ListedDirectory {
-            key,
-            path: parent,
-            directory,
-            listing,
-        } = within;
+    fn entry(&self, within: &Within<'_>, place: usize, found: &mut Finding) -> io::Result<()> {
+        let Within {
+            directory, listing, ..
+        } = *within;
         let listed: &Listed = &listing.entries[place];
         let scanned = &mut found.scanned;
         let jobs = &mut found.directories;
-        let parent = parent.as_str();
         let Some(Offered {
             name,
             kind,
@@ -763,19 +764,8 @@ impl Scanner<'_> {
                 scanned.symlink(name_span, target, stat.mtime, is_directory)?;
             }
             Kind::Directory => {
-                let mut path = String::with_capacity(parent.len() + 1 + name.len());
-                if !parent.is_empty() {
-                    path.push_str(parent);
-                    path.push('/');
-                }
-                path.push_str(name);
                 jobs.push(Job {
-                    key: key_below(key, place, true),
-                    work: Work::Directory {
-                        path,
-                        opened,
-                        refused,
-                    },
+                    work: Work::Directory { opened, refused },
                 });
                 scanned.row(EntryKind::Directory, name, "");
                 scanned.items.push(Item::Directory {
@@ -846,7 +836,7 @@ mod tests {
             held: Held::new(),
         };
         let mut asked = 0;
-        let found = scanner.scan(Job::root(), &mut Scratch::default(), &mut || {
+        let found = scanner.scan(Job::root(), "", &mut Scratch::default(), &mut || {
             asked += 1;
             taken.pop().is_some()
         });
