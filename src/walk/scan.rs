@@ -361,8 +361,8 @@ impl Finding {
     }
 
     /// Ends a finding that took several scans. Returns their rows, and what
-    /// the last scan could not read: only the last can have that, since the
-    /// caller stops at a scan that is not plain.
+    /// the last scan could not read. Only the last can have that: the caller
+    /// stops at a scan that is not plain.
     pub fn into_rows(self) -> (Arc<Rows>, Vec<Option<io::Error>>, Option<io::Error>, Option<usize>) {
         let Reading {
             text,
