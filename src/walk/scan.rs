@@ -97,6 +97,10 @@ struct Within<'a> {
     path: &'a str,
     directory: &'a Directory,
     listing: &'a reader::Listing,
+    // Where the listing's names are in the text of the rows, if the scan
+    // copied them there all at once. A name's span is then known without a
+    // copy of its own.
+    names_at: Option<u32>,
 }
 
 impl ListedDirectory {
@@ -105,6 +109,8 @@ impl ListedDirectory {
             path: &self.path,
             directory: &self.directory,
             listing: &self.listing,
+            // A scan of a part of a large directory copies only its names.
+            names_at: None,
         }
     }
 }
@@ -537,11 +543,21 @@ impl Scanner<'_> {
         let entries = listing.entries.len();
         found.scanned.items.reserve(entries.min(CHUNK));
         if entries <= CHUNK {
-            found.scanned.text.reserve(listing.names().len());
+            // One copy for all the names, where there was one for each.
+            let names_at = listing.text().and_then(|text| {
+                let at = u32::try_from(found.scanned.text.len()).ok()?;
+                at.checked_add(u32::try_from(text.len()).ok()?)?;
+                found.scanned.text.push_str(text);
+                Some(at)
+            });
+            if names_at.is_none() {
+                found.scanned.text.reserve(listing.names().len());
+            }
             let within = Within {
                 path,
                 directory: &directory,
                 listing: &listing,
+                names_at,
             };
             self.entries(&within, 0, found);
             // The listing's buffers serve the next directory.
@@ -613,6 +629,7 @@ impl Scanner<'_> {
             path: parent,
             directory,
             listing,
+            ..
         } = *within;
         let raw = listed.name(listing.names());
         let name = match listing.name_text(listed) {
@@ -733,7 +750,16 @@ impl Scanner<'_> {
         else {
             return Ok(());
         };
-        let name_span = scanned.span(name)?;
+        let name_span = match within.names_at {
+            Some(at) => {
+                let (start, len) = listed.span();
+                Span {
+                    start: at + start,
+                    len,
+                }
+            }
+            None => scanned.span(name)?,
+        };
 
         let (opened, refused) = if kind == EntryKind::Directory {
             self.open_ahead(directory, listed, listing)

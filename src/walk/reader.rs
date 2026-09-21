@@ -4,7 +4,6 @@
 // A listing keeps every name in one buffer and one small record per entry, so
 // that listing a directory costs no allocation per entry.
 
-use std::cmp::Ordering;
 
 use crate::manifest::Timestamp;
 
@@ -26,6 +25,8 @@ pub(super) use imp::{Directory, Scratch};
 pub(super) struct Spare {
     entries: Vec<Listed>,
     names: Vec<u8>,
+    sorted: Vec<Listed>,
+    keys: Vec<u128>,
 }
 
 // The names of a listing. They are checked for UTF-8 once, all together, and
@@ -98,15 +99,14 @@ impl Listed {
         })
     }
 
+    /// Where the name is in [`Listing::text`]: its start and its length.
+    pub fn span(&self) -> (u32, u32) {
+        (self.start, self.len)
+    }
+
     /// Returns the entry's name, given the buffer of its listing.
     pub fn name<'n>(&self, names: &'n [u8]) -> &'n [u8] {
         &names[self.start as usize..(self.start + self.len) as usize]
-    }
-
-    fn order(&self, other: &Self, names: &[u8]) -> Ordering {
-        self.prefix
-            .cmp(&other.prefix)
-            .then_with(|| self.name(names).cmp(other.name(names)))
     }
 }
 
@@ -115,6 +115,9 @@ impl Listed {
 pub(super) struct Listing {
     pub entries: Vec<Listed>,
     names: Names,
+    // What the sort works in. See `Listing::sort`.
+    sorted: Vec<Listed>,
+    keys: Vec<u128>,
     // What the reader keeps until the entries have been visited.
     #[cfg_attr(
         all(target_os = "linux", not(tarseer_portable_reader)),
@@ -132,6 +135,8 @@ impl Listing {
         Self {
             entries: std::mem::take(&mut spare.entries),
             names: Names::Bytes(std::mem::take(&mut spare.names)),
+            sorted: std::mem::take(&mut spare.sorted),
+            keys: std::mem::take(&mut spare.keys),
             ..Self::default()
         }
     }
@@ -139,9 +144,17 @@ impl Listing {
     /// Gives the buffers up for the next listing.
     pub fn into_spare(self) -> Spare {
         let (mut entries, mut names) = (self.entries, self.names.into_bytes());
+        let (mut sorted, mut keys) = (self.sorted, self.keys);
         entries.clear();
         names.clear();
-        Spare { entries, names }
+        sorted.clear();
+        keys.clear();
+        Spare {
+            entries,
+            names,
+            sorted,
+            keys,
+        }
     }
 
     /// The buffer that holds every name.
@@ -160,6 +173,16 @@ impl Listing {
         }
     }
 
+    /// All the names as one text, each followed by whatever the reader put
+    /// after it, or `None` if one of them is not UTF-8. [`Listed::span`] says
+    /// where a name is in it.
+    pub fn text(&self) -> Option<&str> {
+        match &self.names {
+            Names::Text(text) => Some(text),
+            Names::Bytes(_) => None,
+        }
+    }
+
     /// The name of `listed` as text, or `None` if it is not UTF-8.
     pub fn name_text(&self, listed: &Listed) -> Option<&str> {
         match &self.names {
@@ -174,8 +197,40 @@ impl Listing {
             Names::Bytes(bytes) => bytes.as_slice(),
             Names::Text(text) => text.as_bytes(),
         };
-        self.entries
-            .sort_unstable_by(|left, right| left.order(right, names));
+        // The sort is of one integer for each entry: the first eight bytes
+        // of its name, and its place. Integers sort several times faster than
+        // records that are compared through a function. Names that share
+        // their first eight bytes are then put in order among themselves.
+        let entries = &self.entries;
+        self.keys.clear();
+        self.keys.extend(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(place, entry)| (u128::from(entry.prefix) << 64) | place as u128),
+        );
+        self.keys.sort_unstable();
+        let place = |key: u128| (key & u128::from(u64::MAX)) as usize;
+        let mut from = 0;
+        while from < self.keys.len() {
+            let prefix = self.keys[from] >> 64;
+            let run = self.keys[from..]
+                .iter()
+                .take_while(|&&key| key >> 64 == prefix)
+                .count();
+            if run > 1 {
+                self.keys[from..from + run].sort_unstable_by(|&left, &right| {
+                    entries[place(left)]
+                        .name(names)
+                        .cmp(entries[place(right)].name(names))
+                });
+            }
+            from += run;
+        }
+        self.sorted.clear();
+        self.sorted
+            .extend(self.keys.iter().map(|&key| entries[place(key)]));
+        std::mem::swap(&mut self.entries, &mut self.sorted);
         self.names = match std::mem::take(&mut self.names) {
             Names::Bytes(bytes) => match String::from_utf8(bytes) {
                 Ok(text) => Names::Text(text),
