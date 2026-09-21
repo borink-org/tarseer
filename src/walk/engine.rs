@@ -1220,7 +1220,13 @@ impl<'a> Engine<'a> {
         } else {
             drop(state);
         }
-        self.announce();
+        // In walk order the calling thread follows what the sequencers make.
+        // As built, it takes parts, and a worker that builds one tells it. It
+        // then needs to hear of a sequencer only that the last one is done.
+        // Every needless wake-up takes a processor from a worker.
+        if done || self.options.order == PartOrder::Walk {
+            self.announce();
+        }
     }
 
     // Goes through the children of `node` in walk order and groups them. It
