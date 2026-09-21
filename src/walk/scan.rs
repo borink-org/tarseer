@@ -13,7 +13,7 @@ use super::{Candidate, Filter, Listing, OnError, SkipReason, estimate};
 use crate::manifest::{EntryKind, Timestamp};
 
 /// The most open directories that waiting jobs may hold between them.
-const MAX_HELD: usize = 128;
+pub(super) const MAX_HELD: usize = 128;
 
 /// The most entries one scan reads. A directory with more is read by several
 /// scans, which can run on different threads. The walk never holds the

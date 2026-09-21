@@ -16,6 +16,9 @@ pub struct Scratch {
     pub spare: Spare,
 }
 
+/// This reader holds no descriptors of its own.
+pub fn reserve_handles(_: usize) {}
+
 #[derive(Default)]
 pub struct Held {
     entries: Vec<DirEntry>,

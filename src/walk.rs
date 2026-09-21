@@ -445,6 +445,8 @@ pub fn walk_parts(
         return Ok(walker.skips);
     }
 
+    // What the waiting jobs may hold, and a few for each thread at work.
+    reader::reserve_handles(scan::MAX_HELD + 4 * options.threads + 64);
     let engine = Engine::new(&scanner, options, root);
     std::thread::scope(|scope| {
         // Closed on every way out, so that the scope can join the workers.

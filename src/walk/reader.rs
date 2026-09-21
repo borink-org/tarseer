@@ -16,7 +16,7 @@ mod portable;
 #[cfg(not(all(target_os = "linux", not(tarseer_portable_reader))))]
 use portable as imp;
 
-pub(super) use imp::{Directory, Scratch};
+pub(super) use imp::{Directory, Scratch, reserve_handles};
 
 /// The buffers of a listing that has been read, for the next one to fill. A
 /// walk then allocates for a listing only when one is larger than any before.
