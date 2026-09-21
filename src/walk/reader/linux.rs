@@ -42,12 +42,12 @@ pub struct Held;
 /// Makes the process's table of descriptors large enough for `handles` more,
 /// before the walk starts its threads.
 ///
-/// The kernel grows that table when a descriptor does not fit, and in a
-/// process with threads it waits for every processor to pass a quiet point
-/// first. That is several milliseconds each time, inside an `openat`, and a
-/// walk that holds directories open crosses 64, 128 and 256. With one thread
-/// the kernel does not wait. Measured on 2026-09-21: about 30 ms of every walk
-/// with 8 threads, whatever its size.
+/// The kernel grows that table when a descriptor does not fit. In a process
+/// with threads it first waits for every processor to pass a quiet point.
+/// That is several milliseconds each time, inside an `openat`. A walk that
+/// holds directories open crosses 64, 128 and 256. With one thread the kernel
+/// does not wait. Measured on 2026-09-21 on a virtual machine with 8 threads:
+/// 10 to 20 ms of every walk, whatever its size.
 pub fn reserve_handles(handles: usize) {
     let flags = OFlags::RDONLY | OFlags::CLOEXEC;
     let Ok(any) = rustix::fs::open("/", flags | OFlags::DIRECTORY, Mode::empty()) else {
