@@ -6,13 +6,14 @@ use std::fs::{self, DirEntry, FileType, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{Kind, Listed, Listing, Stat};
+use super::{Kind, Listed, Listing, Spare, Stat};
 use crate::manifest::Timestamp;
 
 /// This reader needs no buffer of its own.
 #[derive(Default)]
 pub struct Scratch {
-    _nothing: (),
+    /// See [`Spare`].
+    pub spare: Spare,
 }
 
 #[derive(Default)]
@@ -62,8 +63,8 @@ impl Directory {
     }
 
     /// Reads and sorts the directory's entries.
-    pub fn list(&self, _: &mut Scratch) -> io::Result<Listing> {
-        let mut listing = Listing::default();
+    pub fn list(&self, scratch: &mut Scratch) -> io::Result<Listing> {
+        let mut listing = Listing::from_spare(&mut scratch.spare);
         for entry in fs::read_dir(&self.path)? {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -84,13 +85,13 @@ impl Directory {
             let slot = listing.held.entries.len();
             let listed = match name.to_str() {
                 Some(name) => Listed::new(
-                    &mut listing.names,
+                    listing.names_mut(),
                     name.as_bytes(),
                     kind_of(file_type),
                     slot,
                 ),
                 None => Listed::new(
-                    &mut listing.names,
+                    listing.names_mut(),
                     name.to_string_lossy().as_bytes(),
                     Kind::NonUtf8,
                     slot,

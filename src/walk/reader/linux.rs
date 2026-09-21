@@ -9,7 +9,7 @@ use std::path::Path;
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawDir, Statx, StatxFlags};
 
-use super::{Kind, Listed, Listing, Stat};
+use super::{Kind, Listed, Listing, Spare, Stat};
 use crate::manifest::Timestamp;
 
 // Only what a row records, and the type for an entry listed without one.
@@ -22,6 +22,8 @@ const WANTED: StatxFlags = StatxFlags::TYPE
 /// listing is copied out of it before the next directory is read.
 pub struct Scratch {
     buffer: Vec<MaybeUninit<u8>>,
+    /// See [`Spare`].
+    pub spare: Spare,
 }
 
 impl Default for Scratch {
@@ -29,6 +31,7 @@ impl Default for Scratch {
         Self {
             // 32 KiB, the size glibc reads directories with.
             buffer: vec![MaybeUninit::uninit(); 32 << 10],
+            spare: Spare::default(),
         }
     }
 }
@@ -59,7 +62,7 @@ impl Directory {
     /// Opens the directory `listed` names inside this one.
     pub fn open_child(&self, listed: &Listed, listing: &Listing) -> io::Result<Self> {
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-        let name = c_name(listed, &listing.names);
+        let name = c_name(listed, listing.names());
         let fd = rustix::fs::openat(&self.fd, name, flags, Mode::empty())?;
         Ok(Self { fd })
     }
@@ -75,7 +78,7 @@ impl Directory {
     // The signature is the portable reader's, which can fail here.
     #[allow(clippy::unnecessary_wraps)]
     pub fn list(&self, scratch: &mut Scratch) -> io::Result<Listing> {
-        let mut listing = Listing::default();
+        let mut listing = Listing::from_spare(&mut scratch.spare);
         let mut raw = RawDir::new(&self.fd, &mut scratch.buffer);
         while let Some(entry) = raw.next() {
             let entry = match entry {
@@ -90,7 +93,7 @@ impl Directory {
                 continue;
             }
             let kind = kind_of(entry.file_type());
-            let Some(listed) = Listed::new(&mut listing.names, name, kind, 0) else {
+            let Some(listed) = Listed::new(listing.names_mut(), name, kind, 0) else {
                 let error = io::Error::other("the listing is larger than 4 GiB");
                 listing.failures.push((error, None, "listing"));
                 break;
@@ -103,7 +106,7 @@ impl Directory {
 
     /// Reads the metadata of `listed`, without following a symlink.
     pub fn stat(&self, listed: &Listed, listing: &Listing) -> io::Result<Stat> {
-        let name = c_name(listed, &listing.names);
+        let name = c_name(listed, listing.names());
         let stat = rustix::fs::statx(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW, WANTED)?;
         converted(&stat)
     }
@@ -116,7 +119,7 @@ impl Directory {
 
     /// Reads the target of the symlink `listed`. `None` if it is not UTF-8.
     pub fn read_link(&self, listed: &Listed, listing: &Listing) -> io::Result<Option<String>> {
-        let name = c_name(listed, &listing.names);
+        let name = c_name(listed, listing.names());
         let target = rustix::fs::readlinkat(&self.fd, name, Vec::new())?;
         Ok(target.into_string().ok())
     }

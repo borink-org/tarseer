@@ -20,6 +20,28 @@ use portable as imp;
 
 pub(super) use imp::{Directory, Scratch};
 
+/// The buffers of a listing that has been read, for the next one to fill. A
+/// walk then allocates for a listing only when one is larger than any before.
+#[derive(Default)]
+pub(super) struct Spare {
+    entries: Vec<Listed>,
+    names: Vec<u8>,
+}
+
+// The names of a listing. They are checked for UTF-8 once, all together, and
+// held as text if they pass. A name is then a slice of that text, and costs no
+// check of its own. NUL, which ends each name for the linux reader, is UTF-8.
+enum Names {
+    Bytes(Vec<u8>),
+    Text(String),
+}
+
+impl Default for Names {
+    fn default() -> Self {
+        Self::Bytes(Vec::new())
+    }
+}
+
 /// What a listing says an entry is, before its metadata is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
@@ -92,7 +114,7 @@ impl Listed {
 #[derive(Default)]
 pub(super) struct Listing {
     pub entries: Vec<Listed>,
-    pub names: Vec<u8>,
+    names: Names,
     // What the reader keeps until the entries have been visited.
     #[cfg_attr(
         all(target_os = "linux", not(tarseer_portable_reader)),
@@ -105,10 +127,62 @@ pub(super) struct Listing {
 }
 
 impl Listing {
+    /// An empty listing that fills the buffers of `spare`.
+    fn from_spare(spare: &mut Spare) -> Self {
+        Self {
+            entries: std::mem::take(&mut spare.entries),
+            names: Names::Bytes(std::mem::take(&mut spare.names)),
+            ..Self::default()
+        }
+    }
+
+    /// Gives the buffers up for the next listing.
+    pub fn into_spare(self) -> Spare {
+        let (mut entries, mut names) = (self.entries, self.names.into_bytes());
+        entries.clear();
+        names.clear();
+        Spare { entries, names }
+    }
+
+    /// The buffer that holds every name.
+    pub fn names(&self) -> &[u8] {
+        match &self.names {
+            Names::Bytes(bytes) => bytes,
+            Names::Text(text) => text.as_bytes(),
+        }
+    }
+
+    // While the listing is being read.
+    fn names_mut(&mut self) -> &mut Vec<u8> {
+        match &mut self.names {
+            Names::Bytes(bytes) => bytes,
+            Names::Text(_) => unreachable!("names are text only once the listing is sorted"),
+        }
+    }
+
+    /// The name of `listed` as text, or `None` if it is not UTF-8.
+    pub fn name_text(&self, listed: &Listed) -> Option<&str> {
+        match &self.names {
+            Names::Text(text) => text.get(listed.start as usize..(listed.start + listed.len) as usize),
+            Names::Bytes(bytes) => std::str::from_utf8(listed.name(bytes)).ok(),
+        }
+    }
+
+    // Sorts the entries, and checks the names for UTF-8 all at once.
     fn sort(&mut self) {
-        let names = &self.names;
+        let names = match &self.names {
+            Names::Bytes(bytes) => bytes.as_slice(),
+            Names::Text(text) => text.as_bytes(),
+        };
         self.entries
             .sort_unstable_by(|left, right| left.order(right, names));
+        self.names = match std::mem::take(&mut self.names) {
+            Names::Bytes(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => Names::Text(text),
+                Err(error) => Names::Bytes(error.into_bytes()),
+            },
+            text @ Names::Text(_) => text,
+        };
     }
 
     /// Returns the position of the entry named `name`, by binary search.
@@ -125,6 +199,15 @@ impl Listing {
                     .then_with(|| entry.name(names).cmp(name))
             })
             .ok()
+    }
+}
+
+impl Names {
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Text(text) => text.into_bytes(),
+        }
     }
 }
 

@@ -387,6 +387,8 @@ impl Scanner<'_> {
         };
         let (path, opened, refused) = match job.work {
             Work::Rest { listed, start } => {
+                let entries = listed.listing.entries.len() - start;
+                found.scanned.items.reserve(entries.min(CHUNK));
                 self.entries(&listed, start, &mut found);
                 return found.finish();
             }
@@ -431,8 +433,15 @@ impl Scanner<'_> {
             directory,
             listing,
         };
-        if listed.listing.entries.len() <= CHUNK {
+        // One allocation for the names and one for the items, where growing
+        // them entry by entry would take several. A link's target comes on top.
+        let entries = listed.listing.entries.len();
+        found.scanned.items.reserve(entries.min(CHUNK));
+        if entries <= CHUNK {
+            found.scanned.text.reserve(listed.listing.names().len());
             self.entries(&listed, 0, &mut found);
+            // The listing's buffers serve the next directory.
+            scratch.spare = listed.listing.into_spare();
             return found.finish();
         }
         let listed = Arc::new(listed);
@@ -500,10 +509,10 @@ impl Scanner<'_> {
             ..
         } = within;
         let parent = parent.as_str();
-        let raw = listed.name(&listing.names);
-        let name = match std::str::from_utf8(raw) {
-            Ok(name) if listed.kind != Kind::NonUtf8 => name,
-            Ok(lossy) => {
+        let raw = listed.name(listing.names());
+        let name = match listing.name_text(listed) {
+            Some(name) if listed.kind != Kind::NonUtf8 => name,
+            Some(lossy) => {
                 let name = scanned.span(lossy)?;
                 scanned.items.push(Item::Skipped {
                     name,
@@ -511,7 +520,7 @@ impl Scanner<'_> {
                 });
                 return Ok(None);
             }
-            Err(_) => {
+            None => {
                 let name = scanned.span(&String::from_utf8_lossy(raw))?;
                 scanned.items.push(Item::Skipped {
                     name,
@@ -558,7 +567,7 @@ impl Scanner<'_> {
                 kind,
                 listing: Listing {
                     entries: &listing.entries,
-                    names: &listing.names,
+                    names: listing.names(),
                 },
             };
             if !filter.keep(&candidate) {
