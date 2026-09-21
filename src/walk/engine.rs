@@ -150,9 +150,11 @@ struct Cut {
     waits_for: Option<Box<[u32]>>,
 }
 
-// A directory that `Engine::deep` is inside of.
+// A directory that `Engine::deep` is inside of. Its scan is in the list of
+// scans that `deep` keeps, at `scan`, and the scans of everything below it
+// follow it there.
 struct Frame {
-    scanned: Scanned,
+    scan: usize,
     // The jobs of the subdirectories not entered yet, and of the rest of a
     // directory that one scan did not read.
     jobs: std::vec::IntoIter<Job>,
@@ -168,13 +170,36 @@ struct Frame {
     // The rows read below the directory's own row.
     bytes: u64,
     count: usize,
-    // The subdirectories that are read to their end, in walk order.
-    done: Vec<(Place, Child)>,
+    // The subdirectories that are read to their end, in walk order: where
+    // each one's row is, its scans in the list, and its rows.
+    done: Vec<Done>,
+}
+
+struct Done {
+    place: Place,
+    scans: std::ops::Range<usize>,
+    bytes: u64,
+    count: usize,
 }
 
 struct Task {
     job: Job,
-    node: Arc<Node>,
+    at: At,
+}
+
+// What a task's scan belongs to.
+enum At {
+    // A node that exists: the root, or a directory that one scan did not
+    // read to its end.
+    Node(Arc<Node>),
+    // A directory that nothing has read. It has no node, and gets one only if
+    // `Engine::deep` cannot read its subtree to the end. `place` and `from`
+    // are as in `Frame`.
+    Below {
+        parent: Arc<Node>,
+        place: Place,
+        from: (Arc<Rows>, usize),
+    },
 }
 
 enum Work {
@@ -324,7 +349,7 @@ impl<'a> Engine<'a> {
         self.open.fetch_add(1, Ordering::Relaxed);
         let first = Task {
             job: Job::root(),
-            node: Arc::clone(&root),
+            at: At::Node(Arc::clone(&root)),
         };
         self.lock().waiting.insert(first.job.key.clone(), first);
         self.work.notify_one();
@@ -564,49 +589,17 @@ impl<'a> Engine<'a> {
         let mut mine = vec![first];
         let mut others: Vec<Task> = Vec::new();
         let mut read = 0;
-        while let Some(Task { job, node }) = mine.pop() {
-            let start = job.start();
-            if let (Some(progress), Some(path)) = (self.options.progress, job.path()) {
-                progress.entered(path);
-            }
-            // With no handle left, this worker first closes the directories
-            // that its own jobs hold.
-            let found = self.scanner.scan(job, scratch, &mut || {
-                let mut released = false;
-                for waiting in mine.iter_mut().chain(others.iter_mut()) {
-                    released |= waiting.job.release(&self.scanner.held);
-                }
-                released || self.release()
-            });
-            read += found.scanned.rows.items.len();
-            self.report(&node.path, &found.scanned);
-
-            let rows = Arc::clone(&found.scanned.rows);
-            let rest: Vec<Task> = found
-                .rest
-                .into_iter()
-                .map(|job| Task {
-                    job,
-                    node: Arc::clone(&node),
-                })
-                .collect();
-            // The node hears of its subdirectories before any of them can
-            // answer.
-            let jobs = found.directories;
-            self.arrived(&node, start, found.scanned, jobs.len(), true);
-
-            // The nth directory among the items belongs to the nth job.
-            let places = rows
-                .items
-                .iter()
-                .enumerate()
-                .filter(|(_, item)| matches!(item, Item::Directory { .. }));
+        while let Some(Task { job, at }) = mine.pop() {
             let mut children: Vec<Task> = Vec::new();
-            for (job, (index, _)) in jobs.into_iter().zip(places) {
-                let from = (Arc::clone(&rows), index);
-                // A subtree is started within the bundle and read to its end
-                // whatever its size, up to a part.
-                if rest.is_empty() && read < BUNDLE && self.alone() {
+            let mut shared = false;
+            match at {
+                // A directory nobody has read is read with all below it, as
+                // far as that goes.
+                At::Below {
+                    parent,
+                    place,
+                    from,
+                } => {
                     let mut release = || {
                         let mut released = false;
                         for waiting in mine.iter_mut().chain(others.iter_mut()) {
@@ -614,19 +607,66 @@ impl<'a> Engine<'a> {
                         }
                         released
                     };
-                    let place = (start, index);
-                    self.deep(job, &node, place, from, &mut read, scratch, &mut release, &mut children);
-                } else {
-                    let below = node_below(&node, (start, index), &from.0, from.1);
-                    children.push(Task { job, node: below });
+                    self.deep(
+                        job,
+                        &parent,
+                        place,
+                        from,
+                        &mut read,
+                        scratch,
+                        &mut release,
+                        &mut children,
+                    );
+                }
+                At::Node(node) => {
+                    let start = job.start();
+                    if let (Some(progress), Some(path)) = (self.options.progress, job.path()) {
+                        progress.entered(path);
+                    }
+                    // With no handle left, this worker first closes the
+                    // directories that its own jobs hold.
+                    let found = self.scanner.scan(job, scratch, &mut || {
+                        let mut released = false;
+                        for waiting in mine.iter_mut().chain(others.iter_mut()) {
+                            released |= waiting.job.release(&self.scanner.held);
+                        }
+                        released || self.release()
+                    });
+                    read += found.scanned.rows.items.len();
+                    self.report(&node.path, &found.scanned);
+
+                    let rows = Arc::clone(&found.scanned.rows);
+                    // The scans of the rest of a directory are for other
+                    // workers, and they come before anything else this worker
+                    // would do.
+                    shared = !found.rest.is_empty();
+                    others.extend(found.rest.into_iter().map(|job| Task {
+                        job,
+                        at: At::Node(Arc::clone(&node)),
+                    }));
+                    // The node hears of its subdirectories before any of them
+                    // can answer.
+                    let jobs = found.directories;
+                    self.arrived(&node, start, found.scanned, jobs.len(), true);
+
+                    // The nth directory among the items belongs to the nth job.
+                    let places = rows
+                        .items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| matches!(item, Item::Directory { .. }));
+                    children.extend(jobs.into_iter().zip(places).map(|(job, (index, _))| Task {
+                        job,
+                        at: At::Below {
+                            parent: Arc::clone(&node),
+                            place: (start, index),
+                            from: (Arc::clone(&rows), index),
+                        },
+                    }));
                 }
             }
 
-            // The scans of the rest of a directory are for other workers,
-            // and they come before anything else this worker would do.
-            let done = read >= BUNDLE || !rest.is_empty();
-            others.extend(rest);
-            if done {
+            if read >= BUNDLE || shared {
                 others.extend(children);
                 break;
             }
@@ -883,6 +923,10 @@ impl<'a> Engine<'a> {
         out: &mut Vec<Task>,
     ) {
         let mut frames: Vec<Frame> = Vec::new();
+        // Every scan made here, in the order the walk enters the directories.
+        // A subtree read to its end is a range of it, so nothing is moved when
+        // a directory is done.
+        let mut scans: Vec<Scanned> = Vec::new();
         // The estimate of the subtree with the row of its root.
         let mut total = row_estimate(&from.0, &from.0.items[from.1]);
         let mut enter = Some((job, place, from));
@@ -916,7 +960,7 @@ impl<'a> Engine<'a> {
             frames.push(Frame {
                 bytes: found.scanned.bytes,
                 count: found.scanned.count,
-                scanned: found.scanned,
+                scan: scans.len(),
                 jobs: found.directories.into_iter(),
                 rest: found.rest,
                 next: 0,
@@ -925,19 +969,20 @@ impl<'a> Engine<'a> {
                 reported: path.is_some(),
                 done: Vec::new(),
             });
+            scans.push(found.scanned);
             if !plain || total > self.options.budget {
-                return self.hand_back(frames, parent, out);
+                return self.hand_back(frames, scans, parent, out);
             }
 
             // Up through the directories that are read to their end, to the
             // next subdirectory to enter.
             while let Some(top) = frames.last_mut() {
-                let rows = &top.scanned.rows;
+                let rows = &scans[top.scan].rows;
                 let next = (top.next..rows.items.len())
                     .find(|&index| matches!(rows.items[index], Item::Directory { .. }));
                 if let Some(index) = next {
                     if !self.alone() {
-                        return self.hand_back(frames, parent, out);
+                        return self.hand_back(frames, scans, parent, out);
                     }
                     top.next = index + 1;
                     let job = top.jobs.next().expect("a job for every directory");
@@ -945,48 +990,69 @@ impl<'a> Engine<'a> {
                     break;
                 }
                 let frame = frames.pop().expect("checked above");
-                let mut scans = vec![frame.scanned];
-                for (_, child) in frame.done {
-                    if let Child::Whole { scans: below, .. } = child {
-                        scans.extend(below);
-                    }
-                }
-                let whole = Child::Whole {
+                let Some(above) = frames.last_mut() else {
+                    let whole = Child::Whole {
+                        bytes: frame.bytes,
+                        count: frame.count,
+                        scans,
+                    };
+                    return self.decided(Arc::clone(parent), frame.place, whole);
+                };
+                above.bytes += frame.bytes;
+                above.count += frame.count;
+                above.done.push(Done {
+                    place: frame.place,
+                    scans: frame.scan..scans.len(),
                     bytes: frame.bytes,
                     count: frame.count,
-                    scans,
-                };
-                match frames.last_mut() {
-                    Some(above) => {
-                        above.bytes += frame.bytes;
-                        above.count += frame.count;
-                        above.done.push((frame.place, whole));
-                    }
-                    None => return self.decided(Arc::clone(parent), frame.place, whole),
-                }
+                });
             }
         }
     }
 
     // Makes nodes of the directories `deep` was inside of, the outermost
     // first, and gives each what was read of it.
-    fn hand_back(&self, frames: Vec<Frame>, parent: &Arc<Node>, out: &mut Vec<Task>) {
+    fn hand_back(
+        &self,
+        frames: Vec<Frame>,
+        mut scans: Vec<Scanned>,
+        parent: &Arc<Node>,
+        out: &mut Vec<Task>,
+    ) {
+        // Each directory's scan, and the subtrees below it that are whole. The
+        // list is taken apart from its end, so the innermost comes first.
+        let mut taken: Vec<(Scanned, Vec<(Place, Child)>)> = Vec::new();
+        for frame in frames.iter().rev() {
+            let mut done = Vec::with_capacity(frame.done.len());
+            for child in frame.done.iter().rev() {
+                let whole = Child::Whole {
+                    bytes: child.bytes,
+                    count: child.count,
+                    scans: scans.split_off(child.scans.start),
+                };
+                done.push((child.place, whole));
+            }
+            done.reverse();
+            let scanned = scans.pop().expect("a scan for every directory");
+            taken.push((scanned, done));
+        }
         let mut above = Arc::clone(parent);
         // The scans not made, of each directory, innermost last.
         let mut left: Vec<Vec<Task>> = Vec::new();
         for frame in frames {
+            let (scanned, done) = taken.pop().expect("one for every directory");
             let node = node_below(&above, frame.place, &frame.from.0, frame.from.1);
             if !frame.reported {
-                self.report(&node.path, &frame.scanned);
+                self.report(&node.path, &scanned);
             }
-            let rows = Arc::clone(&frame.scanned.rows);
+            let rows = Arc::clone(&scanned.rows);
             let directories = rows
                 .items
                 .iter()
                 .filter(|item| matches!(item, Item::Directory { .. }))
                 .count();
-            self.arrived(&node, 0, frame.scanned, directories, false);
-            for (place, whole) in frame.done {
+            self.arrived(&node, 0, scanned, directories, false);
+            for (place, whole) in done {
                 self.decided(Arc::clone(&node), place, whole);
             }
             let places = (frame.next..rows.items.len())
@@ -996,12 +1062,16 @@ impl<'a> Engine<'a> {
                 .zip(places)
                 .map(|(job, index)| Task {
                     job,
-                    node: node_below(&node, (0, index), &rows, index),
+                    at: At::Below {
+                        parent: Arc::clone(&node),
+                        place: (0, index),
+                        from: (Arc::clone(&rows), index),
+                    },
                 })
                 .collect();
             tasks.extend(frame.rest.into_iter().map(|job| Task {
                 job,
-                node: Arc::clone(&node),
+                at: At::Node(Arc::clone(&node)),
             }));
             left.push(tasks);
             above = node;
