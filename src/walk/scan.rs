@@ -67,7 +67,6 @@ impl Job {
         }
     }
 
-
     /// Closes the directory this job holds for its scan, if it holds one that
     /// the scan can open again. Returns `true` if it did.
     pub fn release(&mut self, held: &Held) -> bool {
@@ -243,7 +242,6 @@ impl Scanned {
         &self.rows.items[self.items.clone()]
     }
 
-
     /// Returns `true` if the directory was read and every item is a row, so
     /// that the walk has nothing to count or report for it.
     pub fn is_clean(&self) -> bool {
@@ -363,7 +361,14 @@ impl Finding {
     /// Ends a finding that took several scans. Returns their rows, and what
     /// the last scan could not read. Only the last can have that: the caller
     /// stops at a scan that is not plain.
-    pub fn into_rows(self) -> (Arc<Rows>, Vec<Option<io::Error>>, Option<io::Error>, Option<usize>) {
+    pub fn into_rows(
+        self,
+    ) -> (
+        Arc<Rows>,
+        Vec<Option<io::Error>>,
+        Option<io::Error>,
+        Option<usize>,
+    ) {
         let Reading {
             text,
             items,

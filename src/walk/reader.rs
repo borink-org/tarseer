@@ -4,7 +4,6 @@
 // A listing keeps every name in one buffer and one small record per entry, so
 // that listing a directory costs no allocation per entry.
 
-
 use crate::manifest::Timestamp;
 
 #[cfg(all(target_os = "linux", not(tarseer_portable_reader)))]
@@ -186,7 +185,9 @@ impl Listing {
     /// The name of `listed` as text, or `None` if it is not UTF-8.
     pub fn name_text(&self, listed: &Listed) -> Option<&str> {
         match &self.names {
-            Names::Text(text) => text.get(listed.start as usize..(listed.start + listed.len) as usize),
+            Names::Text(text) => {
+                text.get(listed.start as usize..(listed.start + listed.len) as usize)
+            }
             Names::Bytes(bytes) => std::str::from_utf8(listed.name(bytes)).ok(),
         }
     }

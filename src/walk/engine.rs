@@ -904,8 +904,7 @@ impl<'a> Engine<'a> {
     // Whether a worker may read a subtree by itself: nobody waits for work,
     // and the rows have room.
     fn alone(&self) -> bool {
-        self.idle.load(Ordering::Relaxed) == 0
-            && self.held.load(Ordering::Relaxed) < self.window
+        self.idle.load(Ordering::Relaxed) == 0 && self.held.load(Ordering::Relaxed) < self.window
     }
 
     // Reads the subtree of the directory of `job` on this thread, depth-first,
@@ -1007,7 +1006,9 @@ impl<'a> Engine<'a> {
                         return self.hand_back(frames, found, scans, jobs, parent, from, out);
                     }
                     top.next = index + 1;
-                    let job = jobs[top.jobs.start].take().expect("a job for every directory");
+                    let job = jobs[top.jobs.start]
+                        .take()
+                        .expect("a job for every directory");
                     top.jobs.start += 1;
                     let Item::Directory { name, .. } = items[index] else {
                         unreachable!("found as a directory above");
