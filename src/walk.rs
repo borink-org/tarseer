@@ -79,6 +79,9 @@
 //! On Linux the walk keeps some of the directories it is about to read open,
 //! at most 128. When the process runs out of file descriptors, the walk closes
 //! them. It then opens each by its path when it reads it.
+//! With threads, the walk first makes the process's table of descriptors large
+//! enough for those. The kernel would otherwise grow the table during the walk,
+//! and with threads that stops every one of them for some milliseconds.
 
 use std::collections::VecDeque;
 use std::fmt;
