@@ -13,7 +13,8 @@ use tarseer::frames::DEFAULT_THREADS;
 use tarseer::zstd::Zstd;
 use tarseer::{DEFAULT_BUDGET, PartOrder, Skips, WalkError, WalkOptions, WriteError, walk_parts};
 
-// mimalloc for the binary only; the library sets no allocator.
+// The system allocator has lower resident memory on Linux.
+#[cfg(not(target_os = "linux"))]
 #[global_allocator]
 static GLOBAL: cyo_mimalloc::MiMalloc = cyo_mimalloc::MiMalloc;
 

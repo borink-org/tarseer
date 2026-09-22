@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -40,6 +40,8 @@ use crate::manifest::{EntryKind, TreePart};
 
 // The entries a worker reads before it hands its scans over.
 const BUNDLE: usize = 2048;
+// Bound continuations even when the next directories contain no rows.
+const STEPS: usize = 64;
 
 // How many rows one budget is taken to hold, for the limit on rows in flight.
 const ROW_BYTES: u64 = 64;
@@ -73,7 +75,6 @@ struct Pending {
 }
 
 struct Node {
-    parent: Option<(Arc<Node>, Place)>,
     // The key of the directory's first scan. See `Job::key`.
     key: Box<[u32]>,
     // Relative to the root, and empty for the root.
@@ -87,6 +88,9 @@ struct Node {
 
 #[derive(Default)]
 struct NodeState {
+    // Kept only until the first decision is sent upward. Taking it before
+    // publishing Child::Over prevents a parent/child ownership cycle.
+    parent: Option<(Arc<Node>, Place)>,
     // The directory's scans that have arrived, by where they start.
     scans: BTreeMap<usize, Scanned>,
     arrived: usize,
@@ -112,7 +116,7 @@ struct NodeState {
     queued: bool,
     // What the sequencer has made, in walk order. That is all of it once the
     // stage is `Done`.
-    slots: Vec<Slot>,
+    slots: VecDeque<Slot>,
 }
 
 // How far a node has come.
@@ -188,6 +192,23 @@ struct Done {
     count: usize,
 }
 
+// Rows from independent subtrees are accumulated into one immutable block.
+// Decisions are published together when a scan quantum ends, or before a
+// partially read subtree has to return to the shared scheduler.
+#[derive(Default)]
+struct Batch {
+    found: Finding,
+    done: Vec<Completed>,
+}
+
+struct Completed {
+    parent: Arc<Node>,
+    place: Place,
+    bytes: u64,
+    count: usize,
+    scans: Vec<Added>,
+}
+
 struct Task {
     job: Job,
     at: At,
@@ -243,6 +264,7 @@ pub(super) struct Engine<'a> {
     // The most rows that are read and not yet given to the sink.
     window: usize,
     held: AtomicUsize,
+    sinking: AtomicBool,
     // How many workers wait for work, for a worker that does not hold the
     // lock. It may be a moment behind.
     idle: AtomicUsize,
@@ -269,6 +291,7 @@ impl<'a> Engine<'a> {
                 .saturating_mul(2)
                 .saturating_add(options.threads.saturating_mul(BUNDLE)),
             held: AtomicUsize::new(0),
+            sinking: AtomicBool::new(false),
             idle: AtomicUsize::new(0),
             open: AtomicUsize::new(0),
             planned: AtomicUsize::new(0),
@@ -337,7 +360,6 @@ impl<'a> Engine<'a> {
         // The root is cut like a directory that is over, whatever it holds,
         // and nothing goes ahead of its rows.
         let root = Arc::new(Node {
-            parent: None,
             key: Box::default(),
             path: String::new(),
             depth: 0,
@@ -352,6 +374,8 @@ impl<'a> Engine<'a> {
                 ..NodeState::default()
             }),
         });
+        #[cfg(test)]
+        LAST_ROOT.with(|slot| *slot.borrow_mut() = Arc::downgrade(&root));
         self.open.fetch_add(1, Ordering::Relaxed);
         let first = Task {
             job: Job::root(),
@@ -408,10 +432,13 @@ impl<'a> Engine<'a> {
     ) -> Result<(), Report<WalkError>> {
         let part = built?;
         let rows = part.len();
-        sink(part)?;
+        self.sinking.store(true, Ordering::Release);
+        let result = sink(part);
+        self.sinking.store(false, Ordering::Release);
+        result?;
         // Rows that have gone make room for the workers to scan more.
         let before = self.held.fetch_sub(rows, Ordering::Relaxed);
-        if before >= self.window && before - rows < self.window {
+        if before >= self.window {
             self.work.notify_all();
         }
         Ok(())
@@ -449,27 +476,30 @@ impl<'a> Engine<'a> {
         root: &Arc<Node>,
         sink: &mut dyn FnMut(TreePart) -> Result<(), Report<WalkError>>,
     ) -> Result<(), Report<WalkError>> {
-        // The sequencers being followed, each with the next of its slots.
-        let mut open = vec![(Arc::clone(root), 0)];
+        // Delivered slots are consumed, so metadata does not grow with the walk.
+        let mut open = vec![Arc::clone(root)];
         loop {
             self.cancelled()?;
             let seen = self.lock().events;
-            let Some((node, next)) = open.last_mut() else {
+            let Some(node) = open.last() else {
                 return Ok(());
             };
             let mut state = Self::lock_node(node);
             let closed = state.stage == Stage::Done;
-            let waits_for = match state.slots.get_mut(*next) {
+            let waits_for = match state.slots.front() {
                 Some(Slot::Part(number)) => Some(*number),
                 Some(Slot::Child(child)) => {
                     let child = Arc::clone(child);
-                    *next += 1;
+                    state.slots.pop_front();
                     drop(state);
-                    open.push((child, 0));
+                    open.push(child);
                     continue;
                 }
-                Some(Slot::Failed(report)) => {
-                    return Err(report.take().expect("a failure is reported once"));
+                Some(Slot::Failed(_)) => {
+                    let Some(Slot::Failed(report)) = state.slots.pop_front() else {
+                        unreachable!("the slot is a failure");
+                    };
+                    return Err(report.expect("a failure is reported once"));
                 }
                 None if closed => {
                     drop(state);
@@ -479,12 +509,14 @@ impl<'a> Engine<'a> {
                 None => None,
             };
             drop(state);
-            if let Some(number) = waits_for
-                && let Some(built) = self.lock().parts.remove(&number)
-            {
-                *next += 1;
-                self.hand_to_sink(built, sink)?;
-                continue;
+            if let Some(number) = waits_for {
+                // End the guard's lifetime before calling user code.
+                let built = self.lock().parts.remove(&number);
+                if let Some(built) = built {
+                    Self::lock_node(node).slots.pop_front();
+                    self.hand_to_sink(built, sink)?;
+                    continue;
+                }
             }
             self.wait_for_events(seen)?;
         }
@@ -541,8 +573,10 @@ impl<'a> Engine<'a> {
                     .zip(head)
                     .is_some_and(|(first, head)| first.starts_with(head))
             };
-            let room =
-                self.held.load(Ordering::Relaxed) < self.window || state.scanning == 0 || needed();
+            let output_waiting = self.sinking.load(Ordering::Acquire)
+                || (self.options.order == PartOrder::Completion && !state.built.is_empty());
+            let room = self.held.load(Ordering::Relaxed) < self.window
+                || (!output_waiting && (state.scanning == 0 || needed()));
             if room && let Some((_, task)) = state.waiting.pop_first() {
                 state.scanning += 1;
                 return Some(Work::Scan(task));
@@ -595,7 +629,10 @@ impl<'a> Engine<'a> {
         let mut mine = vec![first];
         let mut others: Vec<Task> = Vec::new();
         let mut read = 0;
+        let mut steps = 0;
+        let mut batch = Batch::default();
         while let Some(Task { job, at }) = mine.pop() {
+            steps += 1;
             let mut children: Vec<Task> = Vec::new();
             let mut shared = false;
             match at {
@@ -622,6 +659,7 @@ impl<'a> Engine<'a> {
                         scratch,
                         &mut release,
                         &mut children,
+                        &mut batch,
                     );
                 }
                 At::Node(node) => {
@@ -671,7 +709,7 @@ impl<'a> Engine<'a> {
                 }
             }
 
-            if read >= BUNDLE || shared {
+            if read >= BUNDLE || shared || self.held.load(Ordering::Relaxed) >= self.window {
                 others.extend(children);
                 break;
             }
@@ -682,6 +720,10 @@ impl<'a> Engine<'a> {
             let mut children = children.into_iter();
             mine.extend(children.next());
             if self.idle.load(Ordering::Relaxed) > 0 {
+                // Share local jobs when workers need work.
+                let keep = mine.pop();
+                others.append(&mut mine);
+                mine.extend(keep);
                 others.extend(children);
                 self.give(std::mem::take(&mut others));
             } else {
@@ -691,9 +733,34 @@ impl<'a> Engine<'a> {
                 mine.extend(later);
                 mine.extend(first);
             }
+            if mine.is_empty() && steps < STEPS {
+                mine.extend(self.take_continuation());
+            }
         }
         others.extend(mine);
+        if !batch.done.is_empty() {
+            let (rows, _, _, _) = batch.found.into_rows();
+            self.publish_batch(&rows, &mut batch.done);
+        }
+        self.finish_scanning(others);
+    }
 
+    // Keep the row buffer for the next single job, while giving consumers
+    // and workers waking up priority over this continuation.
+    fn take_continuation(&self) -> Option<Task> {
+        let mut state = self.lock();
+        if state.closed
+            || !state.plans.is_empty()
+            || !state.sequence.is_empty()
+            || state.waiting.len() <= state.idle
+        {
+            return None;
+        }
+        state.waiting.pop_first().map(|(_, task)| task)
+    }
+
+    // Finishes a scan quantum and returns the jobs it did not read.
+    fn finish_scanning(&self, others: Vec<Task>) {
         // The keys are made before the lock is taken.
         let others = keyed(others);
         let mut state = self.lock();
@@ -829,11 +896,12 @@ impl<'a> Engine<'a> {
     ) -> Option<(Place, Report<WalkError>)> {
         if let Some(error) = scanned
             .unreadable
-            .take_if(|_| self.options.on_error == OnError::Fail || node.parent.is_none())
+            .take_if(|_| self.options.on_error == OnError::Fail || node.depth == 0)
         {
-            let listed = match node.parent {
-                Some(_) => node.path.clone(),
-                None => self.root.display().to_string(),
+            let listed = if node.depth == 0 {
+                self.root.display().to_string()
+            } else {
+                node.path.clone()
             };
             let report = Report::new(error)
                 .attach(format!("listing {listed}"))
@@ -864,12 +932,10 @@ impl<'a> Engine<'a> {
     // can, tells its parent, and so on upwards. A node that is over has its
     // sequencer run instead, since that may have waited for the change.
     fn settled(&self, node: &Arc<Node>, state: MutexGuard<'_, NodeState>) {
-        let Some(decision) = self.settle(node, state) else {
+        let Some((parent, place, decision)) = self.settle(node, state) else {
             return;
         };
-        if let Some((parent, place)) = node.parent.clone() {
-            self.decided(parent, place, decision);
-        }
+        self.decided(parent, place, decision);
     }
 
     // Tells `parent` what its child at `place` is, and everything above it
@@ -890,13 +956,10 @@ impl<'a> Engine<'a> {
                 }
             }
             above.children.insert(place, decision);
-            let Some(next) = self.settle(&parent, above) else {
+            let Some((up, at, next)) = self.settle(&parent, above) else {
                 return;
             };
             decision = next;
-            let Some((up, at)) = parent.parent.clone() else {
-                return;
-            };
             (parent, place) = (up, at);
         }
     }
@@ -917,7 +980,8 @@ impl<'a> Engine<'a> {
     // order. Nothing is read twice.
     //
     // `from` is the row of the directory: a scan of its parent, and the item.
-    #[allow(clippy::too_many_arguments)]
+    // Keep the explicit depth-first state machine together.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn deep(
         &self,
         job: Job,
@@ -928,13 +992,14 @@ impl<'a> Engine<'a> {
         scratch: &mut Scratch,
         release: &mut dyn FnMut() -> bool,
         out: &mut Vec<Task>,
+        batch: &mut Batch,
     ) {
         let mut frames: Vec<Frame> = Vec::new();
         // Every scan made here shares one set of rows, so a directory costs
         // no allocation of its own. `scans` has the items of each, in the
         // order the walk enters the directories. A subtree read to its end is
         // a range of it, so nothing is moved when a directory is done.
-        let mut found = Finding::default();
+        let mut found = std::mem::take(&mut batch.found);
         let mut scans: Vec<Added> = Vec::new();
         // The jobs of the subdirectories found and not entered, those of the
         // innermost directory last. A directory that is done takes its own
@@ -992,7 +1057,16 @@ impl<'a> Engine<'a> {
             });
             scans.push(added);
             if !plain || total > self.options.budget {
-                return self.hand_back(frames, found, scans, jobs, parent, from, out);
+                return self.hand_back(
+                    frames,
+                    found,
+                    scans,
+                    jobs,
+                    parent,
+                    from,
+                    out,
+                    &mut batch.done,
+                );
             }
 
             // Up through the directories that are read to their end, to the
@@ -1003,7 +1077,16 @@ impl<'a> Engine<'a> {
                     .find(|&index| matches!(items[index], Item::Directory { .. }));
                 if let Some(index) = next {
                     if !self.alone() {
-                        return self.hand_back(frames, found, scans, jobs, parent, from, out);
+                        return self.hand_back(
+                            frames,
+                            found,
+                            scans,
+                            jobs,
+                            parent,
+                            from,
+                            out,
+                            &mut batch.done,
+                        );
                     }
                     top.next = index + 1;
                     let job = jobs[top.jobs.start]
@@ -1022,12 +1105,15 @@ impl<'a> Engine<'a> {
                 let frame = frames.pop().expect("checked above");
                 jobs.truncate(frame.first_job);
                 let Some(above) = frames.last_mut() else {
-                    let whole = Child::Whole {
+                    batch.found = found;
+                    batch.done.push(Completed {
+                        parent: Arc::clone(parent),
+                        place: frame.place,
                         bytes: frame.bytes,
                         count: frame.count,
-                        scans: shared(found, scans),
-                    };
-                    return self.decided(Arc::clone(parent), frame.place, whole);
+                        scans,
+                    });
+                    return;
                 };
                 above.bytes += frame.bytes;
                 above.count += frame.count;
@@ -1053,9 +1139,11 @@ impl<'a> Engine<'a> {
         parent: &Arc<Node>,
         from: &(Arc<Rows>, usize),
         out: &mut Vec<Task>,
+        completed: &mut Vec<Completed>,
     ) {
         let mut scans = shared(found, scans);
         let rows = Arc::clone(&scans[0].rows);
+        self.publish_batch(&rows, completed);
         // Each directory's scan, and the subtrees below it that are whole. The
         // list is taken apart from its end, so the innermost comes first.
         let mut taken: Vec<(Scanned, Vec<(Place, Child)>)> = Vec::new();
@@ -1120,9 +1208,24 @@ impl<'a> Engine<'a> {
         out.extend(left.into_iter().rev().flatten());
     }
 
+    fn publish_batch(&self, rows: &Arc<Rows>, completed: &mut Vec<Completed>) {
+        for done in completed.drain(..) {
+            let whole = Child::Whole {
+                bytes: done.bytes,
+                count: done.count,
+                scans: shared_rows(rows, done.scans),
+            };
+            self.decided(done.parent, done.place, whole);
+        }
+    }
+
     // One node's part in `settled`. Returns what the node has decided, if it
     // decided now.
-    fn settle(&self, node: &Arc<Node>, mut state: MutexGuard<'_, NodeState>) -> Option<Child> {
+    fn settle(
+        &self,
+        node: &Arc<Node>,
+        mut state: MutexGuard<'_, NodeState>,
+    ) -> Option<(Arc<Node>, Place, Child)> {
         if state.stage != Stage::Open {
             self.schedule(node, &mut state);
             return None;
@@ -1134,7 +1237,8 @@ impl<'a> Engine<'a> {
             self.open.fetch_add(1, Ordering::Relaxed);
             self.schedule(node, &mut state);
         }
-        Some(decision)
+        let (parent, place) = state.parent.take().expect("an undecided node has a parent");
+        Some((parent, place, decision))
     }
 
     // What `node` is, if that can be said yet.
@@ -1199,7 +1303,14 @@ impl<'a> Engine<'a> {
         if let Some(head) = cut.waits_for.take() {
             self.lock().heads.remove(&head);
         }
+        let slots_before = state.slots.len();
         let done = self.cut(node, &mut state, &mut cut);
+        let notify = done
+            || state
+                .slots
+                .iter()
+                .skip(slots_before)
+                .any(|slot| matches!(slot, Slot::Child(_) | Slot::Failed(_)));
         if let Some(head) = cut.waits_for.clone() {
             // Workers that stopped at the limit may scan below the new head.
             let mut all = self.lock();
@@ -1221,11 +1332,10 @@ impl<'a> Engine<'a> {
         } else {
             drop(state);
         }
-        // In walk order the calling thread follows what the sequencers make.
-        // In completion order it takes parts, and a worker that builds one
-        // tells it. It then needs to hear of a sequencer only that the last
-        // one is done. Every needless wake-up takes a processor from a worker.
-        if done || self.options.order == PartOrder::Walk {
+        // A built part wakes the sink itself. Sequencing only needs another
+        // wakeup when it closes a node, publishes an error, or exposes a
+        // child whose parts may already have been built.
+        if notify {
             self.announce();
         }
     }
@@ -1323,7 +1433,7 @@ impl<'a> Engine<'a> {
 
     fn fail(&self, state: &mut NodeState, report: Report<WalkError>) -> bool {
         match self.options.order {
-            PartOrder::Walk => state.slots.push(Slot::Failed(Some(report))),
+            PartOrder::Walk => state.slots.push_back(Slot::Failed(Some(report))),
             PartOrder::Completion => self.lock().built.push_back(Err(report)),
         }
         true
@@ -1369,7 +1479,9 @@ impl<'a> Engine<'a> {
             // The parent's sequencer has not come this far. The part keeps
             // its place, and is planned when the pending rows come.
             let number = self.planned.fetch_add(1, Ordering::Relaxed);
-            state.slots.push(Slot::Part(number));
+            if self.options.order == PartOrder::Walk {
+                state.slots.push_back(Slot::Part(number));
+            }
             cut.first = Some((number, group));
         }
     }
@@ -1380,7 +1492,9 @@ impl<'a> Engine<'a> {
             return;
         }
         let number = self.planned.fetch_add(1, Ordering::Relaxed);
-        state.slots.push(Slot::Part(number));
+        if self.options.order == PartOrder::Walk {
+            state.slots.push_back(Slot::Part(number));
+        }
         self.plan(number, Plan { stem, pieces });
     }
 
@@ -1414,7 +1528,9 @@ impl<'a> Engine<'a> {
             pending
         };
         push_row(&mut pending.pieces, rows, index, node.depth);
-        state.slots.push(Slot::Child(Arc::clone(child)));
+        if self.options.order == PartOrder::Walk {
+            state.slots.push_back(Slot::Child(Arc::clone(child)));
+        }
 
         // The child's lock inside the parent's: the way down. Nothing takes
         // two node locks on the way up.
@@ -1477,12 +1593,14 @@ fn node_below(parent: &Arc<Node>, place: Place, rows: &Rows, index: usize) -> Ar
         unreachable!("the caller gives a directory");
     };
     Arc::new(Node {
-        parent: Some((Arc::clone(parent), place)),
         key: key_below(&parent.key, listed, true),
         path: job_path(&parent.path, rows, item),
         depth: parent.depth + 1,
         row_bytes: row_estimate(rows, item),
-        state: Mutex::default(),
+        state: Mutex::new(NodeState {
+            parent: Some((Arc::clone(parent), place)),
+            ..NodeState::default()
+        }),
     })
 }
 
@@ -1490,10 +1608,18 @@ fn node_below(parent: &Arc<Node>, place: Place, rows: &Rows, index: usize) -> Ar
 // could not read is the last one's, since `deep` stops there.
 fn shared(found: Finding, scans: Vec<Added>) -> Vec<Scanned> {
     let (rows, errors, unreadable, next) = found.into_rows();
-    let mut scans: Vec<Scanned> = scans
+    let mut scans = shared_rows(&rows, scans);
+    if let Some(last) = scans.last_mut() {
+        (last.errors, last.unreadable, last.next) = (errors, unreadable, next);
+    }
+    scans
+}
+
+fn shared_rows(rows: &Arc<Rows>, scans: Vec<Added>) -> Vec<Scanned> {
+    scans
         .into_iter()
         .map(|added| Scanned {
-            rows: Arc::clone(&rows),
+            rows: Arc::clone(rows),
             items: added.items,
             bytes: added.bytes,
             count: added.count,
@@ -1501,11 +1627,7 @@ fn shared(found: Finding, scans: Vec<Added>) -> Vec<Scanned> {
             unreadable: None,
             next: None,
         })
-        .collect();
-    if let Some(last) = scans.last_mut() {
-        (last.errors, last.unreadable, last.next) = (errors, unreadable, next);
-    }
-    scans
+        .collect()
 }
 
 fn joined(directory: &str, name: &str) -> String {
@@ -1563,5 +1685,78 @@ impl Drop for BrokenOnPanic<'_, '_> {
         drop(state);
         self.0.ready.notify_all();
         self.0.work.notify_all();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_ROOT: std::cell::RefCell<std::sync::Weak<Node>> = const { std::cell::RefCell::new(std::sync::Weak::new()) };
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn completed_walk_releases_root_node() {
+        let _files = crate::walk::FILE_TEST.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("tarseer-lifetime-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        std::fs::write(root.join("child/a"), b"a").unwrap();
+        std::fs::write(root.join("child/b"), b"b").unwrap();
+        let mut retained = 0;
+        for (budget, order) in [
+            (4096, PartOrder::Walk),
+            (4096, PartOrder::Completion),
+            (64, PartOrder::Walk),
+            (64, PartOrder::Completion),
+        ] {
+            let options = WalkOptions {
+                budget,
+                threads: 1,
+                order,
+                ..WalkOptions::default()
+            };
+            let mut entries = 0;
+            crate::walk_parts(&root, &options, &mut |part| {
+                entries += part.len();
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(entries, 3);
+            LAST_ROOT.with(|slot| {
+                let weak = slot.borrow();
+                eprintln!(
+                    "budget={budget}, order={order:?}, root strong references after return={}",
+                    weak.strong_count()
+                );
+                retained += usize::from(weak.upgrade().is_some());
+            });
+        }
+        for order in [PartOrder::Walk, PartOrder::Completion] {
+            for fail_sink in [false, true] {
+                let cancel = AtomicBool::new(false);
+                let options = WalkOptions {
+                    budget: 64,
+                    threads: 2,
+                    order,
+                    cancel: Some(&cancel),
+                    ..WalkOptions::default()
+                };
+                let result = crate::walk_parts(&root, &options, &mut |_| {
+                    if fail_sink {
+                        Err(Report::new(WalkError))
+                    } else {
+                        cancel.store(true, Ordering::Relaxed);
+                        Ok(())
+                    }
+                });
+                assert!(result.is_err());
+                LAST_ROOT.with(|slot| retained += usize::from(slot.borrow().upgrade().is_some()));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            retained, 0,
+            "finished walks retain their roots through strong reference cycles"
+        );
     }
 }

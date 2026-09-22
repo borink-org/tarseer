@@ -16,8 +16,8 @@ doc = false
 tarseer = { path = "..", version = "0.0.1" }
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
 error-stack = "0.8"
-# The binary's global allocator; the library sets none. Git until it is
-# published.
+# Keep the existing allocator on platforms not covered by the Linux measurements.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
 cyo-mimalloc = { git = "https://github.com/cyo-alloc/mimalloc" }
 
 [lints]

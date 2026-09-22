@@ -67,6 +67,39 @@ fn the_parts_are_the_same_with_any_number_of_threads() {
     }
 }
 
+#[test]
+fn continuations_across_small_subtrees_preserve_the_parts() {
+    let fixture = TempDir::new("threads-continuations");
+    for index in (0..160).rev() {
+        let directory = fixture.path().join(format!("d{index:03}"));
+        fs::create_dir_all(directory.join("empty")).unwrap();
+        for file in 0..index % 7 {
+            fs::write(directory.join(format!("f{file}")), b"row").unwrap();
+        }
+        if index % 11 == 0 {
+            fs::create_dir_all(directory.join("nested/child")).unwrap();
+            fs::write(directory.join("nested/child/file"), b"deep").unwrap();
+        }
+    }
+    for budget in [1, 83, 300, 64 << 10, tarseer::DEFAULT_BUDGET] {
+        let want = parts(fixture.path(), &options(budget, 0));
+        for threads in [1, 2, 8] {
+            assert_eq!(parts(fixture.path(), &options(budget, threads)), want);
+            let mut completed = parts(
+                fixture.path(),
+                &WalkOptions {
+                    order: PartOrder::Completion,
+                    ..options(budget, threads)
+                },
+            );
+            let mut sorted = want.clone();
+            completed.sort();
+            sorted.sort();
+            assert_eq!(completed, sorted);
+        }
+    }
+}
+
 // Threads take a subtree that fits a part as one piece, where a walk without
 // them visits every row. Many budgets put the cuts in many places, among them
 // right after an empty directory, which is a subtree with no rows.

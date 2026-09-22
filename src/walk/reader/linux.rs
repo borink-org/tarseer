@@ -127,6 +127,7 @@ impl Directory {
     }
 
     /// Reads the metadata of `listed`, without following a symlink.
+    #[inline]
     pub fn stat(&self, listed: &Listed, listing: &Listing) -> io::Result<Stat> {
         let name = c_name(listed, listing.names());
         let stat = rustix::fs::statx(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW, WANTED)?;
@@ -134,6 +135,7 @@ impl Directory {
     }
 
     /// Reads the metadata of this directory.
+    #[inline]
     pub fn stat_self(&self) -> io::Result<Stat> {
         let stat = rustix::fs::statx(&self.fd, c"", AtFlags::EMPTY_PATH, WANTED)?;
         converted(&stat)
@@ -166,6 +168,7 @@ fn kind_of(file_type: FileType) -> Kind {
 // `statx` says in `stx_mask` which fields it filled, and a filesystem may fill
 // fewer than were asked for. Reading a size that was not filled would record
 // the file as empty.
+#[inline]
 fn converted(stat: &Statx) -> io::Result<Stat> {
     if stat.stx_mask & WANTED.bits() != WANTED.bits() {
         return Err(io::Error::other(

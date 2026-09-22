@@ -73,8 +73,14 @@
 //! inside it.
 //!
 //! With threads, the limit is on the rows that have been read and not yet
-//! given to the sink. It is about two budgets, and 2,048 rows for each thread. At
-//! the limit the threads read only what the next part in walk order needs.
+//! given to the sink. The soft window uses 64 bytes per row: two budgets,
+//! converted to rows, plus 2,048 rows for each thread. Active scans may
+//! overshoot this window. It is not an exact heap-byte limit: names, targets,
+//! directory listings and scratch buffers have their own storage costs.
+//! At the limit the threads read only what output needs to make progress.
+//! This progress allowance stops while the sink is executing. Delivered
+//! sequencing slots are discarded, so their count does not grow with the
+//! number of parts already emitted.
 //!
 //! On Linux the walk keeps some of the directories it is about to read open,
 //! at most 128. When the process runs out of file descriptors, the walk closes
@@ -94,6 +100,10 @@ use error_stack::{Report, ResultExt as _};
 use crate::manifest::{EntryKind, TreePart};
 
 mod assemble;
+// The descriptor exhaustion test changes a process-wide resource limit.
+#[cfg(test)]
+static FILE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 mod engine;
 mod reader;
 mod scan;
@@ -448,8 +458,7 @@ pub fn walk_parts(
         return Ok(walker.skips);
     }
 
-    // What the waiting jobs may hold, and a few for each thread at work.
-    reader::reserve_handles(scan::MAX_HELD + 4 * options.threads + 64);
+    reserve_walk_handles(options.threads);
     let engine = Engine::new(&scanner, options, root);
     std::thread::scope(|scope| {
         // Closed on every way out, so that the scope can join the workers.
@@ -460,6 +469,13 @@ pub fn walk_parts(
         engine.run(sink)?;
         Ok(engine.skips())
     })
+}
+
+// Reserve before starting any threads that will coexist with the walk,
+// including encoders. Growing Linux's descriptor table with threads alive
+// can wait for an RCU grace period.
+pub(crate) fn reserve_walk_handles(threads: usize) {
+    reader::reserve_handles(scan::MAX_HELD + 4 * threads + 64);
 }
 
 struct CloseOnDrop<'e, 'a>(&'e Engine<'a>);

@@ -592,9 +592,20 @@ impl Scanner<'_> {
         if end < listed.listing.entries.len() {
             found.scanned.next = Some(end);
         }
+        // With no filter and a validated, copied name block, regular files
+        // need only their metadata. Decide this once for the scan, rather
+        // than construct an Offered value and copy its optional Stat per row.
+        let files_at = listed.names_at.filter(|_| self.filter.is_none());
         for place in start..end {
             let failed = found.scanned.errors.len();
-            if let Err(error) = self.entry(listed, place, found) {
+            let entry = &listed.listing.entries[place];
+            let result = if let Some(at) = files_at.filter(|_| entry.kind == Kind::File) {
+                Self::file(listed, entry, at, &mut found.scanned);
+                Ok(())
+            } else {
+                self.entry(listed, place, found)
+            };
+            if let Err(error) = result {
                 found.scanned.failed(None, "listing", error);
             }
             // Under `Fail` the walk stops at the first failure, so nothing
@@ -602,6 +613,28 @@ impl Scanner<'_> {
             if self.on_error == OnError::Fail && found.scanned.errors.len() > failed {
                 break;
             }
+        }
+    }
+
+    #[inline]
+    fn file(within: &Within<'_>, listed: &Listed, at: u32, scanned: &mut Reading) {
+        let (offset, len) = listed.span();
+        let name = Span {
+            start: at + offset,
+            len,
+        };
+        match within.directory.stat(listed, within.listing) {
+            Ok(stat) => {
+                scanned.items.push(Item::File {
+                    name,
+                    size: stat.size,
+                    mtime: stat.mtime,
+                    mode: stat.mode,
+                });
+                scanned.bytes += estimate(EntryKind::File, "", "") + u64::from(len);
+                scanned.count += 1;
+            }
+            Err(error) => scanned.failed(Some(name), "metadata", error),
         }
     }
 
@@ -833,8 +866,8 @@ pub(super) fn key_below(key: &[u32], place: usize, subdirectory: bool) -> Box<[u
     below.into_boxed_slice()
 }
 
-// Lowers the descriptor limit of the whole test process, so it is the only
-// unit test of this crate that opens files.
+// Lowers the descriptor limit of the whole test process. File-opening unit
+// tests share FILE_TEST so none observes that temporary limit.
 #[cfg(all(test, target_os = "linux", not(tarseer_portable_reader)))]
 mod tests {
     use std::fs::{self, File};
@@ -845,6 +878,7 @@ mod tests {
 
     #[test]
     fn a_scan_with_no_descriptor_left_asks_for_a_release_and_goes_on() {
+        let _files = crate::walk::FILE_TEST.lock().unwrap();
         let root = std::env::temp_dir().join(format!("tarseer-scan-{}", std::process::id()));
         fs::create_dir_all(root.join("inner")).unwrap();
         fs::write(root.join("file"), b"x").unwrap();
