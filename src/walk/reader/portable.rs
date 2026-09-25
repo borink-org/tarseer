@@ -6,13 +6,14 @@ use std::fs::{self, DirEntry, FileType, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{Kind, Listed, Listing, Stat};
+use super::{Kind, Listed, Listing, Spare, Stat};
 use crate::manifest::Timestamp;
 
 /// This reader needs no buffer of its own.
 #[derive(Default)]
 pub struct Scratch {
-    _nothing: (),
+    /// See [`Spare`].
+    pub spare: Spare,
 }
 
 #[derive(Default)]
@@ -25,16 +26,18 @@ pub struct Directory {
     path: PathBuf,
 }
 
-// The methods share the unix reader's signatures, which read through the
+// The methods share the linux reader's signatures, which read through the
 // open directory.
 #[allow(clippy::unused_self)]
 impl Directory {
-    /// Whether [`Directory::stat_self`] is cheaper than [`Directory::stat`]
-    /// on the parent.
-    pub const STATS_ITSELF: bool = false;
+    /// Whether the walk reads a directory's metadata from the directory itself
+    /// and not from its parent's listing. On Windows the listing holds a copy
+    /// that the filesystem updates late, so a directory that was just written
+    /// into shows an old mtime there.
+    pub const STATS_ITSELF: bool = cfg!(windows);
 
     /// Opens the root of a walk. A root that is a symlink is followed.
-    // The signature is the unix reader's, which can fail here.
+    // The signature is the linux reader's, which can fail here.
     #[allow(clippy::unnecessary_wraps)]
     pub fn open_root(root: &Path) -> io::Result<Self> {
         Ok(Self {
@@ -57,8 +60,8 @@ impl Directory {
     }
 
     /// Reads and sorts the directory's entries.
-    pub fn list(&self, _: &mut Scratch) -> io::Result<Listing> {
-        let mut listing = Listing::default();
+    pub fn list(&self, scratch: &mut Scratch) -> io::Result<Listing> {
+        let mut listing = Listing::from_spare(&mut scratch.spare);
         for entry in fs::read_dir(&self.path)? {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -79,13 +82,13 @@ impl Directory {
             let slot = listing.held.entries.len();
             let listed = match name.to_str() {
                 Some(name) => Listed::new(
-                    &mut listing.names,
+                    listing.names_mut(),
                     name.as_bytes(),
                     kind_of(file_type),
                     slot,
                 ),
                 None => Listed::new(
-                    &mut listing.names,
+                    listing.names_mut(),
                     name.to_string_lossy().as_bytes(),
                     Kind::NonUtf8,
                     slot,
@@ -136,6 +139,7 @@ fn kind_of(file_type: FileType) -> Kind {
 }
 
 // Whether a symlink is a directory link. Only Windows has the distinction.
+#[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
 fn symlink_is_directory(file_type: FileType) -> Option<bool> {
     #[cfg(windows)]
     {
