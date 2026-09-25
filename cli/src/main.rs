@@ -18,6 +18,16 @@ use tarseer::{DEFAULT_BUDGET, Metadata, Skips, WalkError, WalkOptions, WriteErro
 static GLOBAL: cyo_mimalloc::MiMalloc = cyo_mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
+    // Where memory is not overcommitted (Windows), mimalloc commits each page
+    // whole, 4 MiB for blocks over 84 KiB, and growing buffers take one per
+    // size class per thread; committing on demand charges what is touched.
+    // Before the first walk thread, and only if the environment does not say.
+    if std::env::var_os("MIMALLOC_PAGE_COMMIT_ON_DEMAND").is_none() {
+        cyo_mimalloc::MiMalloc::option_set(
+            cyo_mimalloc::mi_option_t::mi_option_page_commit_on_demand,
+            2,
+        );
+    }
     let matches = Command::new("tarseer")
         .about("Walk a directory tree into parts: JSON lines on stdout, or the same lines as a zstd file")
         .version(env!("CARGO_PKG_VERSION"))
