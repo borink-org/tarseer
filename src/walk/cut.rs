@@ -1,6 +1,8 @@
 // Cutting: the walk in walk order, which decides where parts end. It runs on
 // the calling thread. Without threads it reads each directory itself when it
 // comes to it.
+// With threads it takes what the workers of a `Pool` have read ahead, and the
+// workers build the parts it plans.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -10,6 +12,7 @@ use std::sync::atomic::Ordering;
 use error_stack::{Report, ResultExt as _};
 
 use super::assemble::{Piece, Plan, Segment, Subtree};
+use super::pool::{Event, Pool, Slot};
 use super::reader::Scratch;
 use super::scan::{Item, Job, Scanned, Scanner, joined};
 use super::{Cancelled, OnError, WalkError, WalkOptions, estimate};
@@ -30,7 +33,6 @@ pub(super) enum Unit {
     /// A directory whose subtree, with its own row, fits a part, read to its
     /// end: the scans of its directories in walk order, its own first, and the
     /// estimate and number of the rows below it.
-    #[allow(dead_code)]
     Whole {
         scans: Vec<Scanned>,
         bytes: u64,
@@ -42,6 +44,10 @@ pub(super) enum Unit {
 pub(super) enum Next {
     /// Nothing has read it: the walk reads it when it comes to it.
     Job(Job),
+    /// A worker reads it, or has.
+    Slot(Arc<Slot>),
+    /// Read with its parent.
+    Ready(Box<Unit>),
 }
 
 // An open directory. Row positions are absolute: the first row of the walk is
@@ -74,6 +80,7 @@ struct Level {
 pub(super) struct Walker<'w> {
     options: &'w WalkOptions<'w>,
     scanner: &'w Scanner<'w>,
+    pool: Option<&'w Pool<'w>>,
     sink: &'w mut Sink<'w>,
     // The rows that are not in a part yet, in walk order. The walk keeps where
     // they are and never copies them.
@@ -91,17 +98,22 @@ pub(super) struct Walker<'w> {
     // the outer levels' first.
     completed: Vec<(usize, u64)>,
     scratch: Scratch,
+    // Parts planned and parts given to the sink.
+    planned: usize,
+    delivered: usize,
 }
 
 impl<'w> Walker<'w> {
     pub fn new(
         options: &'w WalkOptions<'w>,
         scanner: &'w Scanner<'w>,
+        pool: Option<&'w Pool<'w>>,
         sink: &'w mut Sink<'w>,
     ) -> Self {
         Self {
             options,
             scanner,
+            pool,
             sink,
             waiting: VecDeque::new(),
             base: 0,
@@ -112,11 +124,16 @@ impl<'w> Walker<'w> {
             measuring: 1,
             completed: Vec::new(),
             scratch: Scratch::default(),
+            planned: 0,
+            delivered: 0,
         }
     }
 
     pub fn run(&mut self, root: &Path) -> Result<(), Report<WalkError>> {
-        let first = Next::Job(Job::root());
+        let first = match self.pool {
+            Some(pool) => Next::Slot(pool.root()),
+            None => Next::Job(Job::root()),
+        };
         let Unit::Dir {
             mut scanned,
             subdirs,
@@ -165,6 +182,10 @@ impl<'w> Walker<'w> {
                 return Err(Report::new(Cancelled).change_context(WalkError));
             }
             self.visit(index)?;
+        }
+        // Every part that is planned goes to the sink before the walk ends.
+        while self.delivered < self.planned {
+            self.wait(None)?;
         }
         Ok(())
     }
@@ -287,9 +308,14 @@ impl<'w> Walker<'w> {
     }
 
     // The unit of `next`, from wherever it comes.
-    #[allow(irrefutable_let_patterns, clippy::unnecessary_wraps)]
     fn take(&mut self, next: Next) -> Result<Unit, Report<WalkError>> {
         match next {
+            Next::Ready(unit) => Ok(*unit),
+            Next::Slot(slot) => loop {
+                if let Some(unit) = self.wait(Some(&slot))? {
+                    return Ok(unit);
+                }
+            },
             Next::Job(job) => {
                 let scanner = self.scanner;
                 let stack = &mut self.stack;
@@ -315,6 +341,40 @@ impl<'w> Walker<'w> {
                 })
             }
         }
+    }
+
+    // Waits for `slot` to be filled, or with no slot for the next part, and
+    // gives the sink each part that is ready meanwhile. Returns the unit once
+    // it is there.
+    fn wait(&mut self, slot: Option<&Arc<Slot>>) -> Result<Option<Unit>, Report<WalkError>> {
+        let pool = self.pool.expect("only a walk with threads waits");
+        match pool.wait(slot, self.delivered, self.measuring) {
+            Event::Unit(unit) => Ok(Some(unit)),
+            Event::Part(built) => {
+                self.deliver(pool, built)?;
+                Ok(None)
+            }
+            // Raising the flag wakes nobody, so a wait looks at it now and then.
+            Event::Nothing => match self.options.cancel {
+                Some(cancel) if cancel.load(Ordering::Relaxed) => {
+                    Err(Report::new(Cancelled).change_context(WalkError))
+                }
+                _ => Ok(None),
+            },
+        }
+    }
+
+    fn deliver(
+        &mut self,
+        pool: &Pool<'_>,
+        built: Result<TreePart, Report<WalkError>>,
+    ) -> Result<(), Report<WalkError>> {
+        let part = built?;
+        let rows = part.len();
+        self.delivered += 1;
+        (self.sink)(part)?;
+        pool.delivered(rows);
+        Ok(())
     }
 
     // Replaces the scan of the top level, which the walk has used up, with
@@ -506,6 +566,15 @@ impl<'w> Walker<'w> {
         }
         self.base = end;
         let plan = Plan { stem, pieces };
-        (self.sink)(plan.assemble().change_context(WalkError)?)
+        let Some(pool) = self.pool else {
+            return (self.sink)(plan.assemble().change_context(WalkError)?);
+        };
+        pool.plan(self.planned, plan);
+        self.planned += 1;
+        // The parts built by now go to the sink before more are planned.
+        while let Some(built) = pool.built(self.delivered) {
+            self.deliver(pool, built)?;
+        }
+        Ok(())
     }
 }

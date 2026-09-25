@@ -16,6 +16,9 @@ pub struct Scratch {
     pub spare: Spare,
 }
 
+/// This reader holds no descriptors of its own.
+pub fn reserve_handles(_: usize) {}
+
 #[derive(Default)]
 pub struct Held {
     entries: Vec<DirEntry>,
@@ -220,3 +223,24 @@ fn mode_of(metadata: &Metadata) -> u32 {
         }
     }
 }
+
+/// What the process has used. Not measured here, so no worker is added.
+pub struct Usage;
+
+impl Usage {
+    /// Whether [`Usage::sample`] measures anything.
+    pub const MEASURED: bool = false;
+
+    pub fn new() -> Self {
+        Self
+    }
+
+    // The signature is the linux reader's, which reads a file here.
+    #[allow(clippy::unused_self)]
+    pub fn sample(&mut self) -> (std::time::Duration, Option<u64>) {
+        (std::time::Duration::ZERO, None)
+    }
+}
+
+/// Does nothing here.
+pub fn pin(_worker: usize) {}
