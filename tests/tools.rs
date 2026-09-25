@@ -190,5 +190,7 @@ fn jq_turns_the_columns_of_a_part_into_rows() {
     for row in &part.files {
         writeln!(want, "{}\t{}", part.text(row.name), row.size).unwrap();
     }
-    assert_eq!(String::from_utf8(printed).unwrap(), want);
+    // `jq` ends its lines as the platform does.
+    let printed = String::from_utf8(printed).unwrap().replace("\r\n", "\n");
+    assert_eq!(printed, want);
 }

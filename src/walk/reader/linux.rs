@@ -49,6 +49,9 @@ impl Directory {
     /// and not from its parent's listing. Here that saves the kernel a lookup.
     pub const STATS_ITSELF: bool = true;
 
+    /// Whether a value of this type keeps a file descriptor open.
+    pub const HOLDS_A_HANDLE: bool = true;
+
     /// Opens the root of a walk. A root that is a symlink is followed.
     pub fn open_root(root: &Path) -> io::Result<Self> {
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
@@ -62,6 +65,21 @@ impl Directory {
         let name = c_name(listed, listing.names());
         let fd = rustix::fs::openat(&self.fd, name, flags, Mode::empty())?;
         Ok(Self { fd })
+    }
+
+    /// Opens the directory `name` inside this one, to read the metadata of
+    /// what it holds, and not to list it: `O_PATH` skips the rest of an open.
+    pub fn open_name(&self, name: &str) -> io::Result<Self> {
+        let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+        let fd = rustix::fs::openat(&self.fd, name, flags, Mode::empty())?;
+        Ok(Self { fd })
+    }
+
+    /// Reads the metadata of `name` inside this directory, without following
+    /// a symlink.
+    pub fn stat_name(&self, name: &str) -> io::Result<Stat> {
+        let stat = rustix::fs::statx(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW, WANTED)?;
+        converted(&stat)
     }
 
     /// Returns `true` if `error` says the process has no descriptor left.
@@ -122,6 +140,12 @@ impl Directory {
         let target = rustix::fs::readlinkat(&self.fd, name, Vec::new())?;
         Ok(target.into_string().ok())
     }
+}
+
+/// Reads the metadata of the file `fd` is open on, without a lookup.
+pub fn stat_fd(fd: rustix::fd::BorrowedFd<'_>) -> io::Result<Stat> {
+    let stat = rustix::fs::statx(fd, c"", AtFlags::EMPTY_PATH, WANTED)?;
+    converted(&stat)
 }
 
 fn c_name<'n>(listed: &Listed, names: &'n [u8]) -> &'n CStr {

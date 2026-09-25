@@ -179,8 +179,7 @@ impl Codec for Zstd {
 
 impl Encoder for ZstdEncoder {
     fn encode(&mut self, raw: &[u8], frame: &mut Vec<u8>) -> Result<(), Report<WriteError>> {
-        frame.clear();
-        frame.reserve(zstd_safe::compress_bound(raw.len()));
+        crate::frames::room(frame, zstd_safe::compress_bound(raw.len()));
         // Resets the session, keeps the parameters and the allocated tables.
         self.0
             .compress2(frame, raw)
