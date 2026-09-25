@@ -515,7 +515,7 @@ impl Walker<'_, '_> {
         let parent_len = self.stack[level].path_len;
         self.path.truncate(parent_len);
 
-        let name = listed.name(&listing.names);
+        let name = listed.name(listing.names());
         let name = match std::str::from_utf8(name) {
             Ok(name) if listed.kind != Kind::NonUtf8 => name,
             Ok(lossy) => {
@@ -558,7 +558,7 @@ impl Walker<'_, '_> {
                 kind,
                 listing: Listing {
                     entries: &listing.entries,
-                    names: &listing.names,
+                    names: listing.names(),
                 },
             };
             if !filter.keep(&candidate) {
