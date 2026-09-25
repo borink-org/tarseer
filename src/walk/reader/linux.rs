@@ -39,6 +39,27 @@ impl Default for Scratch {
 #[derive(Default)]
 pub struct Held;
 
+/// Makes the process's table of descriptors large enough for `handles` more,
+/// before the walk starts its threads.
+///
+/// The kernel grows that table when a descriptor does not fit. In a process
+/// with threads it first waits for every processor to pass a quiet point.
+/// That is several milliseconds each time, inside an `openat`. A walk that
+/// holds directories open crosses 64, 128 and 256. With one thread the kernel
+/// does not wait.
+pub fn reserve_handles(handles: usize) {
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC;
+    let Ok(any) = rustix::fs::open("/", flags | OFlags::DIRECTORY, Mode::empty()) else {
+        return;
+    };
+    let Ok(least) = i32::try_from(handles) else {
+        return;
+    };
+    // A descriptor at `least` or above makes the table that large. It may be
+    // refused, by a limit on descriptors below that. The walk works without.
+    drop(rustix::io::fcntl_dupfd_cloexec(&any, least));
+}
+
 /// An open directory.
 pub struct Directory {
     fd: OwnedFd,
@@ -183,4 +204,66 @@ fn converted(stat: &Statx) -> io::Result<Stat> {
         }),
         mode: u32::from(stat.stx_mode) & 0o7777,
     })
+}
+
+/// What the process has used so far: CPU time over all its threads, and bytes
+/// read from storage.
+pub struct Usage {
+    io: Option<OwnedFd>,
+    text: Vec<u8>,
+}
+
+impl Usage {
+    /// Whether [`Usage::sample`] measures anything.
+    pub const MEASURED: bool = true;
+
+    pub fn new() -> Self {
+        let flags = OFlags::RDONLY | OFlags::CLOEXEC;
+        Self {
+            io: rustix::fs::open("/proc/self/io", flags, Mode::empty()).ok(),
+            text: vec![0; 512],
+        }
+    }
+
+    /// The CPU time, and the bytes read from storage if the kernel says.
+    pub fn sample(&mut self) -> (std::time::Duration, Option<u64>) {
+        let time = rustix::time::clock_gettime(rustix::time::ClockId::ProcessCPUTime);
+        let cpu = std::time::Duration::new(
+            u64::try_from(time.tv_sec).unwrap_or(0),
+            u32::try_from(time.tv_nsec).unwrap_or(0),
+        );
+        (cpu, self.read_bytes())
+    }
+
+    fn read_bytes(&mut self) -> Option<u64> {
+        let io = self.io.as_ref()?;
+        let read = rustix::io::pread(io, &mut self.text, 0).ok()?;
+        let text = std::str::from_utf8(&self.text[..read]).ok()?;
+        let line = text.lines().find(|line| line.starts_with("read_bytes:"))?;
+        line["read_bytes:".len()..].trim().parse().ok()
+    }
+}
+
+/// Keeps the calling thread on one processor of those the process may use,
+/// the `worker`th of them, so that what it last used stays in that
+/// processor's caches.
+pub fn pin(worker: usize) {
+    use rustix::thread::{CpuSet, sched_getaffinity, sched_setaffinity};
+    let Ok(allowed) = sched_getaffinity(None) else {
+        return;
+    };
+    let count = allowed.count() as usize;
+    if count == 0 {
+        return;
+    }
+    let Some(cpu) = (0..CpuSet::MAX_CPU)
+        .filter(|&cpu| allowed.is_set(cpu))
+        .nth(worker % count)
+    else {
+        return;
+    };
+    let mut one = CpuSet::new();
+    one.set(cpu);
+    // A thread that cannot be pinned walks all the same.
+    let _ = sched_setaffinity(None, &one);
 }

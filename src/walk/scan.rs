@@ -191,8 +191,10 @@ pub(super) enum Item {
         directory: Option<bool>,
     },
     /// The nth directory of a scan belongs to the nth job the scan returned.
+    /// `place` is where the listing has it, which its job's key is made of.
     Directory {
         name: Span,
+        place: usize,
         mtime: Option<Timestamp>,
         mode: u32,
     },
@@ -249,6 +251,11 @@ pub(super) struct Spares(Mutex<Vec<(String, Vec<Item>)>>);
 
 impl Spares {
     const KEPT: usize = 16;
+    // The items and bytes of text of one block, and the room a scan needs: at
+    // most `CHUNK` items, and names that are rarely longer than this.
+    const ITEMS: usize = 4 * CHUNK;
+    const TEXT: usize = 256 << 10;
+    const TEXT_ROOM: usize = 32 << 10;
 
     fn keep(&self, mut text: String, mut items: Vec<Item>) {
         text.clear();
@@ -388,7 +395,6 @@ struct Offered<'l> {
 }
 
 /// What one scan added to a [`Finding`] that takes several.
-#[allow(dead_code)]
 pub(super) struct Added {
     /// The scan's items, by their places in the rows.
     pub items: std::ops::Range<usize>,
@@ -400,6 +406,70 @@ pub(super) struct Added {
 }
 
 impl Finding {
+    /// An empty finding in buffers that `spares` kept, if it has any, and
+    /// whose rows give their buffers back to it.
+    pub fn from_spares(spares: &Arc<Spares>) -> Self {
+        let kept = spares
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let (text, items) = kept.unwrap_or_default();
+        Self {
+            scanned: Reading {
+                text,
+                items,
+                ..Reading::default()
+            },
+            spares: Some(Arc::clone(spares)),
+            ..Self::default()
+        }
+    }
+
+    /// The items found so far, and the text their spans name.
+    pub fn items(&self) -> &[Item] {
+        &self.scanned.items
+    }
+
+    /// Whether another scan fits in this block.
+    pub fn has_room(&self) -> bool {
+        let Reading { text, items, .. } = &self.scanned;
+        items.is_empty()
+            || (items.len() + CHUNK <= Spares::ITEMS
+                && text.len() + Spares::TEXT_ROOM <= Spares::TEXT)
+    }
+
+    pub fn text(&self) -> &str {
+        &self.scanned.text
+    }
+
+    /// Ends a finding that took several scans. Returns their rows, and what
+    /// the last scan could not read. Only the last can have that: the caller
+    /// stops at a scan that is not plain.
+    pub fn into_rows(
+        self,
+    ) -> (
+        Arc<Rows>,
+        Vec<Option<io::Error>>,
+        Option<io::Error>,
+        Option<usize>,
+    ) {
+        let Reading {
+            text,
+            items,
+            errors,
+            unreadable,
+            next,
+            ..
+        } = self.scanned;
+        let rows = Rows {
+            text,
+            items,
+            spares: self.spares,
+        };
+        (Arc::new(rows), errors, unreadable, next)
+    }
+
     fn finish(self) -> Found {
         let Reading {
             text,
@@ -955,6 +1025,7 @@ impl<'a> Scanner<'a> {
                 scanned.row(EntryKind::Directory, name, "");
                 scanned.items.push(Item::Directory {
                     name: name_span,
+                    place,
                     mtime: stat.mtime,
                     mode: stat.mode,
                 });

@@ -48,6 +48,38 @@
 //! Where a cut falls depends only on the tree, the filter and the budget,
 //! never on how the walk was scheduled.
 //!
+//! # Threads
+//!
+//! With [`WalkOptions::threads`] above 0, that many threads read directories
+//! ahead of the walk, and the parts are the same as without threads, row for
+//! row.
+//!
+//! 1. The threads read directories several at once, first those that come
+//!    first in walk order. A directory of more than 1,024 entries, or of more
+//!    than 64 subdirectories, is read in pieces, which several threads read
+//!    too, and open the subdirectories of.
+//! 2. While every thread is busy, a thread goes on into the subdirectories it
+//!    finds. A subtree that it reads to its end, and that fits a part, is taken
+//!    in as one piece, without a look at its rows.
+//! 3. The calling thread cuts the parts, as it does without threads, from what
+//!    the threads have read, and gives them to the sink in walk order.
+//! 4. The threads build the parts.
+//!
+//! On Linux the walk adds threads while its threads wait on storage, up to
+//! [`WalkOptions::max_threads`]. Every 2 ms it looks at how much CPU time the
+//! process used and whether it read from storage. It adds threads only while
+//! directories are queued, no thread is idle, and either the process read
+//! from storage without filling its processors or it used less than half of
+//! them, as on a remote filesystem. A walk of a warm cache keeps its
+//! processors busy and reads nothing, so it keeps the threads it started with.
+//! When the walk has at least as many threads as the processors it may use,
+//! each thread keeps to one processor.
+//!
+//! [`Progress`] hears of a directory's entries when the directory is read, and
+//! with threads a [`Filter`] and a [`Progress`] are called from the threads,
+//! several at once and in no particular order. A walk that fails reports the
+//! first entry in walk order that it could not read.
+//!
 //! # Memory
 //!
 //! Without threads, the walk holds the rows that are not yet in a sealed
@@ -57,9 +89,20 @@
 //! larger than that costs the names of its whole listing while the walk is
 //! inside it.
 //!
+//! With threads, the limit is on the rows that have been read and not yet
+//! given to the sink: two budgets at 64 bytes a row, plus 2,048 rows for each
+//! thread. A thread that is reading may pass it by what it reads before it
+//! looks again. It is not a limit on bytes: names, targets, listings and
+//! buffers take their own. At the limit the threads read only the directory
+//! the walk waits for, and what lies below the directory whose size it is
+//! still adding up, one budget more at most.
+//!
 //! On Linux the walk keeps some of the directories it is about to read open,
 //! at most 128. When the process runs out of file descriptors, the walk closes
 //! them. It then opens each by its path when it reads it.
+//! With threads, the walk first makes the process's table of descriptors large
+//! enough for those. The kernel would otherwise grow the table during the walk,
+//! and with threads that stops every one of them for some milliseconds.
 
 use std::fmt;
 use std::path::Path;
@@ -72,6 +115,7 @@ use crate::manifest::{EntryKind, TreePart};
 mod assemble;
 mod cut;
 mod fill;
+mod pool;
 mod reader;
 mod scan;
 
@@ -79,6 +123,7 @@ use self::cut::Walker;
 #[cfg(unix)]
 pub use self::fill::read_file_metadata;
 pub use self::fill::read_metadata;
+use self::pool::Pool;
 use self::reader::{Kind, Listed};
 use self::scan::Scanner;
 
@@ -130,6 +175,9 @@ impl std::error::Error for Cancelled {}
 /// no kinds: there the walk reads the metadata first, to learn the kind. A
 /// refused directory is not listed, so nothing under it is offered or counted.
 /// The filter changes where parts are cut, in the same way that the tree does.
+///
+/// With [`WalkOptions::threads`] above 0, the calls come from those threads,
+/// several at once, and in no particular order between directories.
 pub trait Filter: Send + Sync {
     /// Returns `true` to record `candidate`, or `false` to leave it out.
     fn keep(&self, candidate: &Candidate<'_>) -> bool;
@@ -191,6 +239,8 @@ impl<'a> Listing<'a> {
 /// unless you override it.
 ///
 /// Without threads the calls come in walk order.
+/// With [`WalkOptions::threads`] above 0 they come from those threads, when
+/// a directory is read, several at once and in no particular order.
 pub trait Progress: Send + Sync {
     /// Called before the walk lists the directory at `directory`, which is
     /// empty for the root.
@@ -276,6 +326,14 @@ pub struct WalkOptions<'a> {
     pub on_error: OnError,
     /// What the walk reads of each entry. See [`Metadata`].
     pub metadata: Metadata,
+    /// The number of threads that walk. With 0 the calling thread walks alone.
+    /// The parts are the same either way.
+    pub threads: usize,
+    /// The most threads the walk runs when its threads wait on storage. It
+    /// starts [`threads`](Self::threads) and adds more while those are
+    /// blocked, a cold cache or a remote filesystem, and not while they keep
+    /// their processors busy. 0 means four times `threads`. Linux only.
+    pub max_threads: usize,
 }
 
 impl Default for WalkOptions<'_> {
@@ -287,6 +345,8 @@ impl Default for WalkOptions<'_> {
             cancel: None,
             on_error: OnError::Fail,
             metadata: Metadata::Full,
+            threads: 0,
+            max_threads: 0,
         }
     }
 }
@@ -417,6 +477,107 @@ pub fn walk_parts(
     sink: &mut dyn FnMut(TreePart) -> Result<(), Report<WalkError>>,
 ) -> Result<Skips, Report<WalkError>> {
     let scanner = Scanner::new(root, options);
-    Walker::new(options, &scanner, sink).run(root)?;
-    Ok(scanner.skips())
+    if options.threads == 0 {
+        Walker::new(options, &scanner, None, sink).run(root)?;
+        return Ok(scanner.skips());
+    }
+
+    let most = most_threads(options);
+    reserve_walk_handles(most);
+    let pool = Pool::new(&scanner, options);
+    std::thread::scope(|scope| {
+        // Closed on every way out, so that the scope can join the workers.
+        let _closed = CloseOnDrop(&pool);
+        start_workers(scope, options.threads, most, &pool);
+        Walker::new(options, &scanner, Some(&pool), sink).run(root)?;
+        Ok(scanner.skips())
+    })
+}
+
+/// The most threads a walk with threads may run: [`WalkOptions::max_threads`],
+/// or four times [`WalkOptions::threads`].
+pub(crate) fn most_threads(options: &WalkOptions<'_>) -> usize {
+    if options.max_threads == 0 {
+        options.threads.saturating_mul(4)
+    } else {
+        options.max_threads.max(options.threads)
+    }
+}
+
+// Starts `threads` workers, and the thread that adds more up to `most`.
+fn start_workers<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    threads: usize,
+    most: usize,
+    pool: &'scope Pool<'_>,
+) {
+    // Workers that have every processor to themselves each keep to one,
+    // and find their caches as they left them, which walks of small
+    // directories gain most from. On a machine it shares, a worker must be
+    // free to move away from a busy processor, so fewer are not pinned.
+    let processors = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let pinned = threads >= processors;
+    for worker in 0..threads {
+        scope.spawn(move || {
+            if pinned {
+                reader::pin(worker);
+            }
+            pool.work();
+        });
+    }
+    if most > threads && reader::Usage::MEASURED {
+        scope.spawn(move || add_workers_while_blocked(scope, pool, threads, most));
+    }
+}
+
+// Adds workers while the ones there wait on storage. Scans must be queued
+// with no worker idle, and either the process read from storage and its
+// workers do not fill their processors, or it uses less than half of them,
+// as on a remote filesystem that reads nothing from local storage. On a warm
+// cache neither holds, and no worker is added.
+fn add_workers_while_blocked<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    pool: &'scope Pool<'_>,
+    mut workers: usize,
+    most: usize,
+) {
+    const TICK: std::time::Duration = std::time::Duration::from_millis(2);
+    let processors = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let mut usage = reader::Usage::new();
+    let mut before = (std::time::Instant::now(), usage.sample());
+    while let Some(short) = pool.short_of_workers(TICK) {
+        let now = (std::time::Instant::now(), usage.sample());
+        let elapsed = now.0.duration_since(before.0).as_secs_f64();
+        let busy = (now.1).0.saturating_sub((before.1).0).as_secs_f64() / elapsed;
+        let read = (now.1)
+            .1
+            .zip((before.1).1)
+            .is_some_and(|(now, was)| now > was);
+        before = now;
+        #[allow(clippy::cast_precision_loss)]
+        let processors = workers.min(processors) as f64;
+        let blocked = (read && busy < 0.9 * processors) || busy < 0.5 * processors;
+        if short && blocked && workers < most {
+            let add = (workers / 2).clamp(1, most - workers);
+            for _ in 0..add {
+                scope.spawn(|| pool.work());
+            }
+            workers += add;
+        }
+    }
+}
+
+// Reserve before starting any threads that will coexist with the walk,
+// including encoders. Growing Linux's descriptor table with threads alive
+// can wait for an RCU grace period.
+pub(crate) fn reserve_walk_handles(threads: usize) {
+    reader::reserve_handles(scan::MAX_HELD + 4 * threads + 64);
+}
+
+struct CloseOnDrop<'p, 'a>(&'p Pool<'a>);
+
+impl Drop for CloseOnDrop<'_, '_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }

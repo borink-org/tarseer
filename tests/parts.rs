@@ -129,15 +129,16 @@ fn joined_parts_are_the_plain_recursive_walk_at_every_budget() {
     }
 }
 
-// Checks the walk against the rule at every budget.
+// Checks the walk against the rule at every budget, without threads and with.
 fn cut_by_the_rule(root: &Path, budgets: impl IntoIterator<Item = u64>) {
     let tree = read(root, "");
     for budget in budgets {
         let mut want = Vec::new();
         split(&tree, budget, &mut Vec::new(), &mut want);
-        {
+        for threads in [0, 1, 3, 8] {
             let options = WalkOptions {
                 budget,
+                threads,
                 ..WalkOptions::default()
             };
             let got: Vec<Vec<String>> = walk(root, &options)
@@ -146,7 +147,7 @@ fn cut_by_the_rule(root: &Path, budgets: impl IntoIterator<Item = u64>) {
                 .iter()
                 .map(|part| part.entries().into_iter().map(|(path, _)| path).collect())
                 .collect();
-            assert_eq!(got, want, "budget {budget}");
+            assert_eq!(got, want, "budget {budget}, {threads} threads");
         }
     }
 }

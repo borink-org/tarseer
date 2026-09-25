@@ -88,6 +88,9 @@ struct Entry {
     written: i64,
 }
 
+/// Windows has no limit on handles that a walk comes near.
+pub fn reserve_handles(_: usize) {}
+
 /// An open directory.
 pub struct Directory {
     handle: OwnedHandle,
@@ -543,3 +546,24 @@ fn nt_error(status: NTSTATUS) -> io::Error {
     let code = unsafe { RtlNtStatusToDosError(status) };
     io::Error::from_raw_os_error(code.cast_signed())
 }
+
+/// What the process has used. Not measured here, so no worker is added.
+pub struct Usage;
+
+impl Usage {
+    /// Whether [`Usage::sample`] measures anything.
+    pub const MEASURED: bool = false;
+
+    pub fn new() -> Self {
+        Self
+    }
+
+    // The signature is the linux reader's, which reads a file here.
+    #[allow(clippy::unused_self)]
+    pub fn sample(&mut self) -> (std::time::Duration, Option<u64>) {
+        (std::time::Duration::ZERO, None)
+    }
+}
+
+/// Does nothing here.
+pub fn pin(_worker: usize) {}
