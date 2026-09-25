@@ -6,7 +6,7 @@ mod common;
 use std::fs;
 use std::path::Path;
 
-use common::{recurse, wide_fixture};
+use common::{TempDir, recurse, wide_fixture};
 use tarseer::{EntryKind, WalkOptions, estimate, walk};
 
 // A directory entry as the reference sees it: its estimate, its path, and its
@@ -129,27 +129,56 @@ fn joined_parts_are_the_plain_recursive_walk_at_every_budget() {
     }
 }
 
+// Checks the walk against the rule at every budget, without threads and with.
+fn cut_by_the_rule(root: &Path, budgets: impl IntoIterator<Item = u64>) {
+    let tree = read(root, "");
+    for budget in budgets {
+        let mut want = Vec::new();
+        split(&tree, budget, &mut Vec::new(), &mut want);
+        for threads in [0, 1, 3, 8] {
+            let options = WalkOptions {
+                budget,
+                threads,
+                ..WalkOptions::default()
+            };
+            let got: Vec<Vec<String>> = walk(root, &options)
+                .unwrap()
+                .parts
+                .iter()
+                .map(|part| part.entries().into_iter().map(|(path, _)| path).collect())
+                .collect();
+            assert_eq!(got, want, "budget {budget}, {threads} threads");
+        }
+    }
+}
+
 #[test]
 fn parts_are_cut_exactly_where_the_rule_says() {
     let temp_dir = wide_fixture("rule");
-    let tree = read(temp_dir.path(), "");
+    cut_by_the_rule(temp_dir.path(), BUDGETS);
+}
 
-    for budget in BUDGETS {
-        let mut want = Vec::new();
-        split(&tree, budget, &mut Vec::new(), &mut want);
-
-        let options = WalkOptions {
-            budget,
-            ..WalkOptions::default()
-        };
-        let got: Vec<Vec<String>> = walk(temp_dir.path(), &options)
-            .unwrap()
-            .parts
-            .iter()
-            .map(|part| part.entries().into_iter().map(|(path, _)| path).collect())
-            .collect();
-        assert_eq!(got, want, "budget {budget}");
+// Threads read small subtrees whole, many of them one after another, and hand
+// over those they stop inside of. The cuts must not see the difference.
+#[test]
+fn many_small_subtrees_are_cut_where_the_rule_says() {
+    let temp_dir = TempDir::new("rule-small");
+    for index in 0..300 {
+        let directory = temp_dir.path().join(format!("d{index:03}"));
+        fs::create_dir_all(&directory).unwrap();
+        for file in 0..index % 5 {
+            fs::write(directory.join(format!("f{file}")), b"").unwrap();
+        }
+        if index % 7 == 0 {
+            let below = directory.join(format!("n{index}/m"));
+            fs::create_dir_all(&below).unwrap();
+            fs::write(below.join("leaf"), b"").unwrap();
+        }
     }
+    cut_by_the_rule(
+        temp_dir.path(),
+        [1, 90, 400, 2_000, 9_000, 60_000, u64::MAX],
+    );
 }
 
 #[test]

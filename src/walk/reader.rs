@@ -1,24 +1,48 @@
-// How the walk reads directories. Two readers share one interface: `unix`
+// How the walk reads directories. Two readers share one interface: `linux`
 // asks the kernel directly, and `portable` goes through `std::fs`.
 //
 // A listing keeps every name in one buffer and one small record per entry, so
 // that listing a directory costs no allocation per entry.
 
-use std::cmp::Ordering;
-
 use crate::manifest::Timestamp;
 
-#[cfg(all(unix, not(tarseer_portable_reader)))]
-mod unix;
-#[cfg(all(unix, not(tarseer_portable_reader)))]
-use unix as imp;
+#[cfg(all(target_os = "linux", not(tarseer_portable_reader)))]
+mod linux;
+#[cfg(all(target_os = "linux", not(tarseer_portable_reader)))]
+use linux as imp;
 
-#[cfg(not(all(unix, not(tarseer_portable_reader))))]
+#[cfg(not(all(target_os = "linux", not(tarseer_portable_reader))))]
 mod portable;
-#[cfg(not(all(unix, not(tarseer_portable_reader))))]
+#[cfg(not(all(target_os = "linux", not(tarseer_portable_reader))))]
 use portable as imp;
 
-pub(super) use imp::{Directory, Scratch};
+#[cfg(unix)]
+pub(super) use imp::stat_fd;
+pub(super) use imp::{Directory, Scratch, Usage, pin, reserve_handles};
+
+/// The buffers of a listing that has been read, for the next one to fill. A
+/// walk then allocates for a listing only when one is larger than any before.
+#[derive(Default)]
+pub(super) struct Spare {
+    entries: Vec<Listed>,
+    names: Vec<u8>,
+    sorted: Vec<Listed>,
+    keys: Vec<u128>,
+}
+
+// The names of a listing. They are checked for UTF-8 once, all together, and
+// held as text if they pass. A name is then a slice of that text, and costs no
+// check of its own. NUL, which ends each name for the linux reader, is UTF-8.
+enum Names {
+    Bytes(Vec<u8>),
+    Text(String),
+}
+
+impl Default for Names {
+    fn default() -> Self {
+        Self::Bytes(Vec::new())
+    }
+}
 
 /// What a listing says an entry is, before its metadata is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +72,10 @@ pub(super) struct Listed {
     len: u32,
     pub kind: Kind,
     // The entry's place in `Held`, for the reader that needs it.
-    #[cfg_attr(all(unix, not(tarseer_portable_reader)), allow(dead_code))]
+    #[cfg_attr(
+        all(target_os = "linux", not(tarseer_portable_reader)),
+        allow(dead_code)
+    )]
     slot: u32,
 }
 
@@ -62,7 +89,7 @@ impl Listed {
         let head = name.len().min(8);
         prefix[..head].copy_from_slice(&name[..head]);
         names.extend_from_slice(name);
-        // The unix reader passes names to the kernel, which wants this NUL.
+        // The linux reader passes names to the kernel, which wants this NUL.
         names.push(0);
         Some(Self {
             prefix: u64::from_be_bytes(prefix),
@@ -73,15 +100,14 @@ impl Listed {
         })
     }
 
+    /// Where the name is in [`Listing::text`]: its start and its length.
+    pub fn span(&self) -> (u32, u32) {
+        (self.start, self.len)
+    }
+
     /// Returns the entry's name, given the buffer of its listing.
     pub fn name<'n>(&self, names: &'n [u8]) -> &'n [u8] {
         &names[self.start as usize..(self.start + self.len) as usize]
-    }
-
-    fn order(&self, other: &Self, names: &[u8]) -> Ordering {
-        self.prefix
-            .cmp(&other.prefix)
-            .then_with(|| self.name(names).cmp(other.name(names)))
     }
 }
 
@@ -89,9 +115,15 @@ impl Listed {
 #[derive(Default)]
 pub(super) struct Listing {
     pub entries: Vec<Listed>,
-    pub names: Vec<u8>,
+    names: Names,
+    // What the sort works in. See `Listing::sort`.
+    sorted: Vec<Listed>,
+    keys: Vec<u128>,
     // What the reader keeps until the entries have been visited.
-    #[cfg_attr(all(unix, not(tarseer_portable_reader)), allow(dead_code))]
+    #[cfg_attr(
+        all(target_os = "linux", not(tarseer_portable_reader)),
+        allow(dead_code)
+    )]
     held: imp::Held,
     /// Entries the reader could not list: the error, the name if it is
     /// known, and what could not be read.
@@ -99,10 +131,116 @@ pub(super) struct Listing {
 }
 
 impl Listing {
+    /// An empty listing that fills the buffers of `spare`.
+    fn from_spare(spare: &mut Spare) -> Self {
+        Self {
+            entries: std::mem::take(&mut spare.entries),
+            names: Names::Bytes(std::mem::take(&mut spare.names)),
+            sorted: std::mem::take(&mut spare.sorted),
+            keys: std::mem::take(&mut spare.keys),
+            ..Self::default()
+        }
+    }
+
+    /// Gives the buffers up for the next listing.
+    pub fn into_spare(self) -> Spare {
+        let (mut entries, mut names) = (self.entries, self.names.into_bytes());
+        let (mut sorted, mut keys) = (self.sorted, self.keys);
+        entries.clear();
+        names.clear();
+        sorted.clear();
+        keys.clear();
+        Spare {
+            entries,
+            names,
+            sorted,
+            keys,
+        }
+    }
+
+    /// The buffer that holds every name.
+    pub fn names(&self) -> &[u8] {
+        match &self.names {
+            Names::Bytes(bytes) => bytes,
+            Names::Text(text) => text.as_bytes(),
+        }
+    }
+
+    // While the listing is being read.
+    fn names_mut(&mut self) -> &mut Vec<u8> {
+        match &mut self.names {
+            Names::Bytes(bytes) => bytes,
+            Names::Text(_) => unreachable!("names are text only once the listing is sorted"),
+        }
+    }
+
+    /// All the names as one text, each followed by whatever the reader put
+    /// after it, or `None` if one of them is not UTF-8. [`Listed::span`] says
+    /// where a name is in it.
+    pub fn text(&self) -> Option<&str> {
+        match &self.names {
+            Names::Text(text) => Some(text),
+            Names::Bytes(_) => None,
+        }
+    }
+
+    /// The name of `listed` as text, or `None` if it is not UTF-8.
+    pub fn name_text(&self, listed: &Listed) -> Option<&str> {
+        match &self.names {
+            Names::Text(text) => {
+                text.get(listed.start as usize..(listed.start + listed.len) as usize)
+            }
+            Names::Bytes(bytes) => std::str::from_utf8(listed.name(bytes)).ok(),
+        }
+    }
+
+    // Sorts the entries, and checks the names for UTF-8 all at once.
     fn sort(&mut self) {
-        let names = &self.names;
-        self.entries
-            .sort_unstable_by(|left, right| left.order(right, names));
+        let names = match &self.names {
+            Names::Bytes(bytes) => bytes.as_slice(),
+            Names::Text(text) => text.as_bytes(),
+        };
+        // The sort is of one integer for each entry: the first eight bytes
+        // of its name, and its place. Integers sort several times faster than
+        // records that are compared through a function. Names that share
+        // their first eight bytes are then put in order among themselves.
+        let entries = &self.entries;
+        self.keys.clear();
+        self.keys.extend(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(place, entry)| (u128::from(entry.prefix) << 64) | place as u128),
+        );
+        self.keys.sort_unstable();
+        let place = |key: u128| (key & u128::from(u64::MAX)) as usize;
+        let mut from = 0;
+        while from < self.keys.len() {
+            let prefix = self.keys[from] >> 64;
+            let run = self.keys[from..]
+                .iter()
+                .take_while(|&&key| key >> 64 == prefix)
+                .count();
+            if run > 1 {
+                self.keys[from..from + run].sort_unstable_by(|&left, &right| {
+                    entries[place(left)]
+                        .name(names)
+                        .cmp(entries[place(right)].name(names))
+                });
+            }
+            from += run;
+        }
+        self.sorted.clear();
+        self.sorted
+            .extend(self.keys.iter().map(|&key| entries[place(key)]));
+        std::mem::swap(&mut self.entries, &mut self.sorted);
+        self.names = match std::mem::take(&mut self.names) {
+            Names::Bytes(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => Names::Text(text),
+                Err(error) => Names::Bytes(error.into_bytes()),
+            },
+            text @ Names::Text(_) => text,
+        };
     }
 
     /// Returns the position of the entry named `name`, by binary search.
@@ -122,6 +260,15 @@ impl Listing {
     }
 }
 
+impl Names {
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Text(text) => text.into_bytes(),
+        }
+    }
+}
+
 /// What the walk records of an entry.
 pub(super) struct Stat {
     /// The entry's kind, for an entry listed as [`Kind::Unknown`].
@@ -130,4 +277,16 @@ pub(super) struct Stat {
     pub mtime: Option<Timestamp>,
     /// The permission bits.
     pub mode: u32,
+}
+
+impl Stat {
+    /// What a walk that reads no metadata records: nothing but the kind.
+    pub const fn unread(kind: Kind) -> Self {
+        Self {
+            kind,
+            size: 0,
+            mtime: None,
+            mode: 0,
+        }
+    }
 }

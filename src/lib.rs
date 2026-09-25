@@ -66,7 +66,9 @@ pub use crate::manifest::{
     DirectoryRow, EntryKind, FileRow, Index, PartEntry, SymlinkRow, Timestamp, TreePart,
     TreePartFull, walk_order,
 };
+#[cfg(unix)]
+pub use crate::walk::read_file_metadata;
 pub use crate::walk::{
-    Cancelled, Candidate, DEFAULT_BUDGET, Filter, Listing, OnError, Progress, SkipReason, Skips,
-    Walk, WalkError, WalkOptions, estimate, walk, walk_parts,
+    Cancelled, Candidate, DEFAULT_BUDGET, Filter, Listing, Metadata, OnError, Progress, SkipReason,
+    Skips, Walk, WalkError, WalkOptions, estimate, read_metadata, walk, walk_parts,
 };

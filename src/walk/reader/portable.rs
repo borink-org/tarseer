@@ -6,14 +6,18 @@ use std::fs::{self, DirEntry, FileType, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{Kind, Listed, Listing, Stat};
+use super::{Kind, Listed, Listing, Spare, Stat};
 use crate::manifest::Timestamp;
 
 /// This reader needs no buffer of its own.
 #[derive(Default)]
 pub struct Scratch {
-    _nothing: (),
+    /// See [`Spare`].
+    pub spare: Spare,
 }
+
+/// This reader holds no descriptors of its own.
+pub fn reserve_handles(_: usize) {}
 
 #[derive(Default)]
 pub struct Held {
@@ -25,16 +29,21 @@ pub struct Directory {
     path: PathBuf,
 }
 
-// The methods share the unix reader's signatures, which read through the
+// The methods share the linux reader's signatures, which read through the
 // open directory.
 #[allow(clippy::unused_self)]
 impl Directory {
-    /// Whether [`Directory::stat_self`] is cheaper than [`Directory::stat`]
-    /// on the parent.
-    pub const STATS_ITSELF: bool = false;
+    /// Whether the walk reads a directory's metadata from the directory itself
+    /// and not from its parent's listing. On Windows the listing holds a copy
+    /// that the filesystem updates late, so a directory that was just written
+    /// into shows an old mtime there.
+    pub const STATS_ITSELF: bool = cfg!(windows);
+
+    /// Whether a value of this type keeps a file descriptor open.
+    pub const HOLDS_A_HANDLE: bool = false;
 
     /// Opens the root of a walk. A root that is a symlink is followed.
-    // The signature is the unix reader's, which can fail here.
+    // The signature is the linux reader's, which can fail here.
     #[allow(clippy::unnecessary_wraps)]
     pub fn open_root(root: &Path) -> io::Result<Self> {
         Ok(Self {
@@ -50,6 +59,21 @@ impl Directory {
         })
     }
 
+    /// Opens the directory `name` inside this one, to read the metadata of
+    /// what it holds.
+    #[allow(clippy::unnecessary_wraps)]
+    pub fn open_name(&self, name: &str) -> io::Result<Self> {
+        Ok(Self {
+            path: self.path.join(name),
+        })
+    }
+
+    /// Reads the metadata of `name` inside this directory, without following
+    /// a symlink.
+    pub fn stat_name(&self, name: &str) -> io::Result<Stat> {
+        Ok(converted(&fs::symlink_metadata(self.path.join(name))?))
+    }
+
     /// Returns `true` if `error` says the process has no handle left. This
     /// reader holds none.
     pub fn out_of_handles(_: &io::Error) -> bool {
@@ -57,8 +81,8 @@ impl Directory {
     }
 
     /// Reads and sorts the directory's entries.
-    pub fn list(&self, _: &mut Scratch) -> io::Result<Listing> {
-        let mut listing = Listing::default();
+    pub fn list(&self, scratch: &mut Scratch) -> io::Result<Listing> {
+        let mut listing = Listing::from_spare(&mut scratch.spare);
         for entry in fs::read_dir(&self.path)? {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -79,13 +103,13 @@ impl Directory {
             let slot = listing.held.entries.len();
             let listed = match name.to_str() {
                 Some(name) => Listed::new(
-                    &mut listing.names,
+                    listing.names_mut(),
                     name.as_bytes(),
                     kind_of(file_type),
                     slot,
                 ),
                 None => Listed::new(
-                    &mut listing.names,
+                    listing.names_mut(),
                     name.to_string_lossy().as_bytes(),
                     Kind::NonUtf8,
                     slot,
@@ -121,6 +145,14 @@ impl Directory {
     }
 }
 
+/// Reads the metadata of the file `fd` is open on, without a lookup. `std`
+/// reads it only through a `File`, which here takes a copy of the descriptor.
+#[cfg(unix)]
+pub fn stat_fd(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<Stat> {
+    let file = fs::File::from(fd.try_clone_to_owned()?);
+    Ok(converted(&file.metadata()?))
+}
+
 fn kind_of(file_type: FileType) -> Kind {
     if file_type.is_symlink() {
         Kind::Symlink {
@@ -136,6 +168,7 @@ fn kind_of(file_type: FileType) -> Kind {
 }
 
 // Whether a symlink is a directory link. Only Windows has the distinction.
+#[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
 fn symlink_is_directory(file_type: FileType) -> Option<bool> {
     #[cfg(windows)]
     {
@@ -190,3 +223,24 @@ fn mode_of(metadata: &Metadata) -> u32 {
         }
     }
 }
+
+/// What the process has used. Not measured here, so no worker is added.
+pub struct Usage;
+
+impl Usage {
+    /// Whether [`Usage::sample`] measures anything.
+    pub const MEASURED: bool = false;
+
+    pub fn new() -> Self {
+        Self
+    }
+
+    // The signature is the linux reader's, which reads a file here.
+    #[allow(clippy::unused_self)]
+    pub fn sample(&mut self) -> (std::time::Duration, Option<u64>) {
+        (std::time::Duration::ZERO, None)
+    }
+}
+
+/// Does nothing here.
+pub fn pin(_worker: usize) {}

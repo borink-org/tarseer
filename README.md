@@ -8,6 +8,8 @@ Early: the format and the API change without notice.
 ```
 tarseer <dir>              the walk as JSON, one part per line
 tarseer <dir> --out FILE   the same lines and an index, as one zstd file
+tarseer <dir> --walk-threads 0     walk on one thread
+tarseer <dir> --metadata kinds     names and kinds only, no size or mtime
 ```
 
 `tarseer --help` lists the options, and `zstd -dc FILE` prints a file. The
@@ -16,6 +18,16 @@ command is the `tarseer-cli` package in `cli/`.
 The library is the `tarseer` package. Its documentation describes the walk,
 where parts are cut, and the file. The `zstd` feature, on by default, is the
 only part that needs a compressor.
+
+The command reads directories on one thread per processor. On Linux it adds
+threads while they wait on storage. The parts are the same with any number of
+threads.
+
+A walk for a consumer that only needs paths, such as a copy, can skip each
+entry's metadata (`Metadata::Kinds`), which on Linux saves a lookup of every
+entry. `read_metadata` reads it for one part later, on any thread, and
+`read_file_metadata` reads it from a file that is open. The parts are the
+same either way.
 
 ## Attribution
 
