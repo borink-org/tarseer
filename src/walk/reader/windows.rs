@@ -100,6 +100,9 @@ impl Directory {
     /// shows an old mtime there; the open directory costs one call.
     pub const STATS_ITSELF: bool = true;
 
+    /// Whether a value of this type keeps a handle open.
+    pub const HOLDS_A_HANDLE: bool = true;
+
     /// Opens the root of a walk. A root that is a symlink is followed.
     pub fn open_root(root: &Path) -> io::Result<Self> {
         let file = std::fs::OpenOptions::new()
@@ -131,6 +134,13 @@ impl Directory {
             FILE_DIRECTORY_FILE,
         )?;
         Ok(Self { handle })
+    }
+
+    /// Reads the metadata of `name` inside this directory, without following
+    /// a symlink.
+    pub fn stat_name(&self, name: &str) -> io::Result<Stat> {
+        let handle = self.open_relative(name, FILE_READ_ATTRIBUTES | SYNCHRONIZE, 0)?;
+        stat_of(&handle)
     }
 
     /// Returns `true` if `error` says the process has no handle left.
