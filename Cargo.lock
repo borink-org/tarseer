@@ -285,6 +285,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "windows-sys",
  "zstd-safe",
 ]
 

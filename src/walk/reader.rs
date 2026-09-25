@@ -1,5 +1,6 @@
-// How the walk reads directories. Two readers share one interface: `linux`
-// asks the kernel directly, and `portable` goes through `std::fs`.
+// How the walk reads directories. Three readers share one interface: `linux`
+// and `windows` ask the kernel directly, and `portable` goes through
+// `std::fs`.
 //
 // A listing keeps every name in one buffer and one small record per entry, so
 // that listing a directory costs no allocation per entry.
@@ -11,9 +12,14 @@ mod linux;
 #[cfg(all(target_os = "linux", not(tarseer_portable_reader)))]
 use linux as imp;
 
-#[cfg(not(all(target_os = "linux", not(tarseer_portable_reader))))]
+#[cfg(all(windows, not(tarseer_portable_reader)))]
+mod windows;
+#[cfg(all(windows, not(tarseer_portable_reader)))]
+use windows as imp;
+
+#[cfg(any(tarseer_portable_reader, not(any(target_os = "linux", windows))))]
 mod portable;
-#[cfg(not(all(target_os = "linux", not(tarseer_portable_reader))))]
+#[cfg(any(tarseer_portable_reader, not(any(target_os = "linux", windows))))]
 use portable as imp;
 
 #[cfg(unix)]
@@ -54,7 +60,9 @@ pub(super) enum Kind {
     Symlink {
         directory: Option<bool>,
     },
-    /// A socket, a device or another kind the walk does not record.
+    /// A socket, a device or another kind the walk does not record. Windows
+    /// has none: every entry is a file, a directory or a link.
+    #[cfg_attr(all(windows, not(tarseer_portable_reader)), allow(dead_code))]
     Special,
     /// The listing gave no kind. [`Directory::stat`] finds it.
     Unknown,

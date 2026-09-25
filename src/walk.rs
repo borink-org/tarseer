@@ -289,6 +289,14 @@ pub enum OnError {
 pub enum Metadata {
     /// Size, modification time and permission bits, one `statx` per entry
     /// on Linux.
+    ///
+    /// On Windows a file's size and times come from its directory's
+    /// listing, which costs no call. NTFS keeps a copy of them in the entry
+    /// of each of the file's names, and when the file is written through
+    /// one name, the entries of its other names keep the old size and times
+    /// until the file is opened through them. A file with several hard
+    /// links, changed through another name, is then recorded as it was.
+    /// Directories are read from the directory itself and are not affected.
     #[default]
     Full,
     /// Only what the listing of a directory says: the name and the kind, and

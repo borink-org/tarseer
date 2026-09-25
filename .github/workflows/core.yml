@@ -39,7 +39,7 @@ jobs:
       - run: cargo test --locked -p tarseer --no-default-features
       - run: RUSTDOCFLAGS='-D warnings' cargo doc --locked -p tarseer --no-default-features --no-deps
 
-  # Windows reads directories through `std::fs`.
+  # Windows has its own directory reader, which only a Windows build covers.
   windows:
     runs-on: windows-latest
     steps:
