@@ -51,10 +51,21 @@ fn a_tree_larger_than_the_descriptor_limit_is_walked_whole() {
         },
     )
     .expect("lower the descriptor limit");
-    let walked = walk(temp_dir.path(), &WalkOptions::default());
+    let walked: Vec<_> = [0, 4]
+        .into_iter()
+        .map(|threads| {
+            let options = WalkOptions {
+                threads,
+                ..WalkOptions::default()
+            };
+            walk(temp_dir.path(), &options)
+        })
+        .collect();
     setrlimit(Resource::Nofile, limit).expect("restore the descriptor limit");
 
-    let walked = walked.expect("the walk gets by on the descriptors it has");
-    assert!(!walked.skips.any());
-    assert_eq!(walked.paths(), want);
+    for walked in walked {
+        let walked = walked.expect("the walk gets by on the descriptors it has");
+        assert!(!walked.skips.any());
+        assert_eq!(walked.paths(), want);
+    }
 }
