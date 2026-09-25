@@ -24,6 +24,28 @@ pub(super) const MAX_HELD: usize = 128;
 /// metadata of more than this many of its entries at once.
 pub(super) const CHUNK: usize = 1024;
 
+/// The most subdirectories one scan opens. A scan opens each directory it
+/// finds, and a directory with more is read by several scans, so that other
+/// threads open the rest: opening a directory whose record is not cached
+/// waits for storage, and one thread would open them one at a time.
+pub(super) const DIRECTORIES: usize = 64;
+
+// Where the scan of `listing` that starts at `start` ends: after `CHUNK`
+// entries or `DIRECTORIES` directories, whichever comes first.
+fn piece_end(listing: &reader::Listing, start: usize) -> usize {
+    let mut directories = 0;
+    let limit = listing.entries.len().min(start + CHUNK);
+    for (place, entry) in listing.entries[start..limit].iter().enumerate() {
+        if entry.kind == Kind::Directory {
+            directories += 1;
+            if directories == DIRECTORIES {
+                return start + place + 1;
+            }
+        }
+    }
+    limit
+}
+
 /// A scan waiting to be made.
 ///
 /// A job holds neither the path of its directory nor its place in the walk.
@@ -703,7 +725,7 @@ impl<'a> Scanner<'a> {
         // them entry by entry would take several. A link's target comes on top.
         let entries = listing.entries.len();
         found.scanned.items.reserve(entries.min(CHUNK));
-        if entries <= CHUNK {
+        if piece_end(&listing, 0) == entries {
             // One copy for all the names, where there was one for each.
             let names_at = listing.text().and_then(|text| {
                 let at = u32::try_from(found.scanned.text.len()).ok()?;
@@ -731,20 +753,22 @@ impl<'a> Scanner<'a> {
             directory,
             listing,
         });
-        for start in (CHUNK..listed.listing.entries.len()).step_by(CHUNK) {
+        let mut start = piece_end(&listed.listing, 0);
+        while start < listed.listing.entries.len() {
             found.rest.push(Job {
                 work: Work::Rest {
                     listed: Arc::clone(&listed),
                     start,
                 },
             });
+            start = piece_end(&listed.listing, start);
         }
         self.entries(&listed.within(), 0, found);
     }
 
-    // Reads up to `CHUNK` entries of `listed`, from `start`.
+    // Reads the entries of `listed` from `start` to the end of that piece.
     fn entries(&self, listed: &Within<'_>, start: usize, found: &mut Finding) {
-        let end = listed.listing.entries.len().min(start + CHUNK);
+        let end = piece_end(listed.listing, start);
         if end < listed.listing.entries.len() {
             found.scanned.next = Some(end);
         }
