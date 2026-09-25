@@ -8,10 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use common::{TempDir, fixture, recurse, walk_default};
-use tarseer::{
-    Cancelled, Candidate, EntryKind, Filter, OnError, Progress, SkipReason, WalkError, WalkOptions,
-    walk,
-};
+use tarseer::{Cancelled, Candidate, EntryKind, Filter, Progress, WalkError, WalkOptions, walk};
 
 #[test]
 fn every_entry_is_found_in_walk_order() {
@@ -220,6 +217,7 @@ fn an_unreadable_directory_fails_the_walk_and_says_which_one() {
 #[test]
 fn under_skip_an_unreadable_directory_is_counted_and_the_rest_still_walks() {
     use std::os::unix::fs::PermissionsExt;
+    use tarseer::OnError;
 
     let temp_dir = fixture("locked");
     let locked = temp_dir.path().join("zed");
@@ -262,18 +260,19 @@ fn an_entry_that_cannot_be_stated_fails_the_walk_and_says_which_one() {
     );
 }
 
-#[derive(Default)]
-struct Skipped(Mutex<Vec<(String, SkipReason)>>);
-
-impl Progress for Skipped {
-    fn skipped(&self, path: &str, reason: SkipReason) {
-        self.0.lock().unwrap().push((path.to_owned(), reason));
-    }
-}
-
 #[cfg(unix)]
 #[test]
 fn under_skip_an_unstatable_entry_is_counted_and_named_and_the_walk_goes_on() {
+    use tarseer::{OnError, SkipReason};
+
+    #[derive(Default)]
+    struct Skipped(Mutex<Vec<(String, SkipReason)>>);
+
+    impl Progress for Skipped {
+        fn skipped(&self, path: &str, reason: SkipReason) {
+            self.0.lock().unwrap().push((path.to_owned(), reason));
+        }
+    }
     use std::os::unix::fs::PermissionsExt;
 
     let temp_dir = fixture("skipstat");
@@ -300,7 +299,8 @@ fn under_skip_an_unstatable_entry_is_counted_and_named_and_the_walk_goes_on() {
     assert!(walked.paths().iter().any(|path| path == "top.txt"));
 }
 
-#[cfg(unix)]
+// Linux only: other filesystems refuse to create such a name.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_name_that_is_not_utf8_is_counted_and_the_rest_still_walks() {
     use std::ffi::OsStr;
