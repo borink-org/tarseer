@@ -326,7 +326,8 @@ impl Directory {
     }
 }
 
-// The length of a buffer or a struct, as the calls take it.
+// The length of a buffer or a struct, as the calls take it: a `u32`. The
+// largest here is the listing's buffer, of 64 KiB.
 fn length(bytes: usize) -> u32 {
     u32::try_from(bytes).expect("a buffer under 4 GiB")
 }
@@ -381,7 +382,7 @@ fn attributes_of(handle: &OwnedHandle) -> io::Result<(u32, u32)> {
 // The target of the symlink or junction `handle` is open on, as
 // `std::fs::read_link` gives it.
 fn reparse_target(handle: &OwnedHandle) -> io::Result<Vec<u16>> {
-    let mut buffer = vec![0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize];
+    let mut buffer = [0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize];
     let mut returned = 0;
     // SAFETY:
     // 1. The handle is borrowed.
@@ -424,12 +425,16 @@ fn reparse_target(handle: &OwnedHandle) -> io::Result<Vec<u16>> {
     let bytes = data
         .get(start..start + usize::from(u16_at(10)?))
         .ok_or_else(|| io::Error::other("a reparse point shorter than its target"))?;
-    let mut target: Vec<u16> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|&pair| u16::from_le_bytes(pair))
-        .collect();
+    // The one allocation: the target that is returned. Its last unit is room
+    // for the NUL that `user_path` adds.
+    let mut target = Vec::with_capacity(bytes.len() / 2 + 1);
+    target.extend(
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair)),
+    );
     // An absolute target starts with `\??\`, which `std` turns into `\\?\`
     // and then into a plain path where that means the same.
     let backslash = u16::from(b'\\');
@@ -442,8 +447,13 @@ fn reparse_target(handle: &OwnedHandle) -> io::Result<Vec<u16>> {
 }
 
 // `\\?\C:\...` as `C:\...`, and `\\?\UNC\...` as `\\...`, when Windows reads
-// the shorter path as the same one; otherwise the path unchanged. What `std`
-// does for `read_link`.
+// the shorter path as the same one; otherwise the path unchanged. This is
+// `std`'s `from_wide_to_user_path`, which `std::fs::read_link` uses.
+//
+// Without the `\\?\` prefix, Windows changes some paths when it reads them.
+// It resolves `.` and `..`, drops trailing dots and spaces, and reads names
+// such as `CON` as devices. `GetFullPathNameW` applies the same rules, so a
+// path that it returns unchanged means the same without the prefix.
 fn user_path(mut path: Vec<u16>) -> io::Result<Vec<u16>> {
     const LEGACY_MAX_PATH: usize = 260;
     // `std` counts the NUL it ends the path with.
@@ -462,18 +472,19 @@ fn user_path(mut path: Vec<u16>) -> io::Result<Vec<u16>> {
     } else {
         return Ok(path);
     };
-    let short: Vec<u16> = path[from..].iter().copied().chain([0]).collect();
-    let mut full = vec![0u16; LEGACY_MAX_PATH + 1];
+    // The call takes a path that ends with a NUL.
+    path.push(0);
+    let mut full = [0u16; LEGACY_MAX_PATH + 1];
     // SAFETY: GetFullPathNameW touches no handle, and does no I/O (rules 1,
     // 4 and 6 do not apply).
-    // 2. `short` ends with a NUL, and `full` is as many units long as the
+    // 2. `path` ends with a NUL, and `full` is as many units long as the
     //    call is told.
-    // 3. The call reads `short`, and writes `full`, from a `&mut` borrow
+    // 3. The call reads `path`, and writes `full`, from a `&mut` borrow
     //    that nothing else uses until it returns. The file part's pointer is
     //    null, which the call takes as none.
     let written = unsafe {
         GetFullPathNameW(
-            short.as_ptr(),
+            path[from..].as_ptr(),
             length(full.len()),
             full.as_mut_ptr(),
             ptr::null_mut(),
@@ -482,10 +493,12 @@ fn user_path(mut path: Vec<u16>) -> io::Result<Vec<u16>> {
     if written == 0 {
         return Err(io::Error::last_os_error());
     }
+    path.pop();
     // 5. Only what the call says it wrote: a length under the buffer's is
     // the path's, without its NUL.
-    if written < full.len() && full[..written] == short[..short.len() - 1] {
-        return Ok(short[..short.len() - 1].to_vec());
+    if written < full.len() && full[..written] == path[from..] {
+        path.drain(..from);
+        return Ok(path);
     }
     if is_unc {
         path[6] = unit(b'C');

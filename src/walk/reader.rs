@@ -7,20 +7,21 @@
 
 use crate::manifest::Timestamp;
 
-#[cfg(all(target_os = "linux", not(tarseer_portable_reader)))]
-mod linux;
-#[cfg(all(target_os = "linux", not(tarseer_portable_reader)))]
-use linux as imp;
-
-#[cfg(all(windows, not(tarseer_portable_reader)))]
-mod windows;
-#[cfg(all(windows, not(tarseer_portable_reader)))]
-use windows as imp;
-
-#[cfg(any(tarseer_portable_reader, not(any(target_os = "linux", windows))))]
-mod portable;
-#[cfg(any(tarseer_portable_reader, not(any(target_os = "linux", windows))))]
-use portable as imp;
+// The `tarseer_portable_reader` cfg builds the portable reader on any platform.
+cfg_select! {
+    all(target_os = "linux", not(tarseer_portable_reader)) => {
+        mod linux;
+        use linux as imp;
+    }
+    all(windows, not(tarseer_portable_reader)) => {
+        mod windows;
+        use windows as imp;
+    }
+    _ => {
+        mod portable;
+        use portable as imp;
+    }
+}
 
 pub(super) use imp::{Directory, Scratch};
 

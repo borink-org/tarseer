@@ -19,10 +19,9 @@ static GLOBAL: cyo_mimalloc::MiMalloc = cyo_mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
     // Where memory is not overcommitted, as on Windows, mimalloc commits each
-    // page whole. A page is 4 MiB for blocks over 84 KiB, and a growing buffer
-    // takes one per size class on every thread. Committing on demand charges
-    // only what is touched. This is set before the first walk thread starts,
-    // and only if the environment does not set it.
+    // page whole. Committing on demand reduced the memory it commits on every
+    // tree we measured, at no measurable cost in time. Set
+    // `MIMALLOC_PAGE_COMMIT_ON_DEMAND` to override it.
     if std::env::var_os("MIMALLOC_PAGE_COMMIT_ON_DEMAND").is_none() {
         cyo_mimalloc::MiMalloc::option_set(
             cyo_mimalloc::mi_option_t::mi_option_page_commit_on_demand,
