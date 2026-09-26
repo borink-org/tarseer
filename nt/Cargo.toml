@@ -3,7 +3,7 @@ name = "tarseer-nt"
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
-description = "Safe calls into the Windows native API for reading a directory tree: listings with each entry's metadata, and opens relative to an open directory"
+description = "Reads a directory tree on Windows through the native API, opening each directory relative to its parent"
 repository = "https://github.com/borink-org/tarseer"
 
 [target.'cfg(windows)'.dependencies]

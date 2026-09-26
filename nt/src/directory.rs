@@ -70,9 +70,8 @@ const BUFFER_BYTES: usize = 64 << 10;
 
 /// An open directory.
 ///
-/// Its handle is always open for synchronous I/O, which the calls on it rely
-/// on: a call on a handle open for asynchronous I/O could write into its
-/// buffer after it returned.
+/// Its handle is always open for synchronous I/O. On a handle open for
+/// asynchronous I/O, a call could write into its buffer after it returned.
 pub struct Directory {
     handle: OwnedHandle,
 }
@@ -144,13 +143,13 @@ impl Directory {
     /// but `.` and `..`, until `each` returns `false`.
     ///
     /// It takes `&mut self` because the open handle keeps the listing's
-    /// place: two listings of one handle at once would each miss the entries
-    /// the other read.
+    /// place. Two listings of one handle at once would each miss the entries
+    /// that the other read.
     ///
     /// An entry's metadata is the copy NTFS keeps in the entry of the name
-    /// listed. Writing through one name refreshes that name's entry only: the
+    /// listed. Writing through one name refreshes that name's entry only. The
     /// entries of a hard-linked file's other names keep the old size and
-    /// times until it is opened through them. A directory's own entry is
+    /// times until you open the file through them. A directory's own entry is
     /// updated late too, and [`Directory::metadata`] reads the directory's
     /// own.
     ///
