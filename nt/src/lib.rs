@@ -6,7 +6,8 @@
 //! 2. Call [`Directory::list`] with a [`Buffer`]. It calls you with each
 //!    [`Entry`]: its name, and the [`Metadata`] that the listing holds.
 //! 3. Open a subdirectory with [`Directory::open_dir`], by its name.
-//! 4. Read a directory's own metadata with [`Directory::metadata`], and the
+//! 4. Read a directory's own metadata with [`Directory::metadata`], the
+//!    metadata of a name inside it with [`Directory::metadata_of`], and the
 //!    target of a link with [`Directory::read_link`].
 //!
 //! # Choosing it over `std::fs`
