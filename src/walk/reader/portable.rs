@@ -60,7 +60,9 @@ impl Directory {
     }
 
     /// Reads and sorts the directory's entries.
-    pub fn list(&self, scratch: &mut Scratch) -> io::Result<Listing> {
+    // `&mut self` is the other readers', whose open directory keeps the
+    // listing's place; this one opens the directory anew.
+    pub fn list(&mut self, scratch: &mut Scratch) -> io::Result<Listing> {
         let mut listing = Listing::from_spare(&mut scratch.spare);
         for entry in fs::read_dir(&self.path)? {
             let entry = match entry {

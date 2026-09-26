@@ -8,8 +8,9 @@
 //! directory's own metadata takes it another open.
 //!
 //! This crate holds the `unsafe` code that tarseer's Windows reader needs: the
-//! calls into the system, and taking ownership of the handles they return. The
-//! records the system writes are read as bytes, without `unsafe`.
+//! calls into the system, and taking ownership of the handles they return.
+//! The rules those calls keep are at the top of `src/directory.rs`. What the
+//! system writes is parsed as bytes, in safe code.
 //!
 //! On other platforms the crate is empty.
 
@@ -17,6 +18,12 @@
 
 #[cfg(windows)]
 mod directory;
+#[cfg(windows)]
+mod records;
+#[cfg(windows)]
+mod sys;
 
 #[cfg(windows)]
-pub use directory::{Buffer, Directory, Entry, Metadata};
+pub use directory::{Buffer, Directory};
+#[cfg(windows)]
+pub use records::{Entry, Metadata};

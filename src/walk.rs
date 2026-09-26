@@ -456,7 +456,7 @@ impl Walker<'_, '_> {
         }
         // An error under either policy: counting the root as a skip would
         // report an empty walk as a success.
-        let directory = Directory::open_root(root)
+        let mut directory = Directory::open_root(root)
             .attach_with(|| format!("listing {}", root.display()))
             .change_context(WalkError)?;
         let mut listing = directory
@@ -638,7 +638,7 @@ impl Walker<'_, '_> {
                 }
                 let read = opened
                     .expect("a directory was opened above")
-                    .and_then(|directory| Ok((directory.list(&mut self.scratch)?, directory)));
+                    .and_then(|mut directory| Ok((directory.list(&mut self.scratch)?, directory)));
                 let (mut listing, directory) = match read {
                     Ok((listing, directory)) => (listing, Some(directory)),
                     Err(error) => {

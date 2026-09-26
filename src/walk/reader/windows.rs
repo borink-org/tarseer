@@ -83,10 +83,11 @@ impl Directory {
         error.raw_os_error() == Some(ERROR_TOO_MANY_OPEN_FILES.cast_signed())
     }
 
-    /// Reads and sorts the directory's entries.
+    /// Reads and sorts the directory's entries. The handle keeps the
+    /// listing's place, so one listing of it runs at a time.
     // The signature is the portable reader's, which can fail here.
     #[allow(clippy::unnecessary_wraps)]
-    pub fn list(&self, scratch: &mut Scratch) -> io::Result<Listing> {
+    pub fn list(&mut self, scratch: &mut Scratch) -> io::Result<Listing> {
         let mut listing = Listing::from_spare(&mut scratch.spare);
         let name = &mut scratch.name;
         let read = self.directory.list(&mut scratch.buffer, |entry| {

@@ -1,5 +1,36 @@
+// How the calls here stay sound.
+//
+// The system checks every handle and pointer it is given, from a process it
+// does not trust: a bad handle gets an error, and a bad pointer an error or a
+// fault in this process. What a call can harm is this process's memory, and
+// only through what the call is given. Each `unsafe` block below keeps these
+// rules for what it gives, and its `SAFETY` comment says how:
+//
+// 1. Handles. A handle is open for as long as the call runs. Every handle is
+//    borrowed from an `OwnedHandle`, which closes it only when dropped.
+// 2. Bounds. A pointer is valid for as many bytes as the call is told, and
+//    as aligned as the call needs.
+// 3. Access. The system writes only through pointers made from `&mut`
+//    borrows or raw borrows of mutable places, and only reads through the
+//    others. No Rust reference to that memory is used while the call runs.
+// 4. Lifetime. The system is done with every pointer when the call returns.
+//    Every handle here is open for synchronous I/O, and on one, a call waits
+//    for its I/O. On a handle open for asynchronous I/O a call can return
+//    `STATUS_PENDING`, or `ERROR_IO_PENDING`, and write into its buffer and
+//    its status block, which is on the stack, later. `completed` and
+//    `succeeded` abort the process if a call ever does, since unwinding would
+//    free that memory while the system still writes it.
+// 5. Output. What a call writes is read only as far as the call says it
+//    wrote. A struct the system fills is all integers, so any bytes are a
+//    valid one; listings and reparse points are parsed as bytes in safe
+//    code. Every buffer starts zeroed, so none is read uninitialized.
+// 6. Ownership. A handle a call returns is owned by one `OwnedHandle`, made
+//    only when the call succeeded.
+//
+// The unit tests run the code here against stand-ins for the calls (see
+// `sys`), under Miri too, which checks rules 2, 3 and 5 on what is given.
+
 use std::io;
-use std::mem::offset_of;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
@@ -7,25 +38,31 @@ use std::ptr;
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_DIRECTORY_FILE, FILE_FULL_DIR_INFORMATION, FILE_NETWORK_OPEN_INFORMATION, FILE_OPEN,
-    FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
-    FileFullDirectoryInformation, FileNetworkOpenInformation, NTCREATEFILE_CREATE_OPTIONS,
-    NtCreateFile, NtQueryDirectoryFile, NtQueryInformationFile,
+    FILE_DIRECTORY_FILE, FILE_NETWORK_OPEN_INFORMATION, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
+    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, FileFullDirectoryInformation,
+    FileNetworkOpenInformation, NTCREATEFILE_CREATE_OPTIONS,
 };
 use windows_sys::Win32::Foundation::{
-    HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_NO_MORE_FILES,
-    STATUS_NO_SUCH_FILE, UNICODE_STRING,
+    ERROR_IO_PENDING, HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, STATUS_NO_MORE_FILES,
+    STATUS_NO_SUCH_FILE, STATUS_PENDING, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo,
-    GetFileInformationByHandleEx, GetFullPathNameW, MAXIMUM_REPARSE_DATA_BUFFER_SIZE, SYNCHRONIZE,
+    MAXIMUM_REPARSE_DATA_BUFFER_SIZE, SYNCHRONIZE,
 };
-use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
 use windows_sys::Win32::System::SystemServices::{
     IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK,
+};
+use windows_sys::core::BOOL;
+
+use crate::records::{Entry, Metadata, records};
+use crate::sys::{
+    DeviceIoControl, GetFileInformationByHandleEx, GetFullPathNameW, NtCreateFile,
+    NtQueryDirectoryFile, NtQueryInformationFile, RtlNtStatusToDosError,
 };
 
 // 64 KiB: a few hundred entries a call.
@@ -62,41 +99,6 @@ impl Buffer {
     }
 }
 
-/// What the system says of a file, a directory or a link.
-#[derive(Clone, Copy, Debug)]
-pub struct Metadata {
-    /// The `FILE_ATTRIBUTE_*` bits.
-    pub attributes: u32,
-    /// The tag of the reparse point, or 0 if it is not one.
-    pub reparse_tag: u32,
-    /// The size in bytes: the end of the file's data.
-    pub size: u64,
-    /// When the file was last written, in 100-nanosecond intervals since
-    /// 1601.
-    pub last_write: i64,
-}
-
-/// An entry of a listing, as the listing gave it.
-pub struct Entry<'b> {
-    // UTF-16, little-endian.
-    name: &'b [u8],
-    /// The entry's metadata. It is the copy the filesystem keeps in the
-    /// directory, which on NTFS can be older than the file's own: see
-    /// [`Directory::list`].
-    pub metadata: Metadata,
-}
-
-impl Entry<'_> {
-    /// The entry's name, in UTF-16 units that need not be valid UTF-16.
-    pub fn name(&self) -> impl Iterator<Item = u16> + '_ {
-        self.name
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&pair| u16::from_le_bytes(pair))
-    }
-}
-
 impl Directory {
     /// Opens the directory at `path`, following a symlink or junction there.
     ///
@@ -105,7 +107,7 @@ impl Directory {
     /// If the open fails, or [`io::ErrorKind::NotADirectory`] if `path` is
     /// not a directory.
     pub fn open(path: &Path) -> io::Result<Self> {
-        // `std` opens for synchronous I/O unless asked otherwise.
+        // `std` opens for synchronous I/O unless asked otherwise (rule 4).
         let file = std::fs::OpenOptions::new()
             .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -141,6 +143,10 @@ impl Directory {
     /// Reads the directory from its start, and calls `each` with every entry
     /// but `.` and `..`, until `each` returns `false`.
     ///
+    /// It takes `&mut self` because the open handle keeps the listing's
+    /// place: two listings of one handle at once would each miss the entries
+    /// the other read.
+    ///
     /// An entry's metadata is the copy NTFS keeps in the entry of the name
     /// listed. Writing through one name refreshes that name's entry only: the
     /// entries of a hard-linked file's other names keep the old size and
@@ -152,19 +158,26 @@ impl Directory {
     ///
     /// If a read fails. `each` has then seen the entries read before it.
     pub fn list(
-        &self,
+        &mut self,
         buffer: &mut Buffer,
         mut each: impl FnMut(&Entry<'_>) -> bool,
     ) -> io::Result<()> {
+        let handle = self.raw();
         let buffer = buffer.aligned();
         let mut restart = true;
         loop {
             let mut status_block = IO_STATUS_BLOCK::default();
-            // SAFETY: the handle is an open directory, open for synchronous
-            // I/O, and the buffer is as long as it says and 8-byte aligned.
-            let status = unsafe {
+            // SAFETY:
+            // 1. The handle is borrowed from `self`.
+            // 2. The buffer is as long as the call is told, 8-byte aligned as
+            //    the records need, and the status block is its own type.
+            // 3. Both come from `&mut` borrows, used by nothing else until the
+            //    call returns. The other pointers are null, which the call
+            //    takes as none: no event, no routine, no name to match.
+            // 4. The handle is open for synchronous I/O; `completed` checks.
+            let status = completed(unsafe {
                 NtQueryDirectoryFile(
-                    self.raw(),
+                    handle,
                     ptr::null_mut(),
                     None,
                     ptr::null(),
@@ -176,7 +189,7 @@ impl Directory {
                     ptr::null(),
                     restart,
                 )
-            };
+            });
             restart = false;
             if status == STATUS_NO_MORE_FILES || status == STATUS_NO_SUCH_FILE {
                 return Ok(());
@@ -184,6 +197,7 @@ impl Directory {
             if status < 0 {
                 return Err(nt_error(status));
             }
+            // 5. Only what the call says it wrote.
             let written = status_block.Information.min(buffer.len());
             if !records(&buffer[..written], &mut each) {
                 return Ok(());
@@ -199,8 +213,14 @@ impl Directory {
     pub fn metadata(&self) -> io::Result<Metadata> {
         let mut information = FILE_NETWORK_OPEN_INFORMATION::default();
         let mut status_block = IO_STATUS_BLOCK::default();
-        // SAFETY: the handle is open, and the struct is as long as it says.
-        let status = unsafe {
+        // SAFETY:
+        // 1. The handle is borrowed from `self`.
+        // 2. The information and the status block are each their own type, of
+        //    the length the call is told.
+        // 3. Both are raw borrows of local variables that nothing else uses
+        //    until the call returns.
+        // 4. The handle is open for synchronous I/O; `completed` checks.
+        let status = completed(unsafe {
             NtQueryInformationFile(
                 self.raw(),
                 &raw mut status_block,
@@ -208,10 +228,11 @@ impl Directory {
                 length(size_of::<FILE_NETWORK_OPEN_INFORMATION>()),
                 FileNetworkOpenInformation,
             )
-        };
+        });
         if status < 0 {
             return Err(nt_error(status));
         }
+        // 5. The struct is all integers.
         let attributes = information.FileAttributes;
         let reparse_tag = if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
             0
@@ -254,6 +275,7 @@ impl Directory {
         let object_name = UNICODE_STRING {
             Length: name_length,
             MaximumLength: name_length,
+            // The call only reads it (rule 3), though the type says `*mut`.
             Buffer: name.as_ptr().cast_mut(),
         };
         let attributes = OBJECT_ATTRIBUTES {
@@ -267,9 +289,16 @@ impl Directory {
         };
         let mut handle: HANDLE = ptr::null_mut();
         let mut status_block = IO_STATUS_BLOCK::default();
-        // SAFETY: every pointer is to a live value of the type it is declared
-        // as, and the name outlives the call, which only reads it.
-        let status = unsafe {
+        // SAFETY:
+        // 1. The directory the name is opened in is borrowed from `self`.
+        // 2. The attributes, the name and its units are live values of their
+        //    types, and the name's length is the units' length in bytes.
+        // 3. The call writes only the handle and the status block, raw
+        //    borrows of local variables; it reads the rest. The other
+        //    pointers are null, which the call takes as none.
+        // 4. It opens for synchronous I/O, and so does every call on the
+        //    handle it returns; `completed` checks this one.
+        let status = completed(unsafe {
             NtCreateFile(
                 &raw mut handle,
                 access,
@@ -286,56 +315,14 @@ impl Directory {
                 ptr::null(),
                 0,
             )
-        };
+        });
         if status < 0 {
             return Err(nt_error(status));
         }
-        // SAFETY: the call succeeded, so `handle` is open and now owned here.
+        // SAFETY: 6. The call succeeded, so `handle` is open, and nothing
+        // else owns it.
         Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
     }
-}
-
-// Calls `each` with the records of one read, a chain of
-// `FILE_FULL_DIR_INFORMATION`s, each giving the offset of the next. Returns
-// `false` if `each` did.
-fn records(data: &[u8], each: &mut impl FnMut(&Entry<'_>) -> bool) -> bool {
-    type Record = FILE_FULL_DIR_INFORMATION;
-    let header = offset_of!(Record, FileName);
-    let mut at = 0;
-    while let Some(fixed) = data.get(at..at + header) {
-        let length = u32_at(fixed, offset_of!(Record, FileNameLength)) as usize;
-        let Some(name) = data.get(at + header..at + header + length) else {
-            break;
-        };
-        // UTF-16 `.` and `..`.
-        if name != b".\0" && name != b".\0.\0" {
-            let attributes = u32_at(fixed, offset_of!(Record, FileAttributes));
-            let reparse_tag = if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
-                0
-            } else {
-                // With a reparse point, this field holds its tag.
-                u32_at(fixed, offset_of!(Record, EaSize))
-            };
-            let entry = Entry {
-                name,
-                metadata: Metadata {
-                    attributes,
-                    reparse_tag,
-                    size: i64_at(fixed, offset_of!(Record, EndOfFile)).cast_unsigned(),
-                    last_write: i64_at(fixed, offset_of!(Record, LastWriteTime)),
-                },
-            };
-            if !each(&entry) {
-                return false;
-            }
-        }
-        let next = u32_at(fixed, offset_of!(Record, NextEntryOffset)) as usize;
-        if next == 0 {
-            break;
-        }
-        at += next;
-    }
-    true
 }
 
 // The length of a buffer or a struct, as the calls take it.
@@ -343,29 +330,50 @@ fn length(bytes: usize) -> u32 {
     u32::try_from(bytes).expect("a buffer under 4 GiB")
 }
 
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(*bytes[at..].first_chunk().expect("a field of the record"))
+// Rule 4 for the native calls: aborts if a call has left its I/O running.
+fn completed(status: NTSTATUS) -> NTSTATUS {
+    if status == STATUS_PENDING {
+        eprintln!(
+            "tarseer-nt: a call returned STATUS_PENDING on a handle open for synchronous I/O"
+        );
+        std::process::abort();
+    }
+    status
 }
 
-fn i64_at(bytes: &[u8], at: usize) -> i64 {
-    i64::from_le_bytes(*bytes[at..].first_chunk().expect("a field of the record"))
+// Rule 4 for the Win32 calls: aborts if a call has left its I/O running.
+fn succeeded(done: BOOL) -> io::Result<()> {
+    if done != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_IO_PENDING.cast_signed()) {
+        eprintln!(
+            "tarseer-nt: a call returned ERROR_IO_PENDING on a handle open for synchronous I/O"
+        );
+        std::process::abort();
+    }
+    Err(error)
 }
 
 // The attributes and the reparse tag of the file `handle` is open on.
 fn attributes_of(handle: &OwnedHandle) -> io::Result<(u32, u32)> {
     let mut information = FILE_ATTRIBUTE_TAG_INFO::default();
-    // SAFETY: the handle is open, and the struct is as long as it says.
-    let done = unsafe {
+    // SAFETY:
+    // 1. The handle is borrowed.
+    // 2. The information is its own type, of the length the call is told.
+    // 3. It is a raw borrow of a local variable that nothing else uses until
+    //    the call returns.
+    // 4. The handle is open for synchronous I/O; `succeeded` checks.
+    succeeded(unsafe {
         GetFileInformationByHandleEx(
             handle.as_raw_handle(),
             FileAttributeTagInfo,
             (&raw mut information).cast(),
             length(size_of::<FILE_ATTRIBUTE_TAG_INFO>()),
         )
-    };
-    if done == 0 {
-        return Err(io::Error::last_os_error());
-    }
+    })?;
+    // 5. The struct is all integers.
     Ok((information.FileAttributes, information.ReparseTag))
 }
 
@@ -374,9 +382,17 @@ fn attributes_of(handle: &OwnedHandle) -> io::Result<(u32, u32)> {
 fn reparse_target(handle: &OwnedHandle) -> io::Result<Vec<u16>> {
     let mut buffer = vec![0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize];
     let mut returned = 0;
-    // SAFETY: the handle is open for synchronous I/O, and the buffer is as
-    // long as it says.
-    let done = unsafe {
+    // SAFETY:
+    // 1. The handle is borrowed.
+    // 2. The buffer is as long as the call is told, and needs no alignment:
+    //    it is read as bytes. The count is a `u32`.
+    // 3. The call writes the buffer, from a `&mut` borrow, and the count, a
+    //    raw borrow of a local variable; nothing else uses either until it
+    //    returns. It takes no input; the other pointers are null, which the
+    //    call takes as none.
+    // 4. The handle is open for synchronous I/O, and no `OVERLAPPED` is
+    //    given; `succeeded` checks.
+    succeeded(unsafe {
         DeviceIoControl(
             handle.as_raw_handle(),
             FSCTL_GET_REPARSE_POINT,
@@ -387,11 +403,9 @@ fn reparse_target(handle: &OwnedHandle) -> io::Result<Vec<u16>> {
             &raw mut returned,
             ptr::null_mut(),
         )
-    };
-    if done == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let data = &buffer[..returned as usize];
+    })?;
+    // 5. Only what the call says it wrote, as bytes.
+    let data = buffer.get(..returned as usize).unwrap_or(&buffer);
     let u16_at = |at: usize| -> io::Result<u16> {
         data.get(at..at + 2)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
@@ -449,8 +463,14 @@ fn user_path(mut path: Vec<u16>) -> io::Result<Vec<u16>> {
     };
     let short: Vec<u16> = path[from..].iter().copied().chain([0]).collect();
     let mut full = vec![0u16; LEGACY_MAX_PATH + 1];
-    // SAFETY: `short` ends with a NUL, and `full` is as long as it says.
-    let length = unsafe {
+    // SAFETY: GetFullPathNameW touches no handle, and does no I/O (rules 1,
+    // 4 and 6 do not apply).
+    // 2. `short` ends with a NUL, and `full` is as many units long as the
+    //    call is told.
+    // 3. The call reads `short`, and writes `full`, from a `&mut` borrow
+    //    that nothing else uses until it returns. The file part's pointer is
+    //    null, which the call takes as none.
+    let written = unsafe {
         GetFullPathNameW(
             short.as_ptr(),
             length(full.len()),
@@ -458,10 +478,12 @@ fn user_path(mut path: Vec<u16>) -> io::Result<Vec<u16>> {
             ptr::null_mut(),
         )
     } as usize;
-    if length == 0 {
+    if written == 0 {
         return Err(io::Error::last_os_error());
     }
-    if length < full.len() && full[..length] == short[..short.len() - 1] {
+    // 5. Only what the call says it wrote: a length under the buffer's is
+    // the path's, without its NUL.
+    if written < full.len() && full[..written] == short[..short.len() - 1] {
         return Ok(short[..short.len() - 1].to_vec());
     }
     if is_unc {
@@ -471,7 +493,209 @@ fn user_path(mut path: Vec<u16>) -> io::Result<Vec<u16>> {
 }
 
 fn nt_error(status: NTSTATUS) -> io::Error {
-    // SAFETY: a pure conversion of a status code.
+    // SAFETY: a conversion of a status code, which takes no pointer or
+    // handle.
     let code = unsafe { RtlNtStatusToDosError(status) };
     io::Error::from_raw_os_error(code.cast_signed())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+
+    use windows_sys::Wdk::Storage::FileSystem::FILE_NETWORK_OPEN_INFORMATION;
+    use windows_sys::Win32::Foundation::STATUS_ACCESS_DENIED;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK,
+    };
+
+    use super::{Buffer, Directory};
+    use crate::records::chain::{Chain, file};
+    use crate::sys::stand_in::{Script, asked, handle, script};
+
+    fn directory() -> Directory {
+        // SAFETY: `handle` gives an open handle that nothing else owns.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle()) };
+        Directory { handle }
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    fn names(directory: &mut Directory) -> std::io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        directory
+            .list(&mut Buffer::default(), |entry| {
+                names.push(String::from_utf16(&entry.name().collect::<Vec<_>>()).expect("UTF-16"));
+                true
+            })
+            .map(|()| names)
+    }
+
+    #[test]
+    fn a_listing_reads_until_there_are_no_more_entries() {
+        let mut first = Chain::default();
+        first.push(".", file(0), 0).push("a", file(1), 0);
+        let mut second = Chain::default();
+        second.push("b", file(2), 0);
+        script(Script {
+            listing: [Ok(first.bytes), Ok(second.bytes)].into(),
+            ..Script::default()
+        });
+
+        assert_eq!(names(&mut directory()).expect("list"), ["a", "b"]);
+        assert_eq!(
+            asked(|script| script.restarts.clone()),
+            [true, false, false]
+        );
+    }
+
+    #[test]
+    fn a_failed_read_fails_the_listing_after_the_entries_before_it() {
+        let mut first = Chain::default();
+        first.push("a", file(1), 0);
+        script(Script {
+            listing: [Ok(first.bytes), Err(STATUS_ACCESS_DENIED)].into(),
+            ..Script::default()
+        });
+
+        let mut seen = Vec::new();
+        let read = directory().list(&mut Buffer::default(), |entry| {
+            seen.push(entry.metadata);
+            true
+        });
+        assert!(read.is_err());
+        assert_eq!(seen, [file(1)]);
+    }
+
+    #[test]
+    fn a_listing_that_is_stopped_reads_no_further() {
+        let mut first = Chain::default();
+        first.push("a", file(1), 0).push("b", file(1), 0);
+        script(Script {
+            listing: [Ok(first.bytes)].into(),
+            ..Script::default()
+        });
+
+        directory()
+            .list(&mut Buffer::default(), |_| false)
+            .expect("list");
+        assert_eq!(asked(|script| script.restarts.len()), 1);
+    }
+
+    #[test]
+    fn a_directory_opens_by_its_name_relative_to_its_parent() {
+        script(Script::default());
+        let mut opened = directory().open_dir(&wide("sub")).expect("open");
+        assert_eq!(asked(|script| script.opened.clone()), [(wide("sub"), true)]);
+        assert_eq!(names(&mut opened).expect("list"), Vec::<String>::new());
+
+        script(Script {
+            create: STATUS_ACCESS_DENIED,
+            ..Script::default()
+        });
+        assert!(directory().open_dir(&wide("sub")).is_err());
+    }
+
+    #[test]
+    fn a_directory_reads_its_own_metadata() {
+        script(Script {
+            network_open: FILE_NETWORK_OPEN_INFORMATION {
+                FileAttributes: FILE_ATTRIBUTE_DIRECTORY,
+                EndOfFile: 4096,
+                LastWriteTime: 7,
+                ..FILE_NETWORK_OPEN_INFORMATION::default()
+            },
+            ..Script::default()
+        });
+        let metadata = directory().metadata().expect("metadata");
+        assert_eq!(
+            (metadata.attributes, metadata.reparse_tag),
+            (FILE_ATTRIBUTE_DIRECTORY, 0)
+        );
+        assert_eq!((metadata.size, metadata.last_write), (4096, 7));
+        // Only a reparse point has a tag to read.
+        assert_eq!(asked(|script| script.attribute_tag_reads), 0);
+
+        let attributes = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
+        script(Script {
+            network_open: FILE_NETWORK_OPEN_INFORMATION {
+                FileAttributes: attributes,
+                ..FILE_NETWORK_OPEN_INFORMATION::default()
+            },
+            attribute_tag: FILE_ATTRIBUTE_TAG_INFO {
+                FileAttributes: attributes,
+                ReparseTag: IO_REPARSE_TAG_MOUNT_POINT,
+            },
+            ..Script::default()
+        });
+        let metadata = directory().metadata().expect("metadata");
+        assert_eq!(metadata.reparse_tag, IO_REPARSE_TAG_MOUNT_POINT);
+    }
+
+    // A REPARSE_DATA_BUFFER with one name as both the substitute and the
+    // print name.
+    fn reparse(tag: u32, target: &str, relative: bool) -> Vec<u8> {
+        let name: Vec<u8> = target.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let length = u16::try_from(name.len()).expect("a short target");
+        let mut data = Vec::new();
+        data.extend(tag.to_le_bytes());
+        data.extend([0; 4]);
+        // The substitute name's offset and length, and the print name's.
+        data.extend(
+            [0u16, length, 0, length]
+                .iter()
+                .flat_map(|field| field.to_le_bytes()),
+        );
+        if tag == IO_REPARSE_TAG_SYMLINK {
+            data.extend(u32::from(relative).to_le_bytes());
+        }
+        data.extend(name);
+        data
+    }
+
+    fn read_link(reparse: Vec<u8>) -> std::io::Result<String> {
+        script(Script {
+            reparse,
+            ..Script::default()
+        });
+        let target = directory().read_link(&wide("link"))?;
+        assert_eq!(
+            asked(|script| script.opened.clone()),
+            [(wide("link"), false)]
+        );
+        Ok(String::from_utf16(&target).expect("UTF-16"))
+    }
+
+    #[test]
+    fn a_link_reads_as_std_reads_it() {
+        let symlink = |target, relative| reparse(IO_REPARSE_TAG_SYMLINK, target, relative);
+        assert_eq!(
+            read_link(symlink(r"\??\C:\target", false)).expect("read"),
+            r"C:\target"
+        );
+        assert_eq!(
+            read_link(symlink(r"..\target", true)).expect("read"),
+            r"..\target"
+        );
+        assert_eq!(
+            read_link(symlink(r"\??\UNC\server\share", false)).expect("read"),
+            r"\\server\share"
+        );
+        let junction = reparse(IO_REPARSE_TAG_MOUNT_POINT, r"\??\D:\target", false);
+        assert_eq!(read_link(junction).expect("read"), r"D:\target");
+    }
+
+    #[test]
+    fn a_short_or_unknown_reparse_point_is_refused() {
+        let whole = reparse(IO_REPARSE_TAG_SYMLINK, r"\??\C:\target", false);
+        for cut in 0..whole.len() {
+            assert!(read_link(whole[..cut].to_vec()).is_err(), "cut at {cut}");
+        }
+        assert!(read_link(reparse(0x8000_0017, "x", false)).is_err());
+    }
 }

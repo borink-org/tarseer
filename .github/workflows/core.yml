@@ -50,3 +50,16 @@ jobs:
 
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
+
+  # tarseer-nt's unit tests under Miri, on the Windows target. They run the
+  # calls into the system against stand-ins that use every byte the calls
+  # may, so Miri checks what the calls are given.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly branch
+        with:
+          components: miri, rust-src
+
+      - run: cargo miri test --locked -p tarseer-nt --lib --target x86_64-pc-windows-msvc

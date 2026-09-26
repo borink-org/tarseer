@@ -71,10 +71,11 @@ impl Directory {
             || errno == Some(rustix::io::Errno::NFILE.raw_os_error())
     }
 
-    /// Reads and sorts the directory's entries.
+    /// Reads and sorts the directory's entries. The descriptor keeps the
+    /// listing's place, so one listing of it runs at a time.
     // The signature is the portable reader's, which can fail here.
     #[allow(clippy::unnecessary_wraps)]
-    pub fn list(&self, scratch: &mut Scratch) -> io::Result<Listing> {
+    pub fn list(&mut self, scratch: &mut Scratch) -> io::Result<Listing> {
         let mut listing = Listing::from_spare(&mut scratch.spare);
         let mut raw = RawDir::new(&self.fd, &mut scratch.buffer);
         while let Some(entry) = raw.next() {

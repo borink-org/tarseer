@@ -31,7 +31,7 @@ fn wide(name: &str) -> Vec<u16> {
 }
 
 // Every entry's name, and whether it is a directory, and its size.
-fn listed(directory: &Directory) -> Vec<(String, bool, u64)> {
+fn listed(directory: &mut Directory) -> Vec<(String, bool, u64)> {
     let mut entries = Vec::new();
     directory
         .list(&mut Buffer::default(), |entry| {
@@ -51,9 +51,9 @@ fn a_listing_gives_each_entry_with_its_metadata() {
     fs::write(temp_dir.0.join("file"), b"hello").expect("write");
     fs::create_dir(temp_dir.0.join("sub")).expect("create a directory");
 
-    let directory = Directory::open(&temp_dir.0).expect("open");
+    let mut directory = Directory::open(&temp_dir.0).expect("open");
     assert_eq!(
-        listed(&directory),
+        listed(&mut directory),
         [("file".to_owned(), false, 5), ("sub".to_owned(), true, 0)]
     );
 }
@@ -67,8 +67,8 @@ fn a_listing_larger_than_the_buffer_is_read_whole() {
         fs::write(temp_dir.0.join(format!("{index:0>60}")), b"").expect("write");
     }
 
-    let directory = Directory::open(&temp_dir.0).expect("open");
-    let names: Vec<String> = listed(&directory)
+    let mut directory = Directory::open(&temp_dir.0).expect("open");
+    let names: Vec<String> = listed(&mut directory)
         .into_iter()
         .map(|entry| entry.0)
         .collect();
@@ -83,7 +83,7 @@ fn a_listing_stops_when_asked() {
         fs::write(temp_dir.0.join(name), b"").expect("write");
     }
 
-    let directory = Directory::open(&temp_dir.0).expect("open");
+    let mut directory = Directory::open(&temp_dir.0).expect("open");
     let mut seen = 0;
     directory
         .list(&mut Buffer::default(), |_| {
@@ -105,8 +105,8 @@ fn a_directory_opens_relative_to_its_parent() {
     let sub = root
         .open_dir(&wide("SUB"))
         .expect("open, whatever the case");
-    let deeper = sub.open_dir(&wide("deeper")).expect("open");
-    assert_eq!(listed(&deeper), [("file".to_owned(), false, 1)]);
+    let mut deeper = sub.open_dir(&wide("deeper")).expect("open");
+    assert_eq!(listed(&mut deeper), [("file".to_owned(), false, 1)]);
     let metadata = deeper.metadata().expect("metadata");
     assert_ne!(metadata.attributes & FILE_ATTRIBUTE_DIRECTORY, 0);
     assert_eq!(metadata.reparse_tag, 0);
