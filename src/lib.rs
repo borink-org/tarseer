@@ -45,9 +45,7 @@
 //! failed on. [`Cancelled`] and [`TreePartFull`] keep their own types inside a
 //! [`WalkError`]: `report.contains::<Cancelled>()`.
 
-// The Windows reader calls the system through FFI, and allows itself that.
-#![cfg_attr(not(all(windows, not(tarseer_portable_reader))), forbid(unsafe_code))]
-#![cfg_attr(all(windows, not(tarseer_portable_reader)), deny(unsafe_code))]
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod file;

@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli"]
+members = ["cli", "nt"]
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -35,11 +35,9 @@ error-stack = "0.8"
 rustix = { version = "1", default-features = false, features = ["std", "fs", "thread", "time"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-  "Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security",
-  "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl",
-  "Win32_System_SystemServices",
-] }
+# The calls into the system, which this crate makes without `unsafe`.
+tarseer-nt = { path = "nt", version = "0.0.1" }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 # For the LZ4 format in examples/lz4, which shows a format written outside

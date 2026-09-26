@@ -285,6 +285,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "tarseer-nt",
  "windows-sys",
  "zstd-safe",
 ]
@@ -297,6 +298,13 @@ dependencies = [
  "cyo-mimalloc",
  "error-stack",
  "tarseer",
+]
+
+[[package]]
+name = "tarseer-nt"
+version = "0.0.1"
+dependencies = [
+ "windows-sys",
 ]
 
 [[package]]
