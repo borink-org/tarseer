@@ -1,0 +1,3 @@
+# Names that `doc_markdown` would otherwise ask to put in backticks. ".."
+# keeps clippy's own list.
+doc-valid-idents = ["NVMe", ".."]

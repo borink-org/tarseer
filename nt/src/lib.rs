@@ -18,10 +18,12 @@
 //! relative to its open parent. It then reads the listing and the metadata
 //! from that handle.
 //!
-//! With this crate, tarseer's command took 3–27% less time than with
-//! `std::fs` on six trees with warm caches. With cold caches, it took up to
-//! 47% less. Measured on Windows Server 2025, NTFS on a local SSD,
-//! 2026-09-25.
+//! Benchmarks of tarseer on Windows Server 2025, with NTFS on a local NVMe
+//! disk, showed it faster beyond noise with this crate. With warm caches, the
+//! gain was largest on one directory of 100,000 files and on a tree 400 levels
+//! deep. With cold caches, it was largest on trees of many small files. On
+//! 100,000 directories of three files each, with cold caches, the disk set
+//! the time with or without this crate.
 //!
 //! # Auditing the unsafe code
 //!
