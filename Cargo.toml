@@ -35,8 +35,10 @@ error-stack = "0.8"
 rustix = { version = "1", default-features = false, features = ["std", "fs", "thread", "time"] }
 
 [target.'cfg(windows)'.dependencies]
-# The calls into the system, which this crate makes without `unsafe`.
+# The Windows reader's calls into the system, so that this crate has no
+# `unsafe` code.
 tarseer-nt = { path = "nt", version = "0.0.1" }
+# The constants of file attributes and errors.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]

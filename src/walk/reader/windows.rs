@@ -1,16 +1,9 @@
-// The reader for Windows, through `tarseer-nt`: `NtQueryDirectoryFile` into
-// one buffer, which gives every entry's size, times and attributes with its
-// name, and `NtCreateFile` relative to the open directory, as the linux reader
-// uses `openat`. `std` opens every directory by its full path, which Windows
-// resolves from the root each time, and a directory's own metadata takes it
-// another open.
+// The reader for Windows, through `tarseer-nt`. A file's metadata comes from
+// the listing, with no call of its own.
 //
-// A file's metadata from the listing is the copy NTFS keeps in the entry of
-// the name listed. Writing through one name refreshes that name's entry
-// only: the entries of a hard-linked file's other names keep the old size
-// and times until it is opened through them.
-// `NtQueryInformationByName` (`FileStatInformation`) would read the file's
-// own, with its link count, at one call per file, as `statx` on Linux.
+// On NTFS, a hard-linked file's other names keep its old size and times in
+// their listings. To read the file's own metadata, with its link count, use
+// `NtQueryInformationByName` (`FileStatInformation`), one call per file.
 
 use std::io;
 use std::path::Path;
@@ -25,8 +18,9 @@ use super::{Kind, Listed, Listing, Spare, Stat};
 use crate::manifest::Timestamp;
 
 // A reparse point whose tag says it names another file: a symlink or a
-// junction. `std` counts exactly these as symlinks; the others (deduplicated
-// or cloud files, ...) are files and directories like any other.
+// junction. `std` counts exactly these as symlinks. The walk records other
+// reparse points, such as deduplicated or cloud files, as files and
+// directories.
 const NAME_SURROGATE: u32 = 0x2000_0000;
 
 // 100-nanosecond intervals from 1601, the Windows epoch, to 1970.
@@ -55,9 +49,9 @@ pub struct Directory {
 
 impl Directory {
     /// Whether the walk reads a directory's metadata from the directory itself
-    /// and not from its parent's listing. The listing holds a copy that the
-    /// filesystem updates late, so a directory that was just written into
-    /// shows an old mtime there; the open directory costs one call.
+    /// and not from its parent's listing. The filesystem updates the
+    /// listing's copy late, so a directory that was just written into shows
+    /// an old mtime there. Reading the open directory costs one call.
     pub const STATS_ITSELF: bool = true;
 
     /// Opens the root of a walk. A root that is a symlink is followed.
@@ -71,8 +65,8 @@ impl Directory {
         self.open_name(name_of(listed, listing))
     }
 
-    /// Opens the directory `name` inside this one, not following a link: a
-    /// name that became a link since it was listed is opened as the link.
+    /// Opens the directory `name` inside this one, not following a link. A
+    /// name that became a link after it was listed is opened as the link.
     pub fn open_name(&self, name: &str) -> io::Result<Self> {
         let directory = self.directory.open_dir(&wide(name))?;
         Ok(Self { directory })

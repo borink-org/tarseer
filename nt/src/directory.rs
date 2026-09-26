@@ -1,8 +1,7 @@
 // How the calls here stay sound.
 //
-// The system checks every handle and pointer it is given, from a process it
-// does not trust: a bad handle gets an error, and a bad pointer an error or a
-// fault in this process. What a call can harm is this process's memory, and
+// The system checks every handle and pointer that a process gives it. A bad
+// handle gets an error, and a bad pointer an error or a fault in this process. What a call can harm is this process's memory, and
 // only through what the call is given. Each `unsafe` block below keeps these
 // rules for what it gives, and its `SAFETY` comment says how:
 //
@@ -15,20 +14,20 @@
 //    others. No Rust reference to that memory is used while the call runs.
 // 4. Lifetime. The system is done with every pointer when the call returns.
 //    Every handle here is open for synchronous I/O, and on one, a call waits
-//    for its I/O. On a handle open for asynchronous I/O a call can return
-//    `STATUS_PENDING`, or `ERROR_IO_PENDING`, and write into its buffer and
-//    its status block, which is on the stack, later. `completed` and
-//    `succeeded` abort the process if a call ever does, since unwinding would
-//    free that memory while the system still writes it.
+//    for its I/O. On a handle open for asynchronous I/O, a call can return
+//    `STATUS_PENDING` or `ERROR_IO_PENDING`. The system then writes into its
+//    buffer and its status block later, and the status block is on the
+//    stack. `completed` and `succeeded` abort the process if a call ever
+//    returns either. Unwinding would free memory that the system still writes.
 // 5. Output. What a call writes is read only as far as the call says it
-//    wrote. A struct the system fills is all integers, so any bytes are a
-//    valid one; listings and reparse points are parsed as bytes in safe
+//    wrote. A struct that the system fills is all integers, so any bytes are
+//    a valid one. Listings and reparse points are parsed as bytes, in safe
 //    code. Every buffer starts zeroed, so none is read uninitialized.
 // 6. Ownership. A handle a call returns is owned by one `OwnedHandle`, made
 //    only when the call succeeded.
 //
 // The unit tests run the code here against stand-ins for the calls (see
-// `sys`), under Miri too, which checks rules 2, 3 and 5 on what is given.
+// `sys`), also under Miri. Miri checks rules 2, 3 and 5 on what is given.
 
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
@@ -103,8 +102,8 @@ impl Directory {
     ///
     /// # Errors
     ///
-    /// If the open fails, or [`io::ErrorKind::NotADirectory`] if `path` is
-    /// not a directory.
+    /// Returns the open's error if it fails. Returns an error of kind
+    /// [`io::ErrorKind::NotADirectory`] if `path` is not a directory.
     pub fn open(path: &Path) -> io::Result<Self> {
         // `std` opens for synchronous I/O unless asked otherwise (rule 4).
         let file = std::fs::OpenOptions::new()
@@ -129,7 +128,8 @@ impl Directory {
     ///
     /// # Errors
     ///
-    /// If the open fails, or if `name` is not a directory.
+    /// Returns the open's error if it fails, which it does if `name` is not a
+    /// directory.
     pub fn open_dir(&self, name: &[u16]) -> io::Result<Self> {
         let handle = self.open_relative(
             name,
@@ -155,7 +155,8 @@ impl Directory {
     ///
     /// # Errors
     ///
-    /// If a read fails. `each` has then seen the entries read before it.
+    /// Returns a read's error if it fails. `each` has then seen the entries
+    /// that were read before it.
     pub fn list(
         &mut self,
         buffer: &mut Buffer,
@@ -208,7 +209,7 @@ impl Directory {
     ///
     /// # Errors
     ///
-    /// If a call fails.
+    /// Returns a call's error if it fails.
     pub fn metadata(&self) -> io::Result<Metadata> {
         let mut information = FILE_NETWORK_OPEN_INFORMATION::default();
         let mut status_block = IO_STATUS_BLOCK::default();
@@ -251,7 +252,8 @@ impl Directory {
     ///
     /// # Errors
     ///
-    /// If a call fails, or if `name` is another kind of reparse point, or none.
+    /// Returns a call's error if it fails. Returns an error if `name` is
+    /// another kind of reparse point, or not one at all.
     pub fn read_link(&self, name: &[u16]) -> io::Result<Vec<u16>> {
         let handle = self.open_relative(name, FILE_READ_ATTRIBUTES | SYNCHRONIZE, 0)?;
         reparse_target(&handle)
@@ -386,9 +388,9 @@ fn reparse_target(handle: &OwnedHandle) -> io::Result<Vec<u16>> {
     // 2. The buffer is as long as the call is told, and needs no alignment:
     //    it is read as bytes. The count is a `u32`.
     // 3. The call writes the buffer, from a `&mut` borrow, and the count, a
-    //    raw borrow of a local variable; nothing else uses either until it
-    //    returns. It takes no input; the other pointers are null, which the
-    //    call takes as none.
+    //    raw borrow of a local variable. Nothing else uses either until it
+    //    returns. It takes no input, and the other pointers are null, which
+    //    the call takes as none.
     // 4. The handle is open for synchronous I/O, and no `OVERLAPPED` is
     //    given; `succeeded` checks.
     succeeded(unsafe {

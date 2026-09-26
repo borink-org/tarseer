@@ -18,10 +18,11 @@ use tarseer::{DEFAULT_BUDGET, Skips, WalkError, WalkOptions, WriteError, walk_pa
 static GLOBAL: cyo_mimalloc::MiMalloc = cyo_mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
-    // Where memory is not overcommitted (Windows), mimalloc commits each page
-    // whole, 4 MiB for blocks over 84 KiB, and growing buffers take one per
-    // size class per thread; committing on demand charges what is touched.
-    // Before the first walk thread, and only if the environment does not say.
+    // Where memory is not overcommitted, as on Windows, mimalloc commits each
+    // page whole. A page is 4 MiB for blocks over 84 KiB, and a growing buffer
+    // takes one per size class on every thread. Committing on demand charges
+    // only what is touched. This is set before the first walk thread starts,
+    // and only if the environment does not set it.
     if std::env::var_os("MIMALLOC_PAGE_COMMIT_ON_DEMAND").is_none() {
         cyo_mimalloc::MiMalloc::option_set(
             cyo_mimalloc::mi_option_t::mi_option_page_commit_on_demand,

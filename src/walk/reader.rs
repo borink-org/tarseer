@@ -160,7 +160,7 @@ impl Listing {
     }
 
     /// The name of `listed` as text, or `None` if it is not UTF-8.
-    // Only the Windows reader uses it until the scan does.
+    // Only the Windows reader uses it.
     #[cfg_attr(not(all(windows, not(tarseer_portable_reader))), allow(dead_code))]
     pub fn name_text(&self, listed: &Listed) -> Option<&str> {
         match &self.names {
@@ -178,9 +178,8 @@ impl Listing {
             Names::Text(text) => text.as_bytes(),
         };
         // The sort is of one integer for each entry: the first eight bytes
-        // of its name, and its place. Integers sort several times faster than
-        // records that are compared through a function. Names that share
-        // their first eight bytes are then put in order among themselves.
+        // of its name, and its place. Names that share their first eight
+        // bytes are then put in order among themselves.
         let entries = &self.entries;
         self.keys.clear();
         self.keys.extend(

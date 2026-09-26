@@ -299,7 +299,7 @@ fn under_skip_an_unstatable_entry_is_counted_and_named_and_the_walk_goes_on() {
     assert!(walked.paths().iter().any(|path| path == "top.txt"));
 }
 
-// Linux only: other filesystems refuse to create such a name.
+// Other platforms' filesystems refuse to create such a name.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_name_that_is_not_utf8_is_counted_and_the_rest_still_walks() {

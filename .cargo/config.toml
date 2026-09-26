@@ -1,8 +1,9 @@
 [env]
-# Build-time defaults of the command's allocator; the allocator reads them
-# before `main` runs, so the command cannot set them itself. Transparent huge
-# pages are off: with them, every region a thread touches takes 2 MiB, which
-# with many walk threads is most of what the command holds. Arenas are then
-# committed at once, as mimalloc does by default, and not page by page, which
-# took an `mprotect` for each commit.
+# Build-time defaults of the command's allocator. The allocator reads them
+# before `main` runs, so the command cannot set them itself.
+#
+# Transparent huge pages are off. With them, every region that a thread touches
+# takes 2 MiB, and with many walk threads that is most of the command's memory.
+# Leave arenas committed at once, as mimalloc does by default. Committing page
+# by page takes an `mprotect` for each page, which stalls the other threads.
 MI_DEFAULT_ALLOW_THP = "0"

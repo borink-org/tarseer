@@ -4,9 +4,9 @@
 //
 // They are parsed in safe code, as bytes, and every offset and length is
 // checked against what the call said it wrote. The records come from a
-// filesystem driver, and one that writes garbage gives wrong entries or ends
-// the chain early: nothing is read outside what was written, and nothing
-// panics.
+// filesystem driver. If it writes garbage, the result is wrong entries or a
+// chain that ends early. Nothing is read outside what was written, and
+// nothing panics.
 
 use std::mem::offset_of;
 
@@ -37,13 +37,14 @@ pub struct Entry<'b> {
     // UTF-16, little-endian.
     name: &'b [u8],
     /// The entry's metadata. It is the copy the filesystem keeps in the
-    /// directory, which on NTFS can be older than the file's own: see
-    /// `Directory::list`.
+    /// directory, which on NTFS can be older than the file's own. See
+    /// [`Directory::list`](crate::Directory::list).
     pub metadata: Metadata,
 }
 
 impl Entry<'_> {
-    /// The entry's name, in UTF-16 units that need not be valid UTF-16.
+    /// Returns the entry's name, in UTF-16 units that need not be valid
+    /// UTF-16.
     pub fn name(&self) -> impl Iterator<Item = u16> + '_ {
         self.name
             .as_chunks::<2>()
@@ -178,7 +179,7 @@ pub(crate) mod chain {
         bytes[at..at + value.len()].copy_from_slice(value);
     }
 
-    /// A file's metadata.
+    /// Returns the metadata of a file of `size` bytes.
     pub fn file(size: u64) -> Metadata {
         Metadata {
             attributes: 0x20,
@@ -310,7 +311,8 @@ mod tests {
         for _ in 0..rounds {
             let length = usize::try_from(random() % 600).expect("small");
             let mut data: Vec<u8> = (0..length).map(|_| random().to_le_bytes()[0]).collect();
-            // Offsets and lengths small enough to lead somewhere, often.
+            // Small offsets and lengths, often, so that some chains go past
+            // their first record.
             for at in (0..length.saturating_sub(4)).step_by(8) {
                 if random() % 3 == 0 {
                     put_u32(&mut data, at, u32::try_from(random() % 160).expect("small"));
