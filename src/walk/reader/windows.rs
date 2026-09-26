@@ -54,6 +54,9 @@ impl Directory {
     /// an old mtime there. Reading the open directory costs one call.
     pub const STATS_ITSELF: bool = true;
 
+    /// Whether a value of this type keeps a handle open.
+    pub const HOLDS_A_HANDLE: bool = true;
+
     /// Opens the root of a walk. A root that is a symlink is followed.
     pub fn open_root(root: &Path) -> io::Result<Self> {
         let directory = tarseer_nt::Directory::open(root)?;
@@ -70,6 +73,13 @@ impl Directory {
     pub fn open_name(&self, name: &str) -> io::Result<Self> {
         let directory = with_wide(name, |name| self.directory.open_dir(name))?;
         Ok(Self { directory })
+    }
+
+    /// Reads the metadata of `name` inside this directory, without following
+    /// a symlink.
+    pub fn stat_name(&self, name: &str) -> io::Result<Stat> {
+        let metadata = with_wide(name, |name| self.directory.metadata_of(name))?;
+        Ok(converted(&metadata))
     }
 
     /// Returns `true` if `error` says the process has no handle left.

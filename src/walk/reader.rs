@@ -23,6 +23,8 @@ cfg_select! {
     }
 }
 
+#[cfg(unix)]
+pub(super) use imp::stat_fd;
 pub(super) use imp::{Directory, Scratch};
 
 /// The buffers of a listing that has been read, for the next one to fill. A
@@ -107,6 +109,11 @@ impl Listed {
         })
     }
 
+    /// Where the name is in [`Listing::text`]: its start and its length.
+    pub fn span(&self) -> (u32, u32) {
+        (self.start, self.len)
+    }
+
     /// Returns the entry's name, given the buffer of its listing.
     pub fn name<'n>(&self, names: &'n [u8]) -> &'n [u8] {
         &names[self.start as usize..(self.start + self.len) as usize]
@@ -144,6 +151,22 @@ impl Listing {
         }
     }
 
+    /// Gives the buffers up for the next listing.
+    pub fn into_spare(self) -> Spare {
+        let (mut entries, mut names) = (self.entries, self.names.into_bytes());
+        let (mut sorted, mut keys) = (self.sorted, self.keys);
+        entries.clear();
+        names.clear();
+        sorted.clear();
+        keys.clear();
+        Spare {
+            entries,
+            names,
+            sorted,
+            keys,
+        }
+    }
+
     /// The buffer that holds every name.
     pub fn names(&self) -> &[u8] {
         match &self.names {
@@ -160,9 +183,17 @@ impl Listing {
         }
     }
 
+    /// All the names as one text, each followed by whatever the reader put
+    /// after it, or `None` if one of them is not UTF-8. [`Listed::span`] says
+    /// where a name is in it.
+    pub fn text(&self) -> Option<&str> {
+        match &self.names {
+            Names::Text(text) => Some(text),
+            Names::Bytes(_) => None,
+        }
+    }
+
     /// The name of `listed` as text, or `None` if it is not UTF-8.
-    // Only the Windows reader uses it.
-    #[cfg_attr(not(all(windows, not(tarseer_portable_reader))), allow(dead_code))]
     pub fn name_text(&self, listed: &Listed) -> Option<&str> {
         match &self.names {
             Names::Text(text) => {
@@ -237,6 +268,15 @@ impl Listing {
     }
 }
 
+impl Names {
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Text(text) => text.into_bytes(),
+        }
+    }
+}
+
 /// What the walk records of an entry.
 pub(super) struct Stat {
     /// The entry's kind, for an entry listed as [`Kind::Unknown`].
@@ -245,4 +285,16 @@ pub(super) struct Stat {
     pub mtime: Option<Timestamp>,
     /// The permission bits.
     pub mode: u32,
+}
+
+impl Stat {
+    /// What a walk that reads no metadata records: nothing but the kind.
+    pub const fn unread(kind: Kind) -> Self {
+        Self {
+            kind,
+            size: 0,
+            mtime: None,
+            mode: 0,
+        }
+    }
 }

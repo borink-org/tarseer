@@ -15,6 +15,16 @@
 //! The walk opens no file and reads no contents. Paths are relative to the
 //! root, and the root itself has no row.
 //!
+//! # Metadata
+//!
+//! By default the walk reads each entry's size, modification time and
+//! permission bits. With [`Metadata::Kinds`] it reads only what listing a
+//! directory gives, the names and kinds, and the targets of symlinks; that
+//! saves a lookup of every entry. The parts are the same either way, and
+//! [`read_metadata`] fills one in later. A consumer that opens each file, such
+//! as a copy, can instead record a file's metadata from the open file with
+//! `read_file_metadata` (Unix), which needs no second lookup.
+//!
 //! # Walk order
 //!
 //! The walk is depth-first. It lists each directory, sorts the entries by
@@ -26,7 +36,7 @@
 //!
 //! Each row has an estimated size in JSON bytes ([`estimate`]), computed from
 //! its kind and the lengths of its name and target. The walk sums these
-//! estimates and cuts parts against [`WalkOptions::budget`]:
+//! estimates and cuts parts against [`WalkOptions::budget`].
 //!
 //! - a directory whose whole subtree fits the budget is never split;
 //! - a directory whose subtree does not fit groups its children in order, and
@@ -40,28 +50,37 @@
 //!
 //! # Memory
 //!
-//! The walk holds the rows that are not yet in a sealed part, and their
-//! estimates add up to less than about two budgets. It also holds the listing
-//! of every directory between the root and the entry being visited, so a
-//! directory with millions of children costs its whole listing while the walk
-//! is inside it.
+//! Without threads, the walk holds the rows that are not yet in a sealed
+//! part. Their estimates add up to less than about two budgets. It also
+//! holds entries it has read and not yet visited. Those are at most 1,024 for
+//! each directory between the root and the entry being visited. A directory
+//! larger than that costs the names of its whole listing while the walk is
+//! inside it.
 //!
-//! On Unix the walk also keeps each of those directories open, one file
-//! descriptor per level of depth. When the process runs out of descriptors, the
-//! walk closes the shallowest one. It opens that directory again, by its path,
-//! when it returns to it.
+//! On Linux the walk keeps some of the directories it is about to read open,
+//! at most 128. When the process runs out of file descriptors, the walk closes
+//! them. It then opens each by its path when it reads it.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
-use error_stack::{Report, ResultExt as _};
+use error_stack::Report;
 
-use crate::manifest::{EntryKind, Timestamp, TreePart};
+use crate::manifest::{EntryKind, TreePart};
 
+mod assemble;
+mod cut;
+mod fill;
 mod reader;
+mod scan;
 
-use self::reader::{Directory, Kind, Listed, Scratch};
+use self::cut::Walker;
+#[cfg(unix)]
+pub use self::fill::read_file_metadata;
+pub use self::fill::read_metadata;
+use self::reader::{Kind, Listed};
+use self::scan::Scanner;
 
 /// The budget of [`WalkOptions::default()`]: 4 MiB of estimated JSON per
 /// part.
@@ -108,9 +127,9 @@ impl std::error::Error for Cancelled {}
 ///
 /// The walk asks the filter about every entry before it reads the entry's
 /// metadata or lists it. The one exception is a filesystem whose listings give
-/// no kinds: there the walk reads the metadata first, to learn the kind. A refused directory is not listed, so nothing under
-/// it is offered or counted. The filter changes where parts are cut, in the
-/// same way that the tree does.
+/// no kinds: there the walk reads the metadata first, to learn the kind. A
+/// refused directory is not listed, so nothing under it is offered or counted.
+/// The filter changes where parts are cut, in the same way that the tree does.
 pub trait Filter: Send + Sync {
     /// Returns `true` to record `candidate`, or `false` to leave it out.
     fn keep(&self, candidate: &Candidate<'_>) -> bool;
@@ -170,6 +189,8 @@ impl<'a> Listing<'a> {
 
 /// Receives a call for each step the walk takes. Every method does nothing
 /// unless you override it.
+///
+/// Without threads the calls come in walk order.
 pub trait Progress: Send + Sync {
     /// Called before the walk lists the directory at `directory`, which is
     /// empty for the root.
@@ -211,6 +232,33 @@ pub enum OnError {
     Skip,
 }
 
+/// What the walk reads of each entry besides its name and kind.
+///
+/// Where parts are cut depends on the kinds, names and link targets alone,
+/// so both give the same parts, row for row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Metadata {
+    /// Size, modification time and permission bits, one `statx` per entry
+    /// on Linux.
+    ///
+    /// On Windows a file's size and times come from its directory's
+    /// listing, which costs no call. NTFS keeps a copy of them in the entry
+    /// of each of the file's names, and when the file is written through
+    /// one name, the entries of its other names keep the old size and times
+    /// until the file is opened through them. A file with several hard
+    /// links, changed through another name, is then recorded as it was.
+    /// Directories are read from the directory itself and are not affected.
+    #[default]
+    Full,
+    /// Only what the listing of a directory says: the name and the kind, and
+    /// the target of a symlink. Every row has size 0, no modification time
+    /// and mode 0, except those of entries listed without a kind, whose
+    /// metadata is read to find it. A walk that needs no metadata saves a
+    /// lookup of every entry. [`read_metadata`] fills a part in later, on
+    /// any thread, for example while its files are being copied.
+    Kinds,
+}
+
 /// The settings of one walk.
 #[derive(Clone, Copy)]
 pub struct WalkOptions<'a> {
@@ -226,6 +274,8 @@ pub struct WalkOptions<'a> {
     pub cancel: Option<&'a AtomicBool>,
     /// What the walk does with an entry it cannot read.
     pub on_error: OnError,
+    /// What the walk reads of each entry. See [`Metadata`].
+    pub metadata: Metadata,
 }
 
 impl Default for WalkOptions<'_> {
@@ -236,6 +286,7 @@ impl Default for WalkOptions<'_> {
             progress: None,
             cancel: None,
             on_error: OnError::Fail,
+            metadata: Metadata::Full,
         }
     }
 }
@@ -347,8 +398,8 @@ pub fn walk(root: &Path, options: &WalkOptions<'_>) -> Result<Walk, Report<WalkE
     Ok(Walk { parts, skips })
 }
 
-/// Walks `root` and hands each part to `sink` as soon as it is sealed, in
-/// walk order.
+/// Walks `root` and hands each part to `sink` as soon as it is complete,
+/// in walk order, on the calling thread.
 ///
 /// Returns what the walk skipped. `root` itself gets no row, and every path
 /// is relative to it. An error from `sink` stops the walk and is returned
@@ -365,634 +416,7 @@ pub fn walk_parts(
     options: &WalkOptions<'_>,
     sink: &mut dyn FnMut(TreePart) -> Result<(), Report<WalkError>>,
 ) -> Result<Skips, Report<WalkError>> {
-    let mut walker = Walker {
-        options,
-        sink,
-        rows: Vec::new(),
-        text: String::new(),
-        base: 0,
-        total: 0,
-        path: String::new(),
-        stack: Vec::new(),
-        measuring: 1,
-        skips: Skips::default(),
-        root: root.to_path_buf(),
-        scratch: Scratch::default(),
-    };
-    walker.run(root)?;
-    Ok(walker.skips)
-}
-
-// A row waiting for its part. Its strings sit in `Walker::text`, in row order.
-struct Row {
-    depth: u32,
-    name_len: u32,
-    target_len: u32,
-    meta: Meta,
-}
-
-enum Meta {
-    Directory {
-        mtime: Option<Timestamp>,
-        mode: u32,
-    },
-    File {
-        size: u64,
-        mtime: Option<Timestamp>,
-        mode: u32,
-    },
-    Symlink {
-        mtime: Option<Timestamp>,
-        directory: Option<bool>,
-    },
-}
-
-// An open directory. Row positions are absolute: `Walker::base` plus an index
-// into `Walker::rows`.
-struct Level {
-    listing: reader::Listing,
-    // `None` for a directory that could not be opened, and for one whose
-    // handle was given up when the process ran out of them.
-    directory: Option<Directory>,
-    next: usize,
-    // Length of this directory's relative path in `Walker::path`.
-    path_len: usize,
-    // Position of its own row; unused at the root, which has none.
-    row: usize,
-    // `Walker::total` before its own row: its subtree so far is the difference.
-    start_total: u64,
-    split: bool,
-    // Split only: where the open group starts, and its estimate. Empty when
-    // `group_first` is the position of whatever comes next; `usize::MAX` while
-    // an over-budget child is being walked.
-    group_first: usize,
-    group_bytes: u64,
-    // Measuring only: each finished child's position and estimate.
-    completed: Vec<(usize, u64)>,
-}
-
-struct Walker<'o, 's> {
-    options: &'o WalkOptions<'o>,
-    sink: &'s mut dyn FnMut(TreePart) -> Result<(), Report<WalkError>>,
-    rows: Vec<Row>,
-    text: String,
-    // Absolute position of `rows[0]`; everything before it has been sealed.
-    base: usize,
-    // Running estimate of every row so far.
-    total: u64,
-    path: String,
-    stack: Vec<Level>,
-    // Index of the outermost measuring level; `stack.len()` if none.
-    measuring: usize,
-    skips: Skips,
-    root: PathBuf,
-    scratch: Scratch,
-}
-
-impl Walker<'_, '_> {
-    fn run(&mut self, root: &Path) -> Result<(), Report<WalkError>> {
-        if let Some(progress) = self.options.progress {
-            progress.entered("");
-        }
-        // An error under either policy: counting the root as a skip would
-        // report an empty walk as a success.
-        let mut directory = Directory::open_root(root)
-            .attach_with(|| format!("listing {}", root.display()))
-            .change_context(WalkError)?;
-        let mut listing = directory
-            .list(&mut self.scratch)
-            .attach_with(|| format!("listing {}", root.display()))
-            .change_context(WalkError)?;
-        self.report(&mut listing)?;
-        self.stack.push(Level {
-            listing,
-            directory: Some(directory),
-            next: 0,
-            path_len: 0,
-            row: 0,
-            start_total: 0,
-            split: true,
-            group_first: 0,
-            group_bytes: 0,
-            completed: Vec::new(),
-        });
-
-        while let Some(top) = self.stack.last_mut() {
-            if top.next == top.listing.entries.len() {
-                self.finish_level()?;
-                continue;
-            }
-            let index = top.next;
-            top.next += 1;
-            if self
-                .options
-                .cancel
-                .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
-            {
-                return Err(Report::new(Cancelled).change_context(WalkError));
-            }
-            // The listing is moved out while its entry is handled, so that
-            // `visit` can borrow the walker mutably.
-            let level = self.stack.len() - 1;
-            let listing = std::mem::take(&mut self.stack[level].listing);
-            let visited = self.visit(level, &listing, index);
-            self.stack[level].listing = listing;
-            visited?;
-        }
-        Ok(())
-    }
-
-    // Handles one entry from start to finish. Splitting it would pass the
-    // same walker state through several more functions.
-    #[allow(clippy::too_many_lines)]
-    fn visit(
-        &mut self,
-        level: usize,
-        listing: &reader::Listing,
-        index: usize,
-    ) -> Result<(), Report<WalkError>> {
-        let listed = &listing.entries[index];
-        let parent_len = self.stack[level].path_len;
-        self.path.truncate(parent_len);
-
-        let name = listed.name(listing.names());
-        let name = match std::str::from_utf8(name) {
-            Ok(name) if listed.kind != Kind::NonUtf8 => name,
-            Ok(lossy) => {
-                self.skip_named(lossy, SkipReason::NonUtf8);
-                return Ok(());
-            }
-            Err(_) => {
-                self.skip_named(&String::from_utf8_lossy(name), SkipReason::NonUtf8);
-                return Ok(());
-            }
-        };
-        self.ensure_open(level)?;
-
-        // A listing without kinds costs a read of the metadata before the
-        // filter is asked.
-        let mut stat = None;
-        let mut listed_kind = listed.kind;
-        if listed_kind == Kind::Unknown {
-            match self.open(level).stat(listed, listing) {
-                Ok(found) => {
-                    listed_kind = found.kind;
-                    stat = Some(found);
-                }
-                Err(error) => return self.failed_at(error, name, "kind"),
-            }
-        }
-        let kind = match listed_kind {
-            Kind::Symlink { .. } => EntryKind::Symlink,
-            Kind::Directory => EntryKind::Directory,
-            Kind::File => EntryKind::File,
-            Kind::Special | Kind::Unknown | Kind::NonUtf8 => {
-                self.skip_named(name, SkipReason::Special);
-                return Ok(());
-            }
-        };
-        if let Some(filter) = self.options.filter {
-            let candidate = Candidate {
-                parent: &self.path,
-                name,
-                kind,
-                listing: Listing {
-                    entries: &listing.entries,
-                    names: listing.names(),
-                },
-            };
-            if !filter.keep(&candidate) {
-                return Ok(());
-            }
-        }
-        if parent_len > 0 {
-            self.path.push('/');
-        }
-        self.path.push_str(name);
-
-        // A directory is opened before its metadata is read, because an open
-        // directory can report its own.
-        let opened =
-            (kind == EntryKind::Directory).then(|| self.open_child(level, listed, listing));
-        let stat = match (stat, &opened) {
-            (Some(stat), _) => Ok(stat),
-            (None, Some(Ok(directory))) if Directory::STATS_ITSELF => directory.stat_self(),
-            _ => self.open(level).stat(listed, listing),
-        };
-        let stat = match stat {
-            Ok(stat) => stat,
-            Err(error) => return self.failed(error, "metadata"),
-        };
-        let depth = narrow(level)?;
-        let name_len = narrow(name.len())?;
-
-        match listed_kind {
-            Kind::Symlink { directory } => {
-                // The reader appends the target after the name.
-                let name_at = self.text.len();
-                self.text.push_str(name);
-                let open = self.stack[level]
-                    .directory
-                    .as_ref()
-                    .expect("`ensure_open` ran for this level");
-                match open.read_link(listed, listing, &mut self.text) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        self.text.truncate(name_at);
-                        self.skip(SkipReason::NonUtf8);
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        self.text.truncate(name_at);
-                        return self.failed(error, "target");
-                    }
-                }
-                let target = &self.text[name_at + name.len()..];
-                let target_len = narrow(target.len())?;
-                let bytes = estimate(kind, name, target);
-                self.push_leaf(
-                    Row {
-                        depth,
-                        name_len,
-                        target_len,
-                        meta: Meta::Symlink {
-                            mtime: stat.mtime,
-                            directory,
-                        },
-                    },
-                    bytes,
-                )?;
-                self.recorded(kind, 0);
-            }
-            Kind::Directory => {
-                let bytes = estimate(kind, name, "");
-                self.text.push_str(name);
-                let row = self.base + self.rows.len();
-                self.rows.push(Row {
-                    depth,
-                    name_len,
-                    target_len: 0,
-                    meta: Meta::Directory {
-                        mtime: stat.mtime,
-                        mode: stat.mode,
-                    },
-                });
-                self.recorded(kind, 0);
-                if let Some(progress) = self.options.progress {
-                    progress.entered(&self.path);
-                }
-                let read = opened
-                    .expect("a directory was opened above")
-                    .and_then(|mut directory| Ok((directory.list(&mut self.scratch)?, directory)));
-                let (mut listing, directory) = match read {
-                    Ok((listing, directory)) => (listing, Some(directory)),
-                    Err(error) => {
-                        self.unreadable(error)?;
-                        (reader::Listing::default(), None)
-                    }
-                };
-                self.report(&mut listing)?;
-                self.stack.push(Level {
-                    listing,
-                    directory,
-                    next: 0,
-                    path_len: self.path.len(),
-                    row,
-                    start_total: self.total,
-                    split: false,
-                    group_first: 0,
-                    group_bytes: 0,
-                    completed: Vec::new(),
-                });
-                self.total += bytes;
-                self.check_budget()?;
-            }
-            _ => {
-                let bytes = estimate(kind, name, "");
-                self.text.push_str(name);
-                self.push_leaf(
-                    Row {
-                        depth,
-                        name_len,
-                        target_len: 0,
-                        meta: Meta::File {
-                            size: stat.size,
-                            mtime: stat.mtime,
-                            mode: stat.mode,
-                        },
-                    },
-                    bytes,
-                )?;
-                self.recorded(kind, stat.size);
-            }
-        }
-        Ok(())
-    }
-
-    fn open(&self, level: usize) -> &Directory {
-        self.stack[level]
-            .directory
-            .as_ref()
-            .expect("`ensure_open` ran for this level")
-    }
-
-    // Opens a child of `level`. When the process has no handle left, the walk
-    // gives up the handle of its shallowest open ancestor and tries again.
-    // `ensure_open` opens that ancestor again when the walk returns to it.
-    fn open_child(
-        &mut self,
-        level: usize,
-        listed: &Listed,
-        listing: &reader::Listing,
-    ) -> std::io::Result<Directory> {
-        loop {
-            match self.open(level).open_child(listed, listing) {
-                Err(error) if Directory::out_of_handles(&error) && self.release_above(level) => {}
-                result => return result,
-            }
-        }
-    }
-
-    fn release_above(&mut self, level: usize) -> bool {
-        let open = self.stack[..level]
-            .iter_mut()
-            .find(|above| above.directory.is_some());
-        match open {
-            Some(above) => {
-                above.directory = None;
-                true
-            }
-            None => false,
-        }
-    }
-
-    // `self.path` must name the directory of `level` or something below it.
-    fn ensure_open(&mut self, level: usize) -> Result<(), Report<WalkError>> {
-        if self.stack[level].directory.is_some() {
-            return Ok(());
-        }
-        let relative = &self.path[..self.stack[level].path_len];
-        let path = self.root.join(relative);
-        loop {
-            match Directory::open_root(&path) {
-                Ok(directory) => {
-                    self.stack[level].directory = Some(directory);
-                    return Ok(());
-                }
-                Err(error) if Directory::out_of_handles(&error) && self.release_above(level) => {}
-                Err(error) => {
-                    return Err(error)
-                        .attach_with(|| format!("opening {} again", path.display()))
-                        .change_context(WalkError);
-                }
-            }
-        }
-    }
-
-    // A directory below the root that cannot be opened or listed costs its
-    // whole subtree, so under `Skip` it has its own count.
-    fn unreadable(&mut self, error: std::io::Error) -> Result<(), Report<WalkError>> {
-        match self.options.on_error {
-            OnError::Fail => Err(error)
-                .attach_with(|| format!("listing {}", self.path))
-                .change_context(WalkError),
-            OnError::Skip => {
-                self.skip(SkipReason::Unreadable);
-                Ok(())
-            }
-        }
-    }
-
-    // Handles the entries a listing could not read. `self.path` names the
-    // listed directory.
-    fn report(&mut self, listing: &mut reader::Listing) -> Result<(), Report<WalkError>> {
-        for (error, name, what) in std::mem::take(&mut listing.failures) {
-            match name {
-                Some(name) => self.failed_at(error, &name, what)?,
-                None => self.failed(error, what)?,
-            }
-        }
-        Ok(())
-    }
-
-    // `failed` for the entry `name` inside the directory `self.path` names.
-    fn failed_at(
-        &mut self,
-        error: std::io::Error,
-        name: &str,
-        what: &str,
-    ) -> Result<(), Report<WalkError>> {
-        let parent_len = self.path.len();
-        if parent_len > 0 {
-            self.path.push('/');
-        }
-        self.path.push_str(name);
-        let failed = self.failed(error, what);
-        self.path.truncate(parent_len);
-        failed
-    }
-
-    // A file or symlink row, whose strings are already in `text`.
-    fn push_leaf(&mut self, row: Row, bytes: u64) -> Result<(), Report<WalkError>> {
-        let position = self.base + self.rows.len();
-        self.rows.push(row);
-        self.total += bytes;
-        let level = self.stack.len() - 1;
-        if self.stack[level].split {
-            self.add_to_group(level, position, bytes)?;
-        } else {
-            self.stack[level].completed.push((position, bytes));
-        }
-        self.check_budget()
-    }
-
-    // Offer a finished child of split `level` to its open group.
-    fn add_to_group(
-        &mut self,
-        level: usize,
-        position: usize,
-        bytes: u64,
-    ) -> Result<(), Report<WalkError>> {
-        let open = &self.stack[level];
-        if open.group_first < position && open.group_bytes + bytes > self.options.budget {
-            self.seal(position)?;
-            let open = &mut self.stack[level];
-            open.group_first = position;
-            open.group_bytes = 0;
-        }
-        self.stack[level].group_bytes += bytes;
-        Ok(())
-    }
-
-    // Split every measuring level whose subtree has passed the budget,
-    // outermost first. Only the outermost can be the first to cross.
-    fn check_budget(&mut self) -> Result<(), Report<WalkError>> {
-        while self.measuring < self.stack.len()
-            && self.total - self.stack[self.measuring].start_total > self.options.budget
-        {
-            self.split(self.measuring)?;
-            self.measuring += 1;
-        }
-        Ok(())
-    }
-
-    fn split(&mut self, level: usize) -> Result<(), Report<WalkError>> {
-        let row = self.stack[level].row;
-        // The parent is already split. This child closes its open group.
-        if self.stack[level - 1].group_first < row {
-            self.seal(row)?;
-        }
-        let parent = &mut self.stack[level - 1];
-        parent.group_first = usize::MAX;
-        parent.group_bytes = 0;
-
-        let this = &mut self.stack[level];
-        this.split = true;
-        this.group_first = row + 1;
-        this.group_bytes = 0;
-        for (position, bytes) in std::mem::take(&mut this.completed) {
-            self.add_to_group(level, position, bytes)?;
-        }
-        Ok(())
-    }
-
-    fn finish_level(&mut self) -> Result<(), Report<WalkError>> {
-        let level = self.stack.len() - 1;
-        let end = self.base + self.rows.len();
-        if level == 0 {
-            self.seal(end)?;
-            self.stack.pop();
-            return Ok(());
-        }
-
-        // Sealed before the pop: a part starting inside this directory needs it
-        // for its stem.
-        let this = &self.stack[level];
-        // A directory's own row is still waiting here only when that row alone
-        // passes the budget. Seal it now, so that it does not go into a later
-        // sibling's part.
-        if this.split && (this.group_first < end || self.base <= this.row) {
-            self.seal(end)?;
-        }
-        let done = self.stack.pop().expect("a level to finish");
-        self.measuring = self.measuring.min(level);
-        if done.split {
-            let parent = &mut self.stack[level - 1];
-            parent.group_first = end;
-            parent.group_bytes = 0;
-        } else {
-            let bytes = self.total - done.start_total;
-            if self.stack[level - 1].split {
-                self.add_to_group(level - 1, done.row, bytes)?;
-            } else {
-                self.stack[level - 1].completed.push((done.row, bytes));
-            }
-        }
-        self.path.truncate(self.stack[level - 1].path_len);
-        Ok(())
-    }
-
-    // Seal every waiting row before absolute position `end` into a part.
-    fn seal(&mut self, end: usize) -> Result<(), Report<WalkError>> {
-        let count = end - self.base;
-        if count == 0 {
-            return Ok(());
-        }
-        let mut part = TreePart::default();
-
-        // The stem is the open directories above the first row.
-        let stem_len = self.rows[0].depth as usize;
-        for level in 1..=stem_len {
-            let start = match self.stack[level - 1].path_len {
-                0 => 0,
-                parent_len => parent_len + 1,
-            };
-            part.push_stem(&self.path[start..self.stack[level].path_len])
-                .change_context(WalkError)?;
-        }
-        let mut nodes: Vec<u32> = (0..=stem_len)
-            .map(|node| u32::try_from(node).expect("stem depth fits a u32"))
-            .collect();
-
-        let mut cursor = 0;
-        for row in &self.rows[..count] {
-            let name_end = cursor + row.name_len as usize;
-            let name = &self.text[cursor..name_end];
-            let target = &self.text[name_end..name_end + row.target_len as usize];
-            cursor = name_end + row.target_len as usize;
-            let depth = row.depth as usize;
-            let parent = nodes[depth];
-            match row.meta {
-                Meta::Directory { mtime, mode } => {
-                    let node = part
-                        .push_directory(parent, name, mtime, mode)
-                        .change_context(WalkError)?;
-                    nodes.truncate(depth + 1);
-                    nodes.push(node);
-                }
-                Meta::File { size, mtime, mode } => part
-                    .push_file(parent, name, size, mtime, mode)
-                    .change_context(WalkError)?,
-                Meta::Symlink { mtime, directory } => part
-                    .push_symlink(parent, name, target, mtime, directory)
-                    .change_context(WalkError)?,
-            }
-        }
-        self.rows.drain(..count);
-        self.text.drain(..cursor);
-        self.base = end;
-        (self.sink)(part)
-    }
-
-    fn failed(&mut self, error: std::io::Error, what: &str) -> Result<(), Report<WalkError>> {
-        match self.options.on_error {
-            OnError::Fail => Err(error)
-                .attach_with(|| format!("{what} of {}", self.path))
-                .change_context(WalkError),
-            OnError::Skip => {
-                self.skip(SkipReason::Failed);
-                Ok(())
-            }
-        }
-    }
-
-    // Count a skip of the entry `self.path` names.
-    fn skip(&mut self, reason: SkipReason) {
-        let count = match reason {
-            SkipReason::Special => &mut self.skips.special,
-            SkipReason::NonUtf8 => &mut self.skips.non_utf8,
-            SkipReason::Unreadable => &mut self.skips.unreadable,
-            SkipReason::Failed => &mut self.skips.failed,
-        };
-        *count += 1;
-        if let Some(progress) = self.options.progress {
-            progress.skipped(&self.path, reason);
-        }
-    }
-
-    // Count a skip of `name` inside the directory `self.path` names.
-    fn skip_named(&mut self, name: &str, reason: SkipReason) {
-        let parent_len = self.path.len();
-        if parent_len > 0 {
-            self.path.push('/');
-        }
-        self.path.push_str(name);
-        self.skip(reason);
-        self.path.truncate(parent_len);
-    }
-
-    fn recorded(&self, kind: EntryKind, size: u64) {
-        if let Some(progress) = self.options.progress {
-            progress.recorded(kind, size);
-        }
-    }
-}
-
-// A length or a depth as the `u32` a row stores.
-#[inline]
-fn narrow(value: usize) -> Result<u32, Report<WalkError>> {
-    match u32::try_from(value) {
-        Ok(value) => Ok(value),
-        Err(error) => Err(Report::new(error).change_context(WalkError)),
-    }
+    let scanner = Scanner::new(root, options);
+    Walker::new(options, &scanner, sink).run(root)?;
+    Ok(scanner.skips())
 }
