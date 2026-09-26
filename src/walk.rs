@@ -456,7 +456,7 @@ impl Walker<'_, '_> {
         }
         // An error under either policy: counting the root as a skip would
         // report an empty walk as a success.
-        let directory = Directory::open_root(root)
+        let mut directory = Directory::open_root(root)
             .attach_with(|| format!("listing {}", root.display()))
             .change_context(WalkError)?;
         let mut listing = directory
@@ -515,7 +515,7 @@ impl Walker<'_, '_> {
         let parent_len = self.stack[level].path_len;
         self.path.truncate(parent_len);
 
-        let name = listed.name(&listing.names);
+        let name = listed.name(listing.names());
         let name = match std::str::from_utf8(name) {
             Ok(name) if listed.kind != Kind::NonUtf8 => name,
             Ok(lossy) => {
@@ -558,7 +558,7 @@ impl Walker<'_, '_> {
                 kind,
                 listing: Listing {
                     entries: &listing.entries,
-                    names: &listing.names,
+                    names: listing.names(),
                 },
             };
             if !filter.keep(&candidate) {
@@ -588,23 +588,28 @@ impl Walker<'_, '_> {
 
         match listed_kind {
             Kind::Symlink { directory } => {
-                let target = match self.open(level).read_link(listed, listing) {
-                    Ok(Some(target)) => target,
-                    Ok(None) => {
+                // The reader appends the target after the name.
+                let name_at = self.text.len();
+                self.text.push_str(name);
+                let open = self.stack[level]
+                    .directory
+                    .as_ref()
+                    .expect("`ensure_open` ran for this level");
+                match open.read_link(listed, listing, &mut self.text) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.text.truncate(name_at);
                         self.skip(SkipReason::NonUtf8);
                         return Ok(());
                     }
-                    Err(error) => return self.failed(error, "target"),
-                };
-                let target = if target.contains('\\') {
-                    target.replace('\\', "/")
-                } else {
-                    target
-                };
+                    Err(error) => {
+                        self.text.truncate(name_at);
+                        return self.failed(error, "target");
+                    }
+                }
+                let target = &self.text[name_at + name.len()..];
                 let target_len = narrow(target.len())?;
-                let bytes = estimate(kind, name, &target);
-                self.text.push_str(name);
-                self.text.push_str(&target);
+                let bytes = estimate(kind, name, target);
                 self.push_leaf(
                     Row {
                         depth,
@@ -638,7 +643,7 @@ impl Walker<'_, '_> {
                 }
                 let read = opened
                     .expect("a directory was opened above")
-                    .and_then(|directory| Ok((directory.list(&mut self.scratch)?, directory)));
+                    .and_then(|mut directory| Ok((directory.list(&mut self.scratch)?, directory)));
                 let (mut listing, directory) = match read {
                     Ok((listing, directory)) => (listing, Some(directory)),
                     Err(error) => {

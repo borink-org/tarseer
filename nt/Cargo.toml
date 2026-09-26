@@ -1,0 +1,17 @@
+[package]
+name = "tarseer-nt"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Reads a directory tree on Windows through the native API, opening each directory relative to its parent"
+repository = "https://github.com/borink-org/tarseer"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security",
+  "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl",
+  "Win32_System_SystemServices",
+] }
+
+[lints]
+workspace = true

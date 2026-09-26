@@ -65,16 +65,16 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cyo-mimalloc"
-version = "0.5.4"
-source = "git+https://github.com/cyo-alloc/mimalloc#ddaefbf81c5c05af69bb39a8919125e301089be7"
+version = "0.0.1"
+source = "git+https://github.com/cyo-alloc/mimalloc#52121a782a49680d876e10dca4a927c46418e6a9"
 dependencies = [
  "cyo-mimalloc-sys",
 ]
 
 [[package]]
 name = "cyo-mimalloc-sys"
-version = "0.5.4"
-source = "git+https://github.com/cyo-alloc/mimalloc#ddaefbf81c5c05af69bb39a8919125e301089be7"
+version = "0.0.1"
+source = "git+https://github.com/cyo-alloc/mimalloc#52121a782a49680d876e10dca4a927c46418e6a9"
 dependencies = [
  "cc",
 ]
@@ -285,6 +285,8 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "tarseer-nt",
+ "windows-sys",
  "zstd-safe",
 ]
 
@@ -296,6 +298,13 @@ dependencies = [
  "cyo-mimalloc",
  "error-stack",
  "tarseer",
+]
+
+[[package]]
+name = "tarseer-nt"
+version = "0.0.1"
+dependencies = [
+ "windows-sys",
 ]
 
 [[package]]

@@ -127,8 +127,8 @@ pub struct SymlinkRow {
     /// The text index of the link's name, for [`TreePart::text`].
     pub name: u32,
     /// The text index of the link's target, for [`TreePart::text`]. The target
-    /// is stored as the filesystem gave it, with any backslash replaced by a
-    /// forward slash.
+    /// is stored as the filesystem gave it. On Windows, where `\` separates
+    /// the parts of a path, each `\` is stored as `/`.
     pub target: u32,
     /// The modification time of the link itself, or `None` if the filesystem
     /// reported none.
