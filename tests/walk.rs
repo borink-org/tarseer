@@ -68,6 +68,54 @@ fn a_symlink_keeps_its_target_and_is_not_followed() {
     assert_eq!(link.directory, None, "a Unix symlink has no kind");
 }
 
+// On Unix, `\\` is a character like any other, and not a separator.
+#[cfg(unix)]
+#[test]
+fn a_backslash_in_a_unix_link_target_is_kept() {
+    let temp_dir = TempDir::new("backslash");
+    std::os::unix::fs::symlink(r"a\b", temp_dir.path().join("link")).expect("symlink");
+    let walk = walk_default(temp_dir.path());
+    let part = &walk.parts[0];
+    assert_eq!(part.text(part.symlinks[0].target), r"a\b");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_target_of_the_longest_length_is_read_whole() {
+    let temp_dir = TempDir::new("longtarget");
+    // 4,095 bytes, the most that Linux takes.
+    let target = format!("{}x", "t/".repeat(2047));
+    std::os::unix::fs::symlink(&target, temp_dir.path().join("link")).expect("symlink");
+    let walk = walk_default(temp_dir.path());
+    let part = &walk.parts[0];
+    assert_eq!(part.text(part.symlinks[0].target), target);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_windows_link_target_is_recorded_with_forward_slashes() {
+    let temp_dir = TempDir::new("junction");
+    let target = temp_dir.path().join("target");
+    fs::create_dir(&target).expect("create a directory");
+    // A junction needs no privilege, where a symlink can.
+    let made = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(temp_dir.path().join("link"))
+        .arg(&target)
+        .output()
+        .expect("run mklink");
+    assert!(made.status.success(), "{made:?}");
+
+    let walk = walk_default(temp_dir.path());
+    let part = &walk.parts[0];
+    let link = part.symlinks[0];
+    let read = fs::read_link(temp_dir.path().join("link")).expect("std reads the junction");
+    let want = read.to_str().expect("UTF-8").replace('\\', "/");
+    assert_eq!(part.text(link.target), want);
+    assert!(!want.contains('\\'));
+    assert_eq!(link.directory, Some(true));
+}
+
 #[test]
 fn the_walk_order_matches_a_plain_recursive_sorted_walk() {
     let temp_dir = fixture("oracle");

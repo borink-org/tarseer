@@ -30,6 +30,7 @@
 // `sys`), also under Miri. Miri checks rules 2, 3 and 5 on what is given.
 
 use std::io;
+use std::ops::Range;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
@@ -66,6 +67,10 @@ use crate::sys::{
 
 // 64 KiB: a few hundred entries a call.
 const BUFFER_BYTES: usize = 64 << 10;
+
+// Room for the longest target a reparse point holds, and a NUL after it. The
+// target starts after a header of at least 16 bytes.
+const TARGET_UNITS: usize = (MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize - 16) / 2 + 1;
 
 /// An open directory.
 ///
@@ -248,15 +253,21 @@ impl Directory {
     }
 
     /// Reads the target of the symlink or junction `name` inside this
-    /// directory, as `std::fs::read_link` gives it.
+    /// directory, as `std::fs::read_link` gives it, and calls `with` with it.
+    ///
+    /// The target is in UTF-16 units that need not be valid UTF-16. It is in
+    /// a buffer on the stack, so this method allocates nothing. Copy the
+    /// target in `with` to keep it, for example with `<[u16]>::to_vec`.
     ///
     /// # Errors
     ///
     /// Returns a call's error if it fails. Returns an error if `name` is
     /// another kind of reparse point, or not one at all.
-    pub fn read_link(&self, name: &[u16]) -> io::Result<Vec<u16>> {
+    pub fn read_link<R>(&self, name: &[u16], with: impl FnOnce(&[u16]) -> R) -> io::Result<R> {
         let handle = self.open_relative(name, FILE_READ_ATTRIBUTES | SYNCHRONIZE, 0)?;
-        reparse_target(&handle)
+        let mut target = [0u16; TARGET_UNITS];
+        let range = reparse_target(&handle, &mut target)?;
+        Ok(with(&target[range]))
     }
 
     fn raw(&self) -> HANDLE {
@@ -379,9 +390,12 @@ fn attributes_of(handle: &OwnedHandle) -> io::Result<(u32, u32)> {
     Ok((information.FileAttributes, information.ReparseTag))
 }
 
-// The target of the symlink or junction `handle` is open on, as
-// `std::fs::read_link` gives it.
-fn reparse_target(handle: &OwnedHandle) -> io::Result<Vec<u16>> {
+// Reads the target of the symlink or junction `handle` is open on into
+// `target`, as `std::fs::read_link` gives it. Returns where it is there.
+fn reparse_target(
+    handle: &OwnedHandle,
+    target: &mut [u16; TARGET_UNITS],
+) -> io::Result<Range<usize>> {
     let mut buffer = [0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize];
     let mut returned = 0;
     // SAFETY:
@@ -425,25 +439,22 @@ fn reparse_target(handle: &OwnedHandle) -> io::Result<Vec<u16>> {
     let bytes = data
         .get(start..start + usize::from(u16_at(10)?))
         .ok_or_else(|| io::Error::other("a reparse point shorter than its target"))?;
-    // The one allocation: the target that is returned. Its last unit is room
-    // for the NUL that `user_path` adds.
-    let mut target = Vec::with_capacity(bytes.len() / 2 + 1);
-    target.extend(
-        bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&pair| u16::from_le_bytes(pair)),
-    );
+    let units = bytes.len() / 2;
+    if units >= TARGET_UNITS {
+        return Err(io::Error::other("a reparse point longer than its buffer"));
+    }
+    for (unit, &pair) in target.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        *unit = u16::from_le_bytes(pair);
+    }
     // An absolute target starts with `\??\`, which `std` turns into `\\?\`
     // and then into a plain path where that means the same.
     let backslash = u16::from(b'\\');
     let question = u16::from(b'?');
-    if !relative && target.starts_with(&[backslash, question, question, backslash]) {
+    if !relative && target[..units].starts_with(&[backslash, question, question, backslash]) {
         target[1] = backslash;
-        return user_path(target);
+        return user_path(target, units);
     }
-    Ok(target)
+    Ok(0..units)
 }
 
 // `\\?\C:\...` as `C:\...`, and `\\?\UNC\...` as `\\...`, when Windows reads
@@ -454,26 +465,25 @@ fn reparse_target(handle: &OwnedHandle) -> io::Result<Vec<u16>> {
 // It resolves `.` and `..`, drops trailing dots and spaces, and reads names
 // such as `CON` as devices. `GetFullPathNameW` applies the same rules, so a
 // path that it returns unchanged means the same without the prefix.
-fn user_path(mut path: Vec<u16>) -> io::Result<Vec<u16>> {
+fn user_path(path: &mut [u16; TARGET_UNITS], units: usize) -> io::Result<Range<usize>> {
     const LEGACY_MAX_PATH: usize = 260;
     // `std` counts the NUL it ends the path with.
-    if path.len() + 1 > LEGACY_MAX_PATH {
-        return Ok(path);
+    if units + 1 > LEGACY_MAX_PATH {
+        return Ok(0..units);
     }
     let unit = |c: u8| u16::from(c);
-    let is_drive =
-        path.len() >= 7 && path[4] != 0 && path[5] == unit(b':') && path[6] == unit(b'\\');
-    let is_unc = path.len() >= 8 && path[4..8] == [unit(b'U'), unit(b'N'), unit(b'C'), unit(b'\\')];
+    let is_drive = units >= 7 && path[4] != 0 && path[5] == unit(b':') && path[6] == unit(b'\\');
+    let is_unc = units >= 8 && path[4..8] == [unit(b'U'), unit(b'N'), unit(b'C'), unit(b'\\')];
     let from = if is_drive {
         4
     } else if is_unc {
         path[6] = unit(b'\\');
         6
     } else {
-        return Ok(path);
+        return Ok(0..units);
     };
-    // The call takes a path that ends with a NUL.
-    path.push(0);
+    // The call takes a path that ends with a NUL, and `path` has room for it.
+    path[units] = 0;
     let mut full = [0u16; LEGACY_MAX_PATH + 1];
     // SAFETY: GetFullPathNameW touches no handle, and does no I/O (rules 1,
     // 4 and 6 do not apply).
@@ -493,17 +503,15 @@ fn user_path(mut path: Vec<u16>) -> io::Result<Vec<u16>> {
     if written == 0 {
         return Err(io::Error::last_os_error());
     }
-    path.pop();
     // 5. Only what the call says it wrote: a length under the buffer's is
     // the path's, without its NUL.
-    if written < full.len() && full[..written] == path[from..] {
-        path.drain(..from);
-        return Ok(path);
+    if written < full.len() && full[..written] == path[from..units] {
+        return Ok(from..units);
     }
     if is_unc {
         path[6] = unit(b'C');
     }
-    Ok(path)
+    Ok(0..units)
 }
 
 fn nt_error(status: NTSTATUS) -> io::Error {
@@ -677,12 +685,12 @@ mod tests {
             reparse,
             ..Script::default()
         });
-        let target = directory().read_link(&wide("link"))?;
+        let target = directory().read_link(&wide("link"), String::from_utf16)?;
         assert_eq!(
             asked(|script| script.opened.clone()),
             [(wide("link"), false)]
         );
-        Ok(String::from_utf16(&target).expect("UTF-16"))
+        Ok(target.expect("UTF-16"))
     }
 
     #[test]

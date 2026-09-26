@@ -119,10 +119,25 @@ impl Directory {
         Ok(converted(&fs::symlink_metadata(&self.path)?))
     }
 
-    /// Reads the target of the symlink `listed`. `None` if it is not UTF-8.
-    pub fn read_link(&self, listed: &Listed, listing: &Listing) -> io::Result<Option<String>> {
+    /// Appends the target of the symlink `listed` to `into`, with `/` for `\`
+    /// on Windows. Returns `false`, and appends nothing, if the target is not
+    /// UTF-8.
+    pub fn read_link(
+        &self,
+        listed: &Listed,
+        listing: &Listing,
+        into: &mut String,
+    ) -> io::Result<bool> {
         let target = fs::read_link(listing.held.entries[listed.slot as usize].path())?;
-        Ok(target.to_str().map(str::to_owned))
+        let Some(target) = target.to_str() else {
+            return Ok(false);
+        };
+        if cfg!(windows) {
+            into.extend(target.chars().map(|c| if c == '\\' { '/' } else { c }));
+        } else {
+            into.push_str(target);
+        }
+        Ok(true)
     }
 }
 

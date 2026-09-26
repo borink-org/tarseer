@@ -68,7 +68,7 @@ impl Directory {
     /// Opens the directory `name` inside this one, not following a link. A
     /// name that became a link after it was listed is opened as the link.
     pub fn open_name(&self, name: &str) -> io::Result<Self> {
-        let directory = self.directory.open_dir(&wide(name))?;
+        let directory = with_wide(name, |name| self.directory.open_dir(name))?;
         Ok(Self { directory })
     }
 
@@ -127,15 +127,48 @@ impl Directory {
         Ok(converted(&self.directory.metadata()?))
     }
 
-    /// Reads the target of the symlink `listed`. `None` if it is not UTF-8.
-    pub fn read_link(&self, listed: &Listed, listing: &Listing) -> io::Result<Option<String>> {
-        let target = self.directory.read_link(&wide(name_of(listed, listing)))?;
-        Ok(String::from_utf16(&target).ok())
+    /// Appends the target of the symlink `listed` to `into`, with `/` for `\`.
+    /// Returns `false`, and appends nothing, if the target is not valid
+    /// UTF-16.
+    pub fn read_link(
+        &self,
+        listed: &Listed,
+        listing: &Listing,
+        into: &mut String,
+    ) -> io::Result<bool> {
+        with_wide(name_of(listed, listing), |name| {
+            self.directory.read_link(name, |target| {
+                let start = into.len();
+                for unit in char::decode_utf16(target.iter().copied()) {
+                    match unit {
+                        // No Windows name holds either, so the path is the same.
+                        Ok('\\') => into.push('/'),
+                        Ok(c) => into.push(c),
+                        Err(_) => {
+                            into.truncate(start);
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+        })
     }
 }
 
-fn wide(name: &str) -> Vec<u16> {
-    name.encode_utf16().collect()
+// Calls `with` with `name` in UTF-16. A name of up to 255 units, the most
+// that NTFS and ReFS allow, is encoded on the stack.
+fn with_wide<R>(name: &str, with: impl FnOnce(&[u16]) -> R) -> R {
+    let mut units = [0u16; 255];
+    let mut length = 0;
+    for unit in name.encode_utf16() {
+        let Some(slot) = units.get_mut(length) else {
+            return with(&name.encode_utf16().collect::<Vec<_>>());
+        };
+        *slot = unit;
+        length += 1;
+    }
+    with(&units[..length])
 }
 
 fn name_of<'l>(listed: &Listed, listing: &'l Listing) -> &'l str {

@@ -142,7 +142,9 @@ fn a_junction_reads_as_std_reads_it() {
     assert!(made.status.success(), "{made:?}");
 
     let root = Directory::open(&temp_dir.0).expect("open");
-    let read = root.read_link(&wide("link")).expect("read the junction");
+    let read = root
+        .read_link(&wide("link"), <[u16]>::to_vec)
+        .expect("read the junction");
     let want = fs::read_link(temp_dir.0.join("link")).expect("std reads the junction");
     assert_eq!(
         String::from_utf16(&read).expect("UTF-16"),

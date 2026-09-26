@@ -588,23 +588,28 @@ impl Walker<'_, '_> {
 
         match listed_kind {
             Kind::Symlink { directory } => {
-                let target = match self.open(level).read_link(listed, listing) {
-                    Ok(Some(target)) => target,
-                    Ok(None) => {
+                // The reader appends the target after the name.
+                let name_at = self.text.len();
+                self.text.push_str(name);
+                let open = self.stack[level]
+                    .directory
+                    .as_ref()
+                    .expect("`ensure_open` ran for this level");
+                match open.read_link(listed, listing, &mut self.text) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.text.truncate(name_at);
                         self.skip(SkipReason::NonUtf8);
                         return Ok(());
                     }
-                    Err(error) => return self.failed(error, "target"),
-                };
-                let target = if target.contains('\\') {
-                    target.replace('\\', "/")
-                } else {
-                    target
-                };
+                    Err(error) => {
+                        self.text.truncate(name_at);
+                        return self.failed(error, "target");
+                    }
+                }
+                let target = &self.text[name_at + name.len()..];
                 let target_len = narrow(target.len())?;
-                let bytes = estimate(kind, name, &target);
-                self.text.push_str(name);
-                self.text.push_str(&target);
+                let bytes = estimate(kind, name, target);
                 self.push_leaf(
                     Row {
                         depth,

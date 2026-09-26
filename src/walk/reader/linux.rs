@@ -12,6 +12,9 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawDir, Statx, StatxFlags};
 use super::{Kind, Listed, Listing, Spare, Stat};
 use crate::manifest::Timestamp;
 
+// The longest path Linux takes, with its NUL.
+const PATH_MAX: usize = 4096;
+
 // Only what a row records, and the type for an entry listed without one.
 const WANTED: StatxFlags = StatxFlags::TYPE
     .union(StatxFlags::MODE)
@@ -117,11 +120,36 @@ impl Directory {
         converted(&stat)
     }
 
-    /// Reads the target of the symlink `listed`. `None` if it is not UTF-8.
-    pub fn read_link(&self, listed: &Listed, listing: &Listing) -> io::Result<Option<String>> {
+    /// Appends the target of the symlink `listed` to `into`. Returns `false`,
+    /// and appends nothing, if the target is not UTF-8.
+    pub fn read_link(
+        &self,
+        listed: &Listed,
+        listing: &Listing,
+        into: &mut String,
+    ) -> io::Result<bool> {
         let name = c_name(listed, listing.names());
+        // Linux makes no target of `PATH_MAX` bytes or more, but a filesystem
+        // that another system wrote may hold one. `readlinkat` cuts a target
+        // short to the buffer, so a buffer that fills is read again.
+        let mut buffer = [MaybeUninit::<u8>::uninit(); PATH_MAX];
+        let (target, _) = rustix::fs::readlinkat_raw(&self.fd, name, &mut buffer[..])?;
+        if target.len() < PATH_MAX {
+            return Ok(push_utf8(into, target));
+        }
         let target = rustix::fs::readlinkat(&self.fd, name, Vec::new())?;
-        Ok(target.into_string().ok())
+        Ok(push_utf8(into, target.as_bytes()))
+    }
+}
+
+// Appends `bytes` to `into` if they are UTF-8, and returns whether they were.
+fn push_utf8(into: &mut String, bytes: &[u8]) -> bool {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => {
+            into.push_str(text);
+            true
+        }
+        Err(_) => false,
     }
 }
 
