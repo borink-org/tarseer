@@ -17,6 +17,10 @@ license = "Apache-2.0"
 description = "Walks a directory tree into memory-bounded parts and writes them, with an index, as JSON Lines in a zstd file"
 repository = "https://github.com/borink-org/tarseer"
 readme = "README.md"
+keywords = ["filesystem", "directory", "walk", "index", "zstd"]
+categories = ["filesystem"]
+rust-version = "1.95"
+exclude = [".cargo/", ".github/", ".gitignore", "clippy.toml", "rustfmt.toml"]
 
 [features]
 default = ["zstd"]

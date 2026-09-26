@@ -66,7 +66,8 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "cyo-mimalloc"
 version = "0.0.1"
-source = "git+https://github.com/cyo-alloc/mimalloc#52121a782a49680d876e10dca4a927c46418e6a9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f784cca8bbc3cd12879ff52c332ff1b5c0224cada3284194bd4c9cc41091a9"
 dependencies = [
  "cyo-mimalloc-sys",
 ]
@@ -74,7 +75,8 @@ dependencies = [
 [[package]]
 name = "cyo-mimalloc-sys"
 version = "0.0.1"
-source = "git+https://github.com/cyo-alloc/mimalloc#52121a782a49680d876e10dca4a927c46418e6a9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7fa1da638f2a225a33b885ab533a3d7149b4aab4b39215560b4be7f99f56b0f"
 dependencies = [
  "cc",
 ]

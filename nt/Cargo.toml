@@ -5,6 +5,9 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Reads a directory tree on Windows through the native API, opening each directory relative to its parent"
 repository = "https://github.com/borink-org/tarseer"
+keywords = ["windows", "filesystem", "directory", "ntapi"]
+categories = ["filesystem", "os::windows-apis"]
+rust-version = "1.95"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -12,6 +15,11 @@ windows-sys = { version = "0.61", features = [
   "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl",
   "Win32_System_SystemServices",
 ] }
+
+# On other platforms the crate is empty.
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc"]
 
 [lints]
 workspace = true

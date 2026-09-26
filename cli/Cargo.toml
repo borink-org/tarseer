@@ -5,6 +5,11 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Walks a directory tree and prints it as JSON Lines, or writes the lines and an index as a zstd file"
 repository = "https://github.com/borink-org/tarseer"
+readme = "../README.md"
+keywords = ["filesystem", "directory", "walk", "index", "zstd"]
+categories = ["command-line-utilities", "filesystem"]
+# cyo-mimalloc needs 1.97.1.
+rust-version = "1.97.1"
 
 [[bin]]
 name = "tarseer"
@@ -16,9 +21,8 @@ doc = false
 tarseer = { path = "..", version = "0.0.1" }
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
 error-stack = "0.8"
-# The binary's global allocator; the library sets none. Git until it is
-# published.
-cyo-mimalloc = { git = "https://github.com/cyo-alloc/mimalloc" }
+# The binary's global allocator; the library sets none.
+cyo-mimalloc = "0.0.1"
 
 [lints]
 workspace = true
