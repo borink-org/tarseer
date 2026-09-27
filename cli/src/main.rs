@@ -69,6 +69,18 @@ fn main() -> ExitCode {
                 .help("Compression threads [default: 2]"),
         )
         .arg(
+            Arg::new("walk-threads")
+                .long("walk-threads")
+                .value_parser(value_parser!(usize))
+                .help("Threads that read directories; 0 walks on the calling thread alone [default: one per processor]"),
+        )
+        .arg(
+            Arg::new("max-walk-threads")
+                .long("max-walk-threads")
+                .value_parser(value_parser!(usize))
+                .help("Most walk threads while the walk waits on storage [default: 4 × --walk-threads]"),
+        )
+        .arg(
             Arg::new("metadata")
                 .long("metadata")
                 .value_parser(["full", "kinds"])
@@ -84,6 +96,16 @@ fn main() -> ExitCode {
             .get_one::<u64>("budget")
             .copied()
             .unwrap_or(DEFAULT_BUDGET),
+        threads: matches
+            .get_one::<usize>("walk-threads")
+            .copied()
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(0, std::num::NonZero::get)
+            }),
+        max_threads: matches
+            .get_one::<usize>("max-walk-threads")
+            .copied()
+            .unwrap_or(0),
         metadata: match matches.get_one::<String>("metadata").map(String::as_str) {
             Some("kinds") => Metadata::Kinds,
             _ => Metadata::Full,

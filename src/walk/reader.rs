@@ -25,7 +25,7 @@ cfg_select! {
 
 #[cfg(unix)]
 pub(super) use imp::stat_fd;
-pub(super) use imp::{Directory, Scratch};
+pub(super) use imp::{Directory, Scratch, Usage, pin, reserve_handles};
 
 /// The buffers of a listing that has been read, for the next one to fill. A
 /// walk then allocates for a listing only when one is larger than any before.

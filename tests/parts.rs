@@ -77,14 +77,14 @@ fn read(directory: &Path, path: &str) -> Vec<Node> {
 // The rule, stated recursively over a tree already in memory. `carry` holds the
 // rows of directories whose row has not left yet.
 fn split(children: &[Node], budget: u64, carry: &mut Vec<String>, parts: &mut Vec<Vec<String>>) {
-    let mut group = Vec::new();
-    let mut group_bytes = 0;
+    let mut run = Vec::new();
+    let mut run_bytes = 0;
     for child in children {
         let size = child.size();
         if child.kind == EntryKind::Directory && size > budget {
-            if !group.is_empty() {
-                emit(carry, &mut group, parts);
-                group_bytes = 0;
+            if !run.is_empty() {
+                emit(carry, &mut run, parts);
+                run_bytes = 0;
             }
             carry.push(child.path.clone());
             split(&child.children, budget, carry, parts);
@@ -92,22 +92,22 @@ fn split(children: &[Node], budget: u64, carry: &mut Vec<String>, parts: &mut Ve
                 parts.push(std::mem::take(carry));
             }
         } else {
-            if !group.is_empty() && group_bytes + size > budget {
-                emit(carry, &mut group, parts);
-                group_bytes = 0;
+            if !run.is_empty() && run_bytes + size > budget {
+                emit(carry, &mut run, parts);
+                run_bytes = 0;
             }
-            child.paths(&mut group);
-            group_bytes += size;
+            child.paths(&mut run);
+            run_bytes += size;
         }
     }
-    if !group.is_empty() {
-        emit(carry, &mut group, parts);
+    if !run.is_empty() {
+        emit(carry, &mut run, parts);
     }
 }
 
-fn emit(carry: &mut Vec<String>, group: &mut Vec<String>, parts: &mut Vec<Vec<String>>) {
+fn emit(carry: &mut Vec<String>, run: &mut Vec<String>, parts: &mut Vec<Vec<String>>) {
     let mut part = std::mem::take(carry);
-    part.append(group);
+    part.append(run);
     parts.push(part);
 }
 
@@ -129,15 +129,16 @@ fn joined_parts_are_the_plain_recursive_walk_at_every_budget() {
     }
 }
 
-// Checks the walk against the rule at every budget.
+// Checks the walk against the rule at every budget, without threads and with.
 fn cut_by_the_rule(root: &Path, budgets: impl IntoIterator<Item = u64>) {
     let tree = read(root, "");
     for budget in budgets {
         let mut want = Vec::new();
         split(&tree, budget, &mut Vec::new(), &mut want);
-        {
+        for threads in [0, 1, 3, 8] {
             let options = WalkOptions {
                 budget,
+                threads,
                 ..WalkOptions::default()
             };
             let got: Vec<Vec<String>> = walk(root, &options)
@@ -146,7 +147,7 @@ fn cut_by_the_rule(root: &Path, budgets: impl IntoIterator<Item = u64>) {
                 .iter()
                 .map(|part| part.entries().into_iter().map(|(path, _)| path).collect())
                 .collect();
-            assert_eq!(got, want, "budget {budget}");
+            assert_eq!(got, want, "budget {budget}, {threads} threads");
         }
     }
 }
@@ -208,7 +209,7 @@ fn a_part_that_holds_more_than_one_unit_stays_within_budget() {
                 )
             }))
             .sum();
-        // Carried directory rows ride along on top of a group, so allow one
+        // Carried directory rows ride along on top of a run, so allow one
         // row per stem level of slack.
         let slack = (part.stem().len() as u64 + 2) * 60;
         assert!(rows <= budget + slack, "{rows} estimated bytes in one part");

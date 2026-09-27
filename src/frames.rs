@@ -22,8 +22,11 @@
 //! # Memory
 //!
 //! Each worker thread keeps one [`Encoder`], one JSON buffer and one output
-//! buffer, and reuses them for every part. The walk waits when every thread is
-//! busy and the queue of sealed parts, one slot per thread, is full.
+//! buffer, and reuses them for every part. At most twice as many parts as
+//! there are threads are queued, being encoded, waiting for an earlier part,
+//! or with the sink. The walk waits for one of them to be done with, so a
+//! slow encoder or sink stops it from reading ahead. The index holds one entry
+//! for each part, and grows with the walk.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -35,7 +38,7 @@ use std::thread;
 use error_stack::{Report, ResultExt as _};
 
 use crate::manifest::{Index, PartEntry, TreePart};
-use crate::walk::{WalkError, WalkOptions, walk_parts};
+use crate::walk::{WalkError, WalkOptions, most_threads, reserve_walk_handles, walk_parts};
 
 /// The number of worker threads the `tarseer` command uses.
 pub const DEFAULT_THREADS: usize = 2;
@@ -140,6 +143,20 @@ pub struct Frame {
     pub raw_len: u64,
 }
 
+// A panicking encoder tells the thread that orders the frames, which would
+// otherwise wait for its part while the walk waits for room.
+struct FailedOnPanic<'a>(&'a mpsc::Sender<Result<Encoded, Report<WriteError>>>);
+
+impl Drop for FailedOnPanic<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            let _ = self.0.send(Err(
+                Report::new(WriteError).attach("an encoder thread panicked")
+            ));
+        }
+    }
+}
+
 // An encoded part on its way to the sink, with its index entry.
 struct Encoded {
     sequence: usize,
@@ -171,6 +188,8 @@ pub fn write_frames(
 ) -> Result<Index, Report<WriteError>> {
     let threads = threads.max(1);
     let part_sink = &mut *sink;
+    // Before any thread starts: see `reserve_walk_handles`.
+    reserve_walk_handles(most_threads(walk_options));
 
     let (in_order, walked) = thread::scope(|scope| {
         // Bounded, so a walk that outruns encoding waits instead of queueing
@@ -178,10 +197,19 @@ pub fn write_frames(
         let (job_sender, job_receiver) = mpsc::sync_channel::<(usize, TreePart)>(threads);
         let job_receiver = Arc::new(Mutex::new(job_receiver));
         let (done_sender, done_receiver) = mpsc::channel();
+        // One permit for each part that is queued, being encoded, waiting for
+        // an earlier one or with the sink. It comes back once the sink took the
+        // part.
+        let permits = threads * 2;
+        let (permit_sender, permit_receiver) = mpsc::sync_channel(permits);
+        for _ in 0..permits {
+            permit_sender.send(()).expect("the receiver is here");
+        }
         for _ in 0..threads {
             let job_receiver = Arc::clone(&job_receiver);
             let done_sender = done_sender.clone();
             scope.spawn(move || {
+                let _failed = FailedOnPanic(&done_sender);
                 let mut worker = match Worker::new(codec) {
                     Ok(worker) => worker,
                     Err(report) => {
@@ -205,11 +233,12 @@ pub fn write_frames(
         // walk's next send fails instead of waiting forever.
         drop(job_receiver);
         drop(done_sender);
-        let orderer = scope.spawn(move || hand_out_in_order(done_receiver, part_sink));
+        let orderer =
+            scope.spawn(move || hand_out_in_order(done_receiver, part_sink, &permit_sender));
 
         let mut sequence = 0;
         let walked = walk_parts(root, walk_options, &mut |part| {
-            if job_sender.send((sequence, part)).is_err() {
+            if permit_receiver.recv().is_err() || job_sender.send((sequence, part)).is_err() {
                 // The sink's thread stopped; its own error is the one returned.
                 return Err(Report::new(WalkError));
             }
@@ -284,6 +313,7 @@ pub(crate) fn room(buffer: &mut Vec<u8>, bytes: usize) {
 fn hand_out_in_order(
     done: Receiver<Result<Encoded, Report<WriteError>>>,
     sink: &mut (dyn FnMut(Frame) -> Result<(), Report<WriteError>> + Send),
+    permits: &mpsc::SyncSender<()>,
 ) -> Result<Vec<PartEntry>, Report<WriteError>> {
     let mut early = BTreeMap::new();
     let mut entries = Vec::new();
@@ -297,6 +327,7 @@ fn hand_out_in_order(
                 raw_len: encoded.raw_len,
             })?;
             entries.push(encoded.entry);
+            let _ = permits.send(());
         }
     }
     if let Some(&sequence) = early.keys().next() {
