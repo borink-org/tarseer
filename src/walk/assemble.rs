@@ -1,6 +1,6 @@
-// Building a part from the rows that scans found. The walk decides which rows
-// make up a part, and writes that down as a plan. Building the part from the
-// plan needs nothing else, so any thread can do it.
+// Building a part from the rows that scans found. At a cut the walk writes
+// down which rows make up the part, as a cut list. Building the part from the
+// cut list needs nothing else, so any thread can do it.
 
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use crate::manifest::{TreePart, TreePartFull};
 
 /// Rows that follow one another in walk order: the items `from..to` of one
 /// scan, which are entries of one directory.
-pub(super) struct Segment {
+pub(super) struct RowRange {
     pub rows: Arc<Rows>,
     pub from: usize,
     pub to: usize,
@@ -22,7 +22,7 @@ pub(super) struct Segment {
     pub count: usize,
 }
 
-impl Segment {
+impl RowRange {
     /// Splits off the first `count` rows. `self` keeps the rest.
     pub fn split_off_front(&mut self, count: usize) -> Self {
         let mut seen = 0;
@@ -56,48 +56,50 @@ pub(super) struct Subtree {
     pub count: usize,
 }
 
-/// What a part is made of, piece by piece in walk order.
-pub(super) enum Piece {
-    Rows(Segment),
+/// Where rows that follow one another in walk order come from: a range of
+/// one scan, or a whole subtree.
+pub(super) enum RowSource {
+    Range(RowRange),
     Subtree(Subtree),
 }
 
-impl Piece {
+impl RowSource {
     pub fn count(&self) -> usize {
         match self {
-            Self::Rows(segment) => segment.count,
+            Self::Range(range) => range.count,
             Self::Subtree(subtree) => subtree.count,
         }
     }
 
-    /// The depth of the piece's first row.
+    /// The depth of the first row.
     pub fn depth(&self) -> usize {
         match self {
-            Self::Rows(segment) => segment.depth,
+            Self::Range(range) => range.depth,
             Self::Subtree(subtree) => subtree.depth,
         }
     }
 }
 
-/// Everything a part is built from.
-pub(super) struct Plan {
+/// Everything a part is built from: what a cut writes down.
+pub(super) struct CutList {
     /// The names of the open directories above the first row, from the root
     /// down.
     pub stem: Vec<String>,
-    pub pieces: Vec<Piece>,
+    /// The part's rows, in walk order.
+    pub sources: Vec<RowSource>,
 }
 
-impl Plan {
+impl CutList {
     pub fn assemble(&self) -> Result<TreePart, Report<TreePartFull>> {
         // Counted first, so that the part is allocated once and never grows.
         let mut room = Room {
             bytes: self.stem.iter().map(String::len).sum(),
             ..Room::default()
         };
-        for piece in &self.pieces {
-            match piece {
-                Piece::Rows(segment) => room.add(&segment.rows, segment.from..segment.to),
-                Piece::Subtree(subtree) => {
+        for source in &self.sources {
+            match source {
+                RowSource::Range(range) => room.add(&range.rows, range.from..range.to),
+                RowSource::Subtree(subtree) => {
                     for scanned in &subtree.scans {
                         room.add(&scanned.rows, scanned.items.clone());
                     }
@@ -119,14 +121,14 @@ impl Plan {
             .map(|node| u32::try_from(node).expect("stem depth fits a u32"))
             .collect();
 
-        for piece in &self.pieces {
-            match piece {
-                Piece::Rows(segment) => {
-                    for item in &segment.rows.items[segment.from..segment.to] {
-                        push(&mut part, &mut nodes, &segment.rows, item, segment.depth)?;
+        for source in &self.sources {
+            match source {
+                RowSource::Range(range) => {
+                    for item in &range.rows.items[range.from..range.to] {
+                        push(&mut part, &mut nodes, &range.rows, item, range.depth)?;
                     }
                 }
-                Piece::Subtree(subtree) => unfold(&mut part, &mut nodes, subtree)?,
+                RowSource::Subtree(subtree) => unfold(&mut part, &mut nodes, subtree)?,
             }
         }
         Ok(part)

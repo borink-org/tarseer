@@ -39,10 +39,11 @@
 //! estimates and cuts parts against [`WalkOptions::budget`].
 //!
 //! - a directory whose whole subtree fits the budget is never split;
-//! - a directory whose subtree does not fit groups its children in order, and
-//!   each group takes as many children as fit;
-//! - a child whose own subtree does not fit closes the group before it and is
-//!   cut by these same rules;
+//! - a directory whose subtree does not fit is cut between its children, into
+//!   sibling runs: consecutive children with their whole subtrees, as many as
+//!   fit;
+//! - a child whose own subtree does not fit closes the sibling run before it
+//!   and is cut by these same rules;
 //! - a directory's own row goes into the first part of its contents.
 //!
 //! Where a cut falls depends only on the tree, the filter and the budget,

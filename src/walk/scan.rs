@@ -19,26 +19,28 @@ use crate::manifest::{EntryKind, Timestamp};
 /// The most open directories that waiting jobs may hold between them.
 pub(super) const MAX_HELD: usize = 128;
 
-/// The most entries one scan reads. A directory with more is read by several
-/// scans, which can run on different threads. The walk never holds the
+/// The most entries one scan reads: the size of a listing window. A directory
+/// with more is read by several scans, one for each window, which can run on
+/// different threads. The walk never holds the
 /// metadata of more than this many of its entries at once.
-pub(super) const CHUNK: usize = 1024;
+pub(super) const WINDOW_ENTRIES: usize = 1024;
 
-/// The most subdirectories one scan opens. A scan opens each directory it
-/// finds, and a directory with more is read by several scans, so that other
+/// The most subdirectories in one listing window. A scan opens each directory
+/// it finds, and a directory with more is read by several scans, so that other
 /// threads open the rest: opening a directory whose record is not cached
 /// waits for storage, and one thread would open them one at a time.
-pub(super) const DIRECTORIES: usize = 64;
+pub(super) const WINDOW_DIRECTORIES: usize = 64;
 
-// Where the scan of `listing` that starts at `start` ends: after `CHUNK`
-// entries or `DIRECTORIES` directories, whichever comes first.
-fn piece_end(listing: &reader::Listing, start: usize) -> usize {
+// Where the listing window of `listing` that starts at `start` ends: after
+// `WINDOW_ENTRIES` entries or `WINDOW_DIRECTORIES` directories, whichever
+// comes first.
+fn window_end(listing: &reader::Listing, start: usize) -> usize {
     let mut directories = 0;
-    let limit = listing.entries.len().min(start + CHUNK);
+    let limit = listing.entries.len().min(start + WINDOW_ENTRIES);
     for (place, entry) in listing.entries[start..limit].iter().enumerate() {
         if entry.kind == Kind::Directory {
             directories += 1;
-            if directories == DIRECTORIES {
+            if directories == WINDOW_DIRECTORIES {
                 return start + place + 1;
             }
         }
@@ -56,7 +58,7 @@ pub(super) struct Job {
 }
 
 pub(super) enum Work {
-    /// Open and list a directory, and read its first [`CHUNK`] entries.
+    /// Open and list a directory, and read its first listing window.
     Directory {
         /// The directory, if the scan of its parent could open it and the
         /// limit on held directories allowed. Otherwise this scan opens it by
@@ -66,7 +68,7 @@ pub(super) enum Work {
         /// out.
         refused: Option<io::Error>,
     },
-    /// Read the next [`CHUNK`] entries, from `start`, of a directory that an
+    /// Read the listing window that starts at `start` of a directory that an
     /// earlier scan listed.
     Rest {
         listed: Arc<ListedDirectory>,
@@ -109,7 +111,7 @@ impl Job {
     }
 }
 
-/// A directory with more than [`CHUNK`] entries, shared by its scans.
+/// A directory with more than [`WINDOW_ENTRIES`] entries, shared by its scans.
 pub(super) struct ListedDirectory {
     path: String,
     directory: Directory,
@@ -627,7 +629,7 @@ impl<'a> Scanner<'a> {
         let (opened, refused) = match job.work {
             Work::Rest { listed, start } => {
                 let entries = listed.listing.entries.len() - start;
-                found.scanned.items.reserve(entries.min(CHUNK));
+                found.scanned.items.reserve(entries.min(WINDOW_ENTRIES));
                 self.entries(&listed.within(), start, found);
                 return;
             }
@@ -665,8 +667,8 @@ impl<'a> Scanner<'a> {
         // One allocation for the names and one for the items, where growing
         // them entry by entry would take several. A link's target comes on top.
         let entries = listing.entries.len();
-        found.scanned.items.reserve(entries.min(CHUNK));
-        if piece_end(&listing, 0) == entries {
+        found.scanned.items.reserve(entries.min(WINDOW_ENTRIES));
+        if window_end(&listing, 0) == entries {
             // One copy for all the names, where there was one for each.
             let names_at = listing.text().and_then(|text| {
                 let at = u32::try_from(found.scanned.text.len()).ok()?;
@@ -694,7 +696,7 @@ impl<'a> Scanner<'a> {
             directory,
             listing,
         });
-        let mut start = piece_end(&listed.listing, 0);
+        let mut start = window_end(&listed.listing, 0);
         while start < listed.listing.entries.len() {
             found.rest.push(Job {
                 work: Work::Rest {
@@ -702,14 +704,15 @@ impl<'a> Scanner<'a> {
                     start,
                 },
             });
-            start = piece_end(&listed.listing, start);
+            start = window_end(&listed.listing, start);
         }
         self.entries(&listed.within(), 0, found);
     }
 
-    // Reads the entries of `listed` from `start` to the end of that piece.
+    // Reads the entries of `listed` from `start` to the end of that listing
+    // window.
     fn entries(&self, listed: &Within<'_>, start: usize, found: &mut Finding) {
-        let end = piece_end(listed.listing, start);
+        let end = window_end(listed.listing, start);
         if end < listed.listing.entries.len() {
             found.scanned.next = Some(end);
         }

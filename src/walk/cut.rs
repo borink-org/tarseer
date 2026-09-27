@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 
 use error_stack::{Report, ResultExt as _};
 
-use super::assemble::{Piece, Plan, Segment, Subtree};
+use super::assemble::{CutList, RowRange, RowSource, Subtree};
 use super::reader::Scratch;
 use super::scan::{Item, Job, Scanned, Scanner, joined};
 use super::{Cancelled, OnError, WalkError, WalkOptions, estimate};
@@ -61,11 +61,11 @@ struct Level {
     // `Walker::total` before its own row: its subtree so far is the difference.
     start_total: u64,
     split: bool,
-    // Split only: where the open group starts, and its estimate. Empty when
-    // `group_first` is the position of whatever comes next; `usize::MAX` while
-    // an over-budget child is being walked.
-    group_first: usize,
-    group_bytes: u64,
+    // Split only: where the open sibling run starts, and its estimate. Empty
+    // when `run_first` is the position of whatever comes next; `usize::MAX`
+    // while an over-budget child is being walked.
+    run_first: usize,
+    run_bytes: u64,
     // Measuring only: where this level's finished children start in
     // `Walker::completed`.
     completed: usize,
@@ -77,7 +77,7 @@ pub(super) struct Walker<'w> {
     sink: &'w mut Sink<'w>,
     // The rows that are not in a part yet, in walk order. The walk keeps where
     // they are and never copies them.
-    waiting: VecDeque<Piece>,
+    waiting: VecDeque<RowSource>,
     // The position of the first waiting row, and of the next row to come.
     base: usize,
     position: usize,
@@ -141,8 +141,8 @@ impl<'w> Walker<'w> {
             row: 0,
             start_total: 0,
             split: true,
-            group_first: 0,
-            group_bytes: 0,
+            run_first: 0,
+            run_bytes: 0,
             completed: 0,
         });
 
@@ -245,7 +245,7 @@ impl<'w> Walker<'w> {
                 self.position += count;
                 self.total += bytes + below;
                 if count > 0 {
-                    self.waiting.push_back(Piece::Subtree(Subtree {
+                    self.waiting.push_back(RowSource::Subtree(Subtree {
                         scans,
                         depth: level + 1,
                         count,
@@ -276,8 +276,8 @@ impl<'w> Walker<'w> {
                     row,
                     start_total: self.total,
                     split: false,
-                    group_first: 0,
-                    group_bytes: 0,
+                    run_first: 0,
+                    run_bytes: 0,
                     completed: self.completed.len(),
                 });
                 self.total += bytes;
@@ -342,9 +342,9 @@ impl<'w> Walker<'w> {
     // Adds item `index` of the top level to the waiting rows.
     fn extend(&mut self, depth: usize, index: usize) {
         let rows = &self.stack[depth].scanned.rows;
-        // The last segment goes on if it ends right before this item of the
+        // The last row range goes on if it ends right before this item of the
         // same directory. Scans of several directories can share their rows.
-        if let Some(Piece::Rows(last)) = self.waiting.back_mut()
+        if let Some(RowSource::Range(last)) = self.waiting.back_mut()
             && last.to == index
             && last.depth == depth
             && Arc::ptr_eq(&last.rows, rows)
@@ -353,7 +353,7 @@ impl<'w> Walker<'w> {
             last.count += 1;
             return;
         }
-        self.waiting.push_back(Piece::Rows(Segment {
+        self.waiting.push_back(RowSource::Range(RowRange {
             rows: Arc::clone(rows),
             from: index,
             to: index + 1,
@@ -371,28 +371,28 @@ impl<'w> Walker<'w> {
         bytes: u64,
     ) -> Result<(), Report<WalkError>> {
         if self.stack[level].split {
-            self.add_to_group(level, position, bytes)
+            self.add_to_run(level, position, bytes)
         } else {
             self.completed.push((position, bytes));
             Ok(())
         }
     }
 
-    // Offer a finished child of split `level` to its open group.
-    fn add_to_group(
+    // Offer a finished child of split `level` to its open sibling run.
+    fn add_to_run(
         &mut self,
         level: usize,
         position: usize,
         bytes: u64,
     ) -> Result<(), Report<WalkError>> {
         let open = &self.stack[level];
-        if open.group_first < position && open.group_bytes + bytes > self.options.budget {
+        if open.run_first < position && open.run_bytes + bytes > self.options.budget {
             self.seal(position)?;
             let open = &mut self.stack[level];
-            open.group_first = position;
-            open.group_bytes = 0;
+            open.run_first = position;
+            open.run_bytes = 0;
         }
-        self.stack[level].group_bytes += bytes;
+        self.stack[level].run_bytes += bytes;
         Ok(())
     }
 
@@ -410,18 +410,18 @@ impl<'w> Walker<'w> {
 
     fn split(&mut self, level: usize) -> Result<(), Report<WalkError>> {
         let row = self.stack[level].row;
-        // The parent is already split. This child closes its open group.
-        if self.stack[level - 1].group_first < row {
+        // The parent is already split. This child closes its open sibling run.
+        if self.stack[level - 1].run_first < row {
             self.seal(row)?;
         }
         let parent = &mut self.stack[level - 1];
-        parent.group_first = usize::MAX;
-        parent.group_bytes = 0;
+        parent.run_first = usize::MAX;
+        parent.run_bytes = 0;
 
         let this = &mut self.stack[level];
         this.split = true;
-        this.group_first = row + 1;
-        this.group_bytes = 0;
+        this.run_first = row + 1;
+        this.run_bytes = 0;
         // Its finished children, which the levels below it follow in
         // `completed`.
         let from = this.completed;
@@ -434,7 +434,7 @@ impl<'w> Walker<'w> {
             below.completed -= to - from;
         }
         for (position, bytes) in children {
-            self.add_to_group(level, position, bytes)?;
+            self.add_to_run(level, position, bytes)?;
         }
         Ok(())
     }
@@ -454,7 +454,7 @@ impl<'w> Walker<'w> {
         // A directory's own row is still waiting here only when that row alone
         // passes the budget. Seal it now, so that it does not go into a later
         // sibling's part.
-        if this.split && (this.group_first < end || self.base <= this.row) {
+        if this.split && (this.run_first < end || self.base <= this.row) {
             self.seal(end)?;
         }
         let done = self.stack.pop().expect("a level to finish");
@@ -462,8 +462,8 @@ impl<'w> Walker<'w> {
         self.measuring = self.measuring.min(level);
         if done.split {
             let parent = &mut self.stack[level - 1];
-            parent.group_first = end;
-            parent.group_bytes = 0;
+            parent.run_first = end;
+            parent.run_bytes = 0;
         } else {
             self.finished(level - 1, done.row, self.total - done.start_total)?;
         }
@@ -489,23 +489,23 @@ impl<'w> Walker<'w> {
             })
             .collect();
 
-        let mut pieces = Vec::new();
+        let mut sources = Vec::new();
         let mut left = count;
         while left > 0 {
             let front = self.waiting.front_mut().expect("a row for every position");
             if front.count() <= left {
                 left -= front.count();
-                pieces.extend(self.waiting.pop_front());
+                sources.extend(self.waiting.pop_front());
             } else {
-                let Piece::Rows(segment) = front else {
+                let RowSource::Range(range) = front else {
                     unreachable!("a part is never cut inside a subtree that fits one");
                 };
-                pieces.push(Piece::Rows(segment.split_off_front(left)));
+                sources.push(RowSource::Range(range.split_off_front(left)));
                 left = 0;
             }
         }
         self.base = end;
-        let plan = Plan { stem, pieces };
-        (self.sink)(plan.assemble().change_context(WalkError)?)
+        let cut_list = CutList { stem, sources };
+        (self.sink)(cut_list.assemble().change_context(WalkError)?)
     }
 }
