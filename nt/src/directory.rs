@@ -216,40 +216,19 @@ impl Directory {
     ///
     /// Returns a call's error if it fails.
     pub fn metadata(&self) -> io::Result<Metadata> {
-        let mut information = FILE_NETWORK_OPEN_INFORMATION::default();
-        let mut status_block = IO_STATUS_BLOCK::default();
-        // SAFETY:
-        // 1. The handle is borrowed from `self`.
-        // 2. The information and the status block are each their own type, of
-        //    the length the call is told.
-        // 3. Both are raw borrows of local variables that nothing else uses
-        //    until the call returns.
-        // 4. The handle is open for synchronous I/O; `completed` checks.
-        let status = completed(unsafe {
-            NtQueryInformationFile(
-                self.raw(),
-                &raw mut status_block,
-                (&raw mut information).cast(),
-                length(size_of::<FILE_NETWORK_OPEN_INFORMATION>()),
-                FileNetworkOpenInformation,
-            )
-        });
-        if status < 0 {
-            return Err(nt_error(status));
-        }
-        // 5. The struct is all integers.
-        let attributes = information.FileAttributes;
-        let reparse_tag = if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
-            0
-        } else {
-            attributes_of(&self.handle)?.1
-        };
-        Ok(Metadata {
-            attributes,
-            reparse_tag,
-            size: information.EndOfFile.cast_unsigned(),
-            last_write: information.LastWriteTime,
-        })
+        metadata_of(&self.handle)
+    }
+
+    /// Reads the metadata of `name` inside this directory, from the file
+    /// itself, not following a link. `name` is in UTF-16 units, as for
+    /// [`Directory::open_dir`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a call's error if it fails.
+    pub fn metadata_of(&self, name: &[u16]) -> io::Result<Metadata> {
+        let handle = self.open_relative(name, FILE_READ_ATTRIBUTES | SYNCHRONIZE, 0)?;
+        metadata_of(&handle)
     }
 
     /// Reads the target of the symlink or junction `name` inside this
@@ -367,6 +346,44 @@ fn succeeded(done: BOOL) -> io::Result<()> {
         std::process::abort();
     }
     Err(error)
+}
+
+// The metadata of the file `handle` is open on.
+fn metadata_of(handle: &OwnedHandle) -> io::Result<Metadata> {
+    let mut information = FILE_NETWORK_OPEN_INFORMATION::default();
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY:
+    // 1. The handle is borrowed.
+    // 2. The information and the status block are each their own type, of
+    //    the length the call is told.
+    // 3. Both are raw borrows of local variables that nothing else uses
+    //    until the call returns.
+    // 4. The handle is open for synchronous I/O; `completed` checks.
+    let status = completed(unsafe {
+        NtQueryInformationFile(
+            handle.as_raw_handle(),
+            &raw mut status_block,
+            (&raw mut information).cast(),
+            length(size_of::<FILE_NETWORK_OPEN_INFORMATION>()),
+            FileNetworkOpenInformation,
+        )
+    });
+    if status < 0 {
+        return Err(nt_error(status));
+    }
+    // 5. The struct is all integers.
+    let attributes = information.FileAttributes;
+    let reparse_tag = if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        0
+    } else {
+        attributes_of(handle)?.1
+    };
+    Ok(Metadata {
+        attributes,
+        reparse_tag,
+        size: information.EndOfFile.cast_unsigned(),
+        last_write: information.LastWriteTime,
+    })
 }
 
 // The attributes and the reparse tag of the file `handle` is open on.
@@ -657,6 +674,24 @@ mod tests {
         });
         let metadata = directory().metadata().expect("metadata");
         assert_eq!(metadata.reparse_tag, IO_REPARSE_TAG_MOUNT_POINT);
+    }
+
+    #[test]
+    fn a_name_reads_its_own_metadata_opened_as_itself() {
+        script(Script {
+            network_open: FILE_NETWORK_OPEN_INFORMATION {
+                EndOfFile: 5,
+                LastWriteTime: 9,
+                ..FILE_NETWORK_OPEN_INFORMATION::default()
+            },
+            ..Script::default()
+        });
+        let metadata = directory().metadata_of(&wide("file")).expect("metadata");
+        assert_eq!((metadata.size, metadata.last_write), (5, 9));
+        assert_eq!(
+            asked(|script| script.opened.clone()),
+            [(wide("file"), false)]
+        );
     }
 
     // A REPARSE_DATA_BUFFER with one name as both the substitute and the

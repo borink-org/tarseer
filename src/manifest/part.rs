@@ -205,8 +205,14 @@ impl TreePart {
         components.join("/")
     }
 
-    // A node's parent and its own name.
-    fn node(&self, node: u32) -> (u32, &str) {
+    /// Returns the node id of the directory that holds node `node`, and the
+    /// node's own name. A reader that opens each directory relative to the
+    /// one above it follows these up to node 0, the walk root.
+    ///
+    /// # Panics
+    /// If `node` is 0, the root, or not a node of this part.
+    #[must_use]
+    pub fn node(&self, node: u32) -> (u32, &str) {
         let node = node as usize;
         if node <= self.stem.len() {
             let parent = u32::try_from(node - 1).expect("node ids fit a u32");
@@ -278,6 +284,35 @@ impl TreePart {
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
         self.files.iter().map(|file| file.size).sum()
+    }
+
+    /// An empty part with room for exactly these rows and `bytes` of text,
+    /// for a walk that knows what the part will hold before it fills it.
+    pub(crate) fn with_capacity(
+        directories: usize,
+        files: usize,
+        symlinks: usize,
+        stem: usize,
+        bytes: usize,
+    ) -> Self {
+        let strings = stem + directories + files + 2 * symlinks;
+        Self {
+            text: StrTape::with_capacity(bytes, strings),
+            stem: Vec::with_capacity(stem),
+            directories: Vec::with_capacity(directories),
+            files: Vec::with_capacity(files),
+            symlinks: Vec::with_capacity(symlinks),
+        }
+    }
+
+    /// The estimate of the part's JSON, as the walk adds it up: a fixed width
+    /// for each row, and its text.
+    pub(crate) fn estimate(&self) -> usize {
+        let fixed = |kind| usize::try_from(crate::walk::estimate(kind, "", "")).unwrap_or(0);
+        self.directories.len() * fixed(EntryKind::Directory)
+            + self.files.len() * fixed(EntryKind::File)
+            + self.symlinks.len() * fixed(EntryKind::Symlink)
+            + self.text.text_len()
     }
 
     fn intern(&mut self, text: &str) -> Result<u32, Report<TreePartFull>> {

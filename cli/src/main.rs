@@ -11,7 +11,7 @@ use error_stack::{Report, ResultExt as _};
 use tarseer::file::{Written, write_file};
 use tarseer::frames::DEFAULT_THREADS;
 use tarseer::zstd::Zstd;
-use tarseer::{DEFAULT_BUDGET, Skips, WalkError, WalkOptions, WriteError, walk_parts};
+use tarseer::{DEFAULT_BUDGET, Metadata, Skips, WalkError, WalkOptions, WriteError, walk_parts};
 
 // mimalloc for the binary only; the library sets no allocator.
 #[global_allocator]
@@ -68,6 +68,12 @@ fn main() -> ExitCode {
                 .value_parser(value_parser!(usize))
                 .help("Compression threads [default: 2]"),
         )
+        .arg(
+            Arg::new("metadata")
+                .long("metadata")
+                .value_parser(["full", "kinds"])
+                .help("What the walk reads of each entry: size, mtime and mode, or only its name and kind [default: full]"),
+        )
         .get_matches();
 
     let directory: &PathBuf = matches
@@ -78,6 +84,10 @@ fn main() -> ExitCode {
             .get_one::<u64>("budget")
             .copied()
             .unwrap_or(DEFAULT_BUDGET),
+        metadata: match matches.get_one::<String>("metadata").map(String::as_str) {
+            Some("kinds") => Metadata::Kinds,
+            _ => Metadata::Full,
+        },
         ..WalkOptions::default()
     };
     match matches.get_one::<PathBuf>("out") {

@@ -254,6 +254,8 @@ impl Worker {
     }
 
     fn encode(&mut self, sequence: usize, part: &TreePart) -> Result<Encoded, Report<WriteError>> {
+        // An eighth more than the estimate, so that the JSON fits.
+        room(&mut self.line, part.estimate() + part.estimate() / 8);
         part.write_json(&mut self.line).change_context(WriteError)?;
         self.line.push(b'\n');
         self.encoder.encode(&self.line, &mut self.frame)?;
@@ -263,6 +265,17 @@ impl Worker {
             raw_len: self.line.len() as u64,
             entry: PartEntry::of(part),
         })
+    }
+}
+
+/// Empties `buffer` and makes room in it for `bytes`. A buffer that is too
+/// small is replaced, not grown: growing would copy what it held, which is of
+/// no more use, and an allocator may copy it into memory it has not touched.
+pub(crate) fn room(buffer: &mut Vec<u8>, bytes: usize) {
+    if buffer.capacity() < bytes {
+        *buffer = Vec::with_capacity(bytes);
+    } else {
+        buffer.clear();
     }
 }
 

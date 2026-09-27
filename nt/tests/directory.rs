@@ -116,6 +116,21 @@ fn a_directory_opens_relative_to_its_parent() {
 }
 
 #[test]
+fn a_name_inside_a_directory_reads_its_own_metadata() {
+    let temp_dir = TempDir::new("metadata-of");
+    fs::write(temp_dir.0.join("file"), b"hello").expect("write");
+    fs::create_dir(temp_dir.0.join("sub")).expect("create a directory");
+
+    let root = Directory::open(&temp_dir.0).expect("open");
+    let file = root.metadata_of(&wide("file")).expect("metadata");
+    assert_eq!(file.size, 5);
+    assert_eq!(file.attributes & FILE_ATTRIBUTE_DIRECTORY, 0);
+    let sub = root.metadata_of(&wide("sub")).expect("metadata");
+    assert_ne!(sub.attributes & FILE_ATTRIBUTE_DIRECTORY, 0);
+    assert!(root.metadata_of(&wide("missing")).is_err());
+}
+
+#[test]
 fn only_a_directory_opens_as_one() {
     let temp_dir = TempDir::new("file");
     let file = temp_dir.0.join("file");

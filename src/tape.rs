@@ -42,6 +42,12 @@ impl Default for StrTape {
 }
 
 impl StrTape {
+    /// Returns the bytes of text of every string together.
+    #[must_use]
+    pub fn text_len(&self) -> usize {
+        self.arena.len()
+    }
+
     /// Creates an empty tape with room for `entries` strings holding `bytes`
     /// of text in total.
     #[must_use]

@@ -36,6 +36,9 @@ impl Directory {
     /// into shows an old mtime there.
     pub const STATS_ITSELF: bool = cfg!(windows);
 
+    /// Whether a value of this type keeps a file descriptor open.
+    pub const HOLDS_A_HANDLE: bool = false;
+
     /// Opens the root of a walk. A root that is a symlink is followed.
     // The signature is the linux reader's, which can fail here.
     #[allow(clippy::unnecessary_wraps)]
@@ -51,6 +54,21 @@ impl Directory {
         Ok(Self {
             path: listing.held.entries[listed.slot as usize].path(),
         })
+    }
+
+    /// Opens the directory `name` inside this one, to read the metadata of
+    /// what it holds.
+    #[allow(clippy::unnecessary_wraps)]
+    pub fn open_name(&self, name: &str) -> io::Result<Self> {
+        Ok(Self {
+            path: self.path.join(name),
+        })
+    }
+
+    /// Reads the metadata of `name` inside this directory, without following
+    /// a symlink.
+    pub fn stat_name(&self, name: &str) -> io::Result<Stat> {
+        Ok(converted(&fs::symlink_metadata(self.path.join(name))?))
     }
 
     /// Returns `true` if `error` says the process has no handle left. This
@@ -139,6 +157,14 @@ impl Directory {
         }
         Ok(true)
     }
+}
+
+/// Reads the metadata of the file `fd` is open on, without a lookup. `std`
+/// reads it only through a `File`, which here takes a copy of the descriptor.
+#[cfg(unix)]
+pub fn stat_fd(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<Stat> {
+    let file = fs::File::from(fd.try_clone_to_owned()?);
+    Ok(converted(&file.metadata()?))
 }
 
 fn kind_of(file_type: FileType) -> Kind {
